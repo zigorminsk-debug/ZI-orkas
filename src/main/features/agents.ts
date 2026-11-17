@@ -1,0 +1,3422 @@
+/**
+ * Agents — listing, custom CRUD, marketplace installs, inline edit chat.
+ *
+ * Mirrors the skills module shape. Two sources:
+ *   marketplace — <uid>/local/marketplace/agents/<id>/agent.json
+ *   custom      — <uid>/cloud/agents/<id>/agent.json
+ *
+ * Schema (one JSON per agent):
+ *   { agent_id, name, description, workflow, created_at, updated_at }
+ *
+ * The inline "edit" chat lets the LLM refine an agent by emitting one
+ * `<agent>...</agent>` container per turn, whose children are the fields
+ * to update: `<name>` / `<description>` / `<icon>` / `<workflow>` /
+ * `<skills>` / `<inputs>`. Each child is a full-replacement update for that
+ * field.
+ */
+
+import { validateWithOperatorPolicy } from './operator-policy';
+import { addMemoryEntry, replaceMemoryEntry } from './memory-writes';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+
+import {
+  userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile,
+  agentDir, agentDefinitionFile, agentRuntimeStatsFile,
+  userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
+  userAgentRuntimeConfigFile, userMemoryDir, userAgentCatalogCacheFile,
+} from '../paths';
+import { chatAttachmentDirForConversation } from '../util/project-layout';
+import { evictSession } from '../model/core-agent/session-store';
+import { getActiveUserId } from './users';
+import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { t, buildLanguageDirective, descriptionLang } from '../i18n';
+import { SUPPORTED_LANGS, type Lang } from '../i18n';
+import { getLanguage } from './config';
+import { getWorkspacePath } from './user_workspace';
+import { buildAttachmentManifest } from './chat_attachments';
+import { listAgentEntries, removeAgentEntry } from './memory';
+import {
+  normalizeAgentRuntimeStatsFile,
+  recordAgentRuntimeStatsForDevice,
+  type AgentRuntimeStatsBucket,
+} from './agent_runtime_stats';
+import { getCurrentDevice } from '../util/device';
+import {
+  LOCAL_CLI_TYPES,
+  localCliCapabilities,
+  localCliDefaultPermissionPolicy,
+  localCliSupportsAgentMemory,
+  localCliSupportsPermissionPolicy,
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+} from './local_agents/registry';
+import {
+  appendEditChatCommentaryProcessItem,
+  ensureEditChatRuntimeProcessItem,
+  isEditChatWaitingForInputEvent,
+  normalizeEditChatRuntimeEvent,
+  sanitizeEditChatCommentaryProcessItems,
+} from './edit_chat_runtime';
+
+const log = createLogger('agents');
+
+// Custom agents / skills roots — resolved from the active uid every call.
+function CUSTOM_AGENTS_DIR(): string { return userAgentsDir(getActiveUserId()); }
+function CUSTOM_SKILLS_DIR(): string { return userSkillsDir(getActiveUserId()); }
+import { prompts } from '../prompts/loader';
+import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
+import { findOuterTagRanges } from '../util/markdown-prose-code';
+import {
+  nowIso, genAgentId, safeId,
+  readJson, writeJson, writeJsonSync,
+  appendJsonlAtomic, invalidateLineCount, readJsonl,
+} from '../storage';
+import {
+  listSkillSpecsForAgentMetadata,
+  normalizeKnownSkillRefsForDisplay,
+  resolveSkillAllowlistRefs,
+  type SkillAllowlistRef,
+} from '../model/core-agent/skill-registry';
+import { readDisabledSets, setAgentEnabled } from './component_enabled';
+import { renameAgentInMembers } from './group_chat/state';
+import { ValidationReport as QualityReport } from '../quality';
+import { persistReport as persistQualityReport } from '../quality/report';
+import {
+  DEFAULT_MARKETPLACE_CATEGORY_CODE,
+  normalizeMarketplaceCategoryCode,
+} from './marketplace_biz';
+import { normalizeInstallVersion } from './marketplace_installs';
+import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
+import {
+  canonicalizeAgentToolGroups,
+  getToolCatalogEntry,
+  invalidAgentToolGroupRefs,
+  isAgentDependencyToolGroup,
+  isLoadableToolGroup,
+  toolNamesForAgentGroups,
+  type ToolGroupId,
+} from '../model/core-agent/tool-catalog';
+
+export type AgentSource = 'marketplace' | 'custom';
+type AgentSourceInput = AgentSource | 'builtin';
+export type AgentPrioritySource = 'builtin' | 'platform' | 'custom';
+
+export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
+
+export interface AgentInputOption {
+  value: string;
+  label: string;
+}
+
+export type AgentInputUiLanguage = Lang;
+
+/** Declarative schema for an agent's user-facing input parameters.
+ * Populated by the agent-edit LLM (or commander quick-create) via the
+ * `<inputs>` child of the `<agent>` update container; consumed at run
+ * time by the agent itself per `chat_agent_in_group.md` § inputs_schema
+ * mandatory-confirmation trigger (it emits a fenced `agent-input-form` block when fields
+ * are missing or low-confidence) and by the chat-bubble form widget
+ * (renderer renders it). */
+export interface AgentInput {
+  /** snake_case key, unique within an agent. */
+  id: string;
+  label: string;
+  description?: string;
+  type: AgentInputType;
+  required?: boolean;
+  /** Always defined. text/textarea → string; number → number;
+   * boolean → boolean; select → option value (string); multiselect → string[];
+   * file → string (single) or string[] (when `multiple`). For `file` the
+   * default is always `""` / `[]` — model authors can't pre-pick a file. */
+  default: string | number | boolean | string[];
+  /** Optional select defaults resolved from the current User UI language.
+   * Values must reference declared option values; `default` remains the
+   * unavailable/unsupported-language fallback. */
+  default_by_ui_language?: Partial<Record<AgentInputUiLanguage, string>>;
+  /** Required for select/multiselect; ignored otherwise. */
+  options?: AgentInputOption[];
+  placeholder?: string;
+  min?: number;
+  max?: number;
+  /** `file` only — allow picking more than one file. Default false. */
+  multiple?: boolean;
+  /** `file` only — `accept` attribute hint passed to `<input type=file>`,
+   * e.g. `".pdf,.docx"` or `"image/*"`. Optional. */
+  accept?: string;
+}
+
+/** A question is valid before its answer exists. Unlike persisted Agent launch
+ * configuration, chat forms never synthesize a default from the field type. */
+export type ChatFormField = Omit<AgentInput, 'default'> & { default?: AgentInput['default'] };
+
+export interface AgentProfileEntry {
+  title: string;
+  description?: string;
+  tool?: string;
+  source?: string;
+  scope?: string;
+  updated_at?: string;
+  kept?: boolean;
+}
+
+export interface AgentProfileStat {
+  key: string;
+  value: string | number;
+  unit?: string;
+  label?: string;
+}
+
+export interface AgentProfileRecent {
+  title: string;
+  when?: string;
+  project?: string;
+}
+
+export interface AgentProfileScope {
+  accepts?: string[];
+  rejects?: string[];
+}
+
+/** Structured profile for richer agents. Old agents can omit it entirely and
+ *  still render from description/workflow/skills. New specs persist knowhow /
+ *  standards as top-level fields; `profile` is the normalized read shape.
+ *  `knowhow` is display-only, while `standards` is also runtime guidance. */
+export interface AgentProfile {
+  role?: string;
+  dispatch?: string;
+  /** Stable capabilities shown on the Agent detail surface. This field is not
+   *  injected into the worker prompt; execution behavior belongs in workflow
+   *  or a routed Skill. */
+  knowhow?: string[];
+  /** Pre-handoff checklist, resident on every turn of this agent and read as
+   *  mandatory: the model checks its finished result against each entry and
+   *  reports a blocker for anything it cannot meet. Route- or phase-specific
+   *  rules, procedures, command syntax and soft preferences belong in the Skill
+   *  that reads them; anything needing the words "not a gate" is in the wrong
+   *  list. See the injection site in `group_chat/bus.ts` for the full contract. */
+  standards?: string[];
+  /** Legacy/read-only compatibility. New authoring must use top-level
+   *  `workflow` markdown instead of profile.workflow. */
+  workflow?: AgentProfileEntry[];
+  scope?: AgentProfileScope;
+  stats?: AgentProfileStat[];
+  recent?: AgentProfileRecent[];
+  /** Display-only memory assembled from the per-agent memory store on read.
+   *  New authoring must not generate agent.json profile.memory. */
+  memory?: AgentProfileEntry[];
+  assets?: string[];
+  serving?: string[];
+}
+
+export type AgentRuntimeStats = AgentRuntimeStatsBucket;
+
+export interface Agent {
+  agent_id: string;
+  name: string;
+  /** Chinese description (zh locale). May be empty. */
+  description_zh: string;
+  /** English description (en locale). May be empty. */
+  description_en: string;
+  workflow: string;
+  /** Display avatar — paired (icon id, color id). Both come from
+   * `renderer/modules/avatar.js` constants. Optional: missing fields fall
+   * back to a deterministic hash of `agent_id` at render time so old
+   * agents stay stable without a migration pass. */
+  icon?: string;
+  color?: string;
+  /** Skill ids/names this agent declares as workflow dependencies.
+   * Runtime group-chat agents use this as an upper bound, then inject only
+   * dependencies also named in `workflow`. Undefined means no upper bound;
+   * [] means explicit zero skills.
+   * Maintained exclusively by the agent-edit LLM via the `<skills>` child of
+   * the `<agent>` container. Not exposed in the UI. */
+  skill_list?: string[];
+  /** Fixed runtime tool groups. The Agent cannot load groups beyond this list;
+   * [] is an explicit host-only surface. Missing is retained only for
+   * historical compatibility and resolves to a fixed legacy-capability set. */
+  tool_list?: ToolGroupId[];
+  /** User-facing input schema. Three-state:
+   *   - undefined / field missing → agent needs no up-front confirmation
+   *   - []                        → explicit zero inputs
+   *   - AgentInput[] non-empty    → commander must first emit an
+   *     `agent-input-form` block before @-mentioning the agent
+   * Maintained exclusively by the agent-edit LLM via the `<inputs>` child
+   * of the `<agent>` container. */
+  inputs?: AgentInput[];
+  /** Default multi-turn lifecycle (tutoring, Q&A, role-play). Interactive
+   * agents receive the open/closed protocol and retain an automatic hand-off
+   * until explicit handback; ordinary workers finish at a terminal turn.
+   * Formal hand-offs and valid input forms select their owner independently.
+   * Maintained by the agent-edit LLM via `<interactive>`; missing = false. */
+  interactive?: boolean;
+  /** How this agent collects user input in conversation. The platform default
+   * `form` teaches the `<agent-input-form>` protocol; `prose` replaces it with
+   * plain-language questions for agents whose own protocol forbids forms
+   * (VideoStudio's publish-and-continue flow). Host-generated onboarding
+   * forms (declared `inputs`, directory pickers) are unaffected — this only
+   * selects which asking protocol the MODEL is taught. Missing = `form`. */
+  input_channel?: 'form' | 'prose';
+  /** Rich display profile for "AI employee" style agents. This is optional
+   *  compatibility data: marketplace/new agents can provide it explicitly,
+   *  while legacy agents keep using description/workflow. */
+  profile?: AgentProfile;
+  /** Runtime-derived counters. Stored outside agent.json so the definition is
+   *  not rewritten on every dispatch; merged into list/detail reads. */
+  runtime_stats?: AgentRuntimeStats;
+  /** Execution backend. Missing / `kind === 'in_process'` (the default)
+   *  means the agent runs through `core-agent` like every existing
+   *  agent. `kind === 'cli'` routes the worker turn through
+   *  `features/local_agents/runner.ts` to spawn a local coding CLI
+   *  (claude code / codex / openclaw / opencode / hermes). The field is
+   *  set at create time from the modal's runtime selector and edited
+   *  via the dedicated `chat_agent_setup_cli.md` prompt; the LLM
+   *  doesn't author it directly. */
+  runtime?: AgentRuntime;
+  /** Marketplace category code. Empty string only for legacy/manual specs.
+   *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
+  category: string;
+  /** Output rendering preference — agent-level hint injected into the named Agent
+   *  system prompt at dispatch time. Four user-facing values:
+   *    - `'auto'`: default. The model chooses the lightest useful
+   *      presentation: plain text/Markdown, inline dashboard, or interactive app.
+   *    - `'text'`: blocks `:::dashboard` + `create_artifact`. The plain-reply
+   *      hard constraint.
+   *    - `'dashboard'`: prefers `:::dashboard` for structured data.
+   *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
+   *  Legacy aliases kept for back-compat: `'markdown_only'` (old name for
+   *  `'text'`) and `'allow_artifacts'` (old name for `'artifact'`).
+   *  Missing field = auto. Authored by the agent edit UI dropdown, NOT the
+   *  agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
+  output_format?: OutputFormat;
+  source: AgentSource;
+  created_at: string;
+  updated_at: string;
+  /** **Computed at load time, not persisted.** Filled by `listAgents` /
+   *  `getAgent` from `features/component_enabled.ts`. Defaults to true
+   *  unless the user has explicitly disabled the agent. Don't write this
+   *  field back to disk. */
+  enabled: boolean;
+  /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
+   *  surfaces must not render it. */
+  create_uid?: string;
+  /** Marketplace install version for `source==='marketplace'`. Read from `_install.json` so the
+   *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
+   *  this undefined (version is a publish concept, not authored locally). */
+  version?: string;
+  /** Marketplace install freshness read from `_install.json`. Renderer marketplace uses this
+   *  to decide whether the server listing is newer than the local install. */
+  marketplace_published_at?: number;
+  marketplace_updated_at?: number;
+  /** Server-side fresh-install seed flag mirrored from marketplace metadata. */
+  default_install?: boolean;
+  /** Dev-only publishing metadata mirrored from marketplace metadata. */
+  is_open_source?: boolean;
+  /** Marketplace review lifecycle status mirrored from marketplace metadata. */
+  status?: string;
+  /** Install provenance for marketplace-root agents. `builtin` means the
+   *  packaged fallback copy, which wins conflict arbitration over platform
+   *  marketplace installs and custom agents. */
+  seed_source?: string;
+}
+
+export interface AgentRaw {
+  agent_id?: string;
+  _v?: unknown;
+  name?: string;
+  description?: string;
+  description_zh?: string;
+  description_en?: string;
+  workflow?: string;
+  created_at?: string;
+  updated_at?: string;
+  skill_list?: unknown;
+  tool_list?: unknown;
+  inputs?: unknown;
+  icon?: unknown;
+  color?: unknown;
+  interactive?: unknown;
+  input_channel?: unknown;
+  runtime?: unknown;
+  category?: unknown;
+  status?: unknown;
+  state?: unknown;
+  output_format?: unknown;
+  profile?: unknown;
+  role?: unknown;
+  dispatch?: unknown;
+  knowhow?: unknown;
+  standards?: unknown;
+  flow?: unknown;
+  workflow_steps?: unknown;
+  doYes?: unknown;
+  doNo?: unknown;
+  stats?: unknown;
+  runtime_stats?: unknown;
+  recent?: unknown;
+  memory?: unknown;
+  assets?: unknown;
+  serving?: unknown;
+}
+
+/** Agent output rendering preference. Four user-facing values
+ *  (`'auto' | 'text' | 'dashboard' | 'artifact'`); the create modal defaults
+ *  to `'auto'`. Legacy values are accepted and canonicalized on read/write:
+ *  `'markdown_only'` → `'text'`, `'allow_artifacts'` → `'artifact'`.
+ *  Missing field on disk = auto. */
+export type OutputFormat = 'auto' | 'text' | 'dashboard' | 'artifact' | 'markdown_only' | 'allow_artifacts';
+const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'text', 'dashboard', 'artifact', 'markdown_only', 'allow_artifacts']);
+
+function _canonicalOutputFormat(v: unknown): Exclude<OutputFormat, 'markdown_only' | 'allow_artifacts'> | null {
+  if (v === 'markdown_only') return 'text';
+  if (v === 'allow_artifacts') return 'artifact';
+  if (v === 'auto' || v === 'text' || v === 'dashboard' || v === 'artifact') return v;
+  return null;
+}
+
+/** Per-agent execution backend. See `Agent.runtime`. */
+export type AgentRuntime =
+  | { kind: 'in_process' }
+  | {
+      kind: 'cli';
+      /** Canonical CLI type — must match `LOCAL_CLI_TYPES` in
+       *  `features/local_agents/registry.ts`. Validated on read; an
+       *  unknown value drops the runtime field entirely. */
+      cli: string;
+      /** Per-Agent model override. Missing means use the CLI default. */
+      model_override?: string;
+      /** Per-Agent effort / thinking / variant override. Missing means use
+       * the selected model's CLI default. */
+      thinking_level?: string;
+      /** Per-Agent permission override. Missing means inherit the CLI's own
+       * configuration. */
+      permission_policy?: Exclude<LocalCliPermissionPolicy, 'inherit'>;
+      /** Extra CLI flags appended after our own args. Strings only;
+       *  not shell-parsed by us. */
+      custom_args?: string[];
+    };
+
+// Avatar tokens are validated against the catalog allow-list
+// (src/main/data/avatars.json is the single source of truth).
+// renderer/modules/avatar.js pulls from the same file, so frontend and
+// backend never duplicate it.
+import * as avatars from './avatars';
+
+function _applyMarketplaceInstallMeta(agent: Agent, dir: string): void {
+  try {
+    const metaFile = path.join(dir, '_install.json');
+    if (!fs.existsSync(metaFile)) return;
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    if (!meta || typeof meta !== 'object') return;
+    agent.version = normalizeInstallVersion(meta.version);
+    if (typeof meta.published_at === 'number') agent.marketplace_published_at = meta.published_at;
+    if (typeof meta.updated_at === 'number') agent.marketplace_updated_at = meta.updated_at;
+    if (typeof meta.default_install === 'boolean') agent.default_install = meta.default_install;
+    if (typeof meta.is_open_source === 'boolean') agent.is_open_source = meta.is_open_source;
+    if (typeof meta.status === 'string') agent.status = meta.status;
+    else if (typeof meta.state === 'string') agent.status = meta.state;
+    if (typeof meta.seed_source === 'string') agent.seed_source = meta.seed_source;
+  } catch (err) {
+    log.warn('marketplace agent install metadata unreadable', { directory: logPathRef(dir), error: logErrorSummary(err) });
+  }
+}
+
+export function agentPrioritySource(agent: Pick<Agent, 'source' | 'seed_source'>): AgentPrioritySource {
+  if (agent.source === 'custom') return 'custom';
+  return agent.seed_source === 'builtin' ? 'builtin' : 'platform';
+}
+
+export function agentPriorityRank(agent: Pick<Agent, 'source' | 'seed_source'>): number {
+  switch (agentPrioritySource(agent)) {
+    case 'builtin': return 0;
+    case 'platform': return 1;
+    case 'custom': return 2;
+    default: return 99;
+  }
+}
+
+export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 1. Builtin agent sync (startup)
+// ─────────────────────────────────────────────────────────────────────────
+
+// `syncBuiltinAgents` / `hashTree` / `_isMarketplaceInstalled` removed — marketplace installs
+// now write to `<uid>/local/marketplace/agents/` directly.
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2. Read / list
+// ─────────────────────────────────────────────────────────────────────────
+
+function normalizeAgentSource(source: AgentSourceInput): AgentSource {
+  return source === 'builtin' ? 'marketplace' : source;
+}
+
+function isMarketplaceSource(source: AgentSourceInput): boolean {
+  return normalizeAgentSource(source) === 'marketplace';
+}
+
+/** Resolve where a given source's agents live on disk. */
+function agentBaseDir(source: AgentSourceInput): string {
+  const uid = getActiveUserId();
+  return isMarketplaceSource(source) ? userMarketplaceAgentsDir(uid) : userAgentsDir(uid);
+}
+
+/** Helpers replacing the removed `builtinAgentDir` / `builtinAgentDefinitionFile`.
+ *  Same shape but per-user (marketplace installs are per-user, not per-machine). */
+function _platformAgentDir(agentId: string): string {
+  return userMarketplaceAgentDir(getActiveUserId(), agentId);
+}
+function _platformAgentSpecFile(agentId: string): string {
+  return path.join(_platformAgentDir(agentId), 'agent.json');
+}
+
+const INPUT_ID_RE = /^[a-z_][a-z0-9_]{0,31}$/;
+const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory'];
+
+// Reserved agent display names — collide with the commander role surfaced in
+// the chat-recipient chip and the sidebar tab. The bus router also keys
+// "commander" as a member id, so we guard localized display names and the
+// English form. Comparison is case-insensitive after stripping all whitespace;
+// whitespace itself is rejected by the charset guard below.
+const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
+function _agentNameKey(name: string): string {
+  return String(name || '').replace(/\s+/g, '').toLowerCase();
+}
+function assertAgentNameAllowed(name: string): void {
+  const key = _agentNameKey(name);
+  if (!key) return; // empty handled elsewhere (defaults to t('agent.default_name'))
+  if (/\s/.test(String(name))) assertAgentNameCharsetValid(name);
+  if (RESERVED_AGENT_NAMES.has(key)) {
+    const err: any = new Error(`agent name "${name}" is reserved`);
+    err.code = 'E_AGENT_NAME_RESERVED';
+    throw err;
+  }
+  assertAgentNameCharsetValid(name);
+}
+
+// Agent names must round-trip through the @-mention regex used by the
+// router (`router.ts::TOKEN_CLASS = [A-Za-z0-9_一-鿿-]`) — slashes,
+// backslashes, dots, parens, control chars etc. either truncate the
+// match (e.g. `@Agent/SkillSomeName` only matches `Agent`) or escape the
+// alternation arm at the regex stage. We additionally cap length. Any
+// whitespace is rejected because UIs render names raw — stray whitespace
+// looks like a typo nobody can see to fix.
+const NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+$/;
+function assertAgentNameCharsetValid(name: string): void {
+  if (name == null) return;
+  const trimmed = String(name);
+  if (!trimmed.trim()) return;
+  if (trimmed !== trimmed.trim()) {
+    const err: any = new Error(`agent name has leading or trailing whitespace`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
+  if (nameDisplayWidth(trimmed) > NAME_DISPLAY_MAX_UNITS) {
+    const err: any = new Error(`agent name longer than ${NAME_DISPLAY_MAX_UNITS} display units`);
+    err.code = 'E_AGENT_NAME_TOO_LONG';
+    throw err;
+  }
+  if (!NAME_TOKEN_RE.test(trimmed)) {
+    // Surface the offending literal + the specific bad chars so a streamed
+    // error feeds the LLM enough signal to self-correct on the next turn,
+    // instead of repeating the same forbidden character.
+    const SINGLE_TOKEN_CHAR_RE = /[A-Za-z0-9_一-鿿-]/;
+    const bad: string[] = [];
+    const seen = new Set<string>();
+    for (const ch of trimmed) {
+      if (ch === ' ') continue;
+      if (SINGLE_TOKEN_CHAR_RE.test(ch)) continue;
+      if (!seen.has(ch)) { seen.add(ch); bad.push(ch); }
+    }
+    const detail = bad.length
+      ? `forbidden character${bad.length > 1 ? 's' : ''}: ${bad.map(c => `\`${c}\``).join(' ')}`
+      : 'spaces are not allowed';
+    const err: any = new Error(`agent name "${trimmed}" contains unsupported characters — ${detail}. Allowed: ASCII letters / digits / \`_\` / \`-\` / CJK U+4E00–U+9FFF. Forbidden include spaces, \`/\` \`\\\` \`.\` \`,\` \`(\` \`)\` \`:\` \`!\` \`?\`, full-width punctuation, kana, hangul, extended-CJK, emoji.`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
+}
+
+/** Reject names already in use by another agent (custom OR marketplace).
+ *  Matches `_agentNameKey` (case-insensitive, all whitespace stripped) so
+ *  "Code Helper" and "codehelper" collide. `excludeAgentId` lets the
+ *  update path keep its own name. Caller owns the check at every write
+ *  entry — IPC create / IPC update / LLM-driven create+edit — so neither
+ *  the UI form nor the LLM can land a duplicate. */
+async function assertAgentNameUnique(
+  name: string, excludeAgentId?: string, userId = getActiveUserId(),
+): Promise<void> {
+  const key = _agentNameKey(name);
+  if (!key) return;
+  for (const [source, baseDir] of [
+    ['marketplace', userMarketplaceAgentsDir(userId)],
+    ['custom', userAgentsDir(userId)],
+  ] as const) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const raw = await readJson<AgentRaw>(path.join(baseDir, entry.name, 'agent.json'));
+        const agent = normalizeAgent(raw, source);
+        if (!agent) continue;
+        if (excludeAgentId && agent.agent_id === excludeAgentId) continue;
+        if (_agentNameKey(agent.name || '') === key) {
+          const err: any = new Error(`agent name "${name}" is already in use`);
+          err.code = 'E_AGENT_NAME_TAKEN';
+          throw err;
+        }
+      } catch (err) {
+        if ((err as { code?: string }).code === 'E_AGENT_NAME_TAKEN') throw err;
+      }
+    }
+  }
+}
+
+/**
+ * Normalize + validate a candidate `AgentInput[]`. Drop malformed entries
+ * with a warn log rather than throw — we don't want one bad field to make
+ * an entire agent unreadable. Returns a cleaned array (possibly empty).
+ */
+export function validateAgentInputs(raw: unknown): AgentInput[] {
+  return normalizeInputDefinitions(raw, 'configuration') as AgentInput[];
+}
+
+export function validateChatFormFields(raw: unknown): ChatFormField[] {
+  return normalizeInputDefinitions(raw, 'question');
+}
+
+function chatFormDefault(e: Record<string, unknown>, options?: AgentInputOption[]): { valid: boolean; value?: AgentInput['default'] } {
+  const value = e.default;
+  if (value === undefined || value === null || value === '' || (typeof value === 'string' && !value.trim())) return { valid: true };
+  if (e.type === 'file' || e.type === 'directory') return { valid: true };
+  if (e.type === 'number') {
+    const number = typeof value === 'number' || typeof value === 'string' ? Number(value) : NaN;
+    return { valid: Number.isFinite(number)
+      && !(typeof e.min === 'number' && number < e.min)
+      && !(typeof e.max === 'number' && number > e.max), value: number };
+  }
+  if (e.type === 'boolean') {
+    if (value === true || value === 'true' || value === 1) return { valid: true, value: true };
+    if (value === false || value === 'false' || value === 0) return { valid: true, value: false };
+    return { valid: false };
+  }
+  if (e.type === 'select') return { valid: typeof value === 'string' && !!options?.some(o => o.value === value), value: value as string };
+  if (e.type === 'multiselect') return { valid: Array.isArray(value) && value.every(v => typeof v === 'string' && options?.some(o => o.value === v)), value: value as string[] };
+  return { valid: typeof value === 'string', value: value as string };
+}
+
+function normalizeInputDefinitions(raw: unknown, purpose: 'configuration' | 'question'): ChatFormField[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: ChatFormField[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const id = typeof e.id === 'string' ? e.id.trim() : '';
+    if (!INPUT_ID_RE.test(id) || seen.has(id)) { log.warn('agent input dropped: invalid or duplicate id'); continue; }
+    const type = e.type as AgentInputType;
+    if (!ALLOWED_INPUT_TYPES.includes(type)) { log.warn('agent input dropped: invalid type', { input_id: maskId(id) }); continue; }
+    const label = typeof e.label === 'string' ? e.label : id;
+
+    let options: AgentInputOption[] | undefined;
+    if (type === 'select' || type === 'multiselect') {
+      if (!Array.isArray(e.options) || e.options.length === 0) {
+        log.warn('agent input dropped: options required', { input_id: maskId(id), type }); continue;
+      }
+      const optValues = new Set<string>();
+      options = [];
+      for (const o of e.options) {
+        if (!o || typeof o !== 'object') continue;
+        const v = typeof (o as any).value === 'string' ? String((o as any).value) : '';
+        if (!v || optValues.has(v)) continue;
+        optValues.add(v);
+        options.push({ value: v, label: typeof (o as any).label === 'string' ? (o as any).label : v });
+      }
+      if (options.length === 0) { log.warn('agent input dropped: options invalid', { input_id: maskId(id) }); continue; }
+    }
+
+    let def: AgentInput['default'] | undefined;
+    const fileMultiple = type === 'file' && e.multiple === true;
+    if (purpose === 'question') {
+      const normalized = chatFormDefault(e, options);
+      // The question remains answerable even when its suggested answer is
+      // invalid. Retain required/options/bounds and ask the user to fill it.
+      if (!normalized.valid) log.warn('chat form default cleared: invalid value', { input_id: maskId(id) });
+      else def = normalized.value;
+    } else if (type === 'text' || type === 'textarea') {
+      def = typeof e.default === 'string' ? e.default : '';
+    } else if (type === 'number') {
+      // Allow JS numeric default OR a string that parses to a finite number
+      // (LLMs frequently emit `"3"` instead of `3` because of how they
+      // serialise mixed-type JSON schemas). Drop the field if the default
+      // is truly non-numeric (NaN / "abc" / object) — better to lose the
+      // field than persist garbage.
+      let n: number | null = null;
+      if (typeof e.default === 'number' && Number.isFinite(e.default)) n = e.default;
+      else if (typeof e.default === 'string' && e.default.trim() !== '') {
+        const parsed = Number(e.default);
+        if (Number.isFinite(parsed)) n = parsed;
+      }
+      if (n === null) { log.warn('agent input dropped: default must be finite number', { input_id: maskId(id) }); continue; }
+      def = n;
+    } else if (type === 'boolean') {
+      // Coerce common boolean reps the LLM emits (`"true"` / `"false"` /
+      // `0` / `1`) instead of dropping the field — losing a structural
+      // input over a serialisation quirk silently breaks the agent's
+      // form schema, which the user sees as "form missing a checkbox".
+      let b: boolean;
+      if (typeof e.default === 'boolean') b = e.default;
+      else if (e.default === 'true' || e.default === 1) b = true;
+      else if (e.default === 'false' || e.default === 0) b = false;
+      else {
+        log.warn('agent input default invalid: falling back to false', { input_id: maskId(id) });
+        b = false;
+      }
+      def = b;
+    } else if (type === 'select') {
+      // The prompt (chat_agent_in_group.md) explicitly allows the runtime
+      // form to render an "empty form" (one without a default selection).
+      // The old logic dropped the whole field on a missing/invalid
+      // default, so all-empty fields → no form rendered → the raw
+      // `<agent-input-form>` XML got rendered by markdown as unknown
+      // HTML, breaking the user's styling. Graceful fallback: use
+      // options[0].value (matching the browser's default-first-option
+      // behavior for `<select>`).
+      const v = typeof e.default === 'string' ? e.default : '';
+      if (v && options!.some((o) => o.value === v)) {
+        def = v;
+      } else {
+        if (v) log.warn('agent input default not in options: falling back to first', { input_id: maskId(id) });
+        def = options![0].value;
+      }
+    } else if (type === 'multiselect') {
+      const arr = Array.isArray(e.default) ? e.default.filter((x): x is string => typeof x === 'string') : [];
+      const allowed = new Set(options!.map((o) => o.value));
+      const filtered = arr.filter((v) => allowed.has(v));
+      def = filtered;
+    } else if (type === 'directory') {
+      // Directory — default is always empty; the user picks via native dialog.
+      def = '';
+    } else { // file — default is always empty (the model can't pre-pick a file)
+      def = fileMultiple ? [] : '';
+    }
+
+    const input: ChatFormField = { id, label, type, ...(def !== undefined ? { default: def } : {}) };
+    if (typeof e.description === 'string' && e.description) input.description = e.description;
+    if (e.required === true) input.required = true;
+    if (options) input.options = options;
+    if (
+      type === 'select'
+      && e.default_by_ui_language
+      && typeof e.default_by_ui_language === 'object'
+      && !Array.isArray(e.default_by_ui_language)
+    ) {
+      const rawDefaults = e.default_by_ui_language as Record<string, unknown>;
+      const uiDefaults: Partial<Record<AgentInputUiLanguage, string>> = {};
+      for (const lang of SUPPORTED_LANGS) {
+        const value = rawDefaults[lang];
+        if (typeof value === 'string' && options!.some((option) => option.value === value)) {
+          uiDefaults[lang] = value;
+        }
+      }
+      if (Object.keys(uiDefaults).length > 0) input.default_by_ui_language = uiDefaults;
+    }
+    if (typeof e.placeholder === 'string' && e.placeholder) input.placeholder = e.placeholder;
+    if (typeof e.min === 'number' && Number.isFinite(e.min)) input.min = e.min;
+    if (typeof e.max === 'number' && Number.isFinite(e.max)) input.max = e.max;
+    if (type === 'file') {
+      if (fileMultiple) input.multiple = true;
+      if (typeof e.accept === 'string' && e.accept.trim()) input.accept = e.accept.trim();
+    }
+    if (type === 'number' && typeof def === 'number') {
+      if (typeof input.min === 'number' && def < input.min) { log.warn('agent input default below min', { input_id: maskId(id) }); }
+      if (typeof input.max === 'number' && def > input.max) { log.warn('agent input default above max', { input_id: maskId(id) }); }
+    }
+
+    seen.add(id);
+    out.push(input);
+  }
+  return out;
+}
+
+function _plainObj(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null;
+}
+
+function _cleanProfileString(v: unknown, max = 320): string {
+  if (typeof v !== 'string' && typeof v !== 'number') return '';
+  const text = String(v).replace(/\s+/g, ' ').trim();
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+function _firstProfileString(obj: Record<string, unknown>, keys: string[], max = 320): string {
+  for (const k of keys) {
+    const v = _cleanProfileString(obj[k], max);
+    if (v) return v;
+  }
+  return '';
+}
+
+function _profileStringList(raw: unknown, limit = 16, max = 160): string[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: string[] = [];
+  for (const item of arr) {
+    const text = _cleanProfileString(item, max);
+    if (!text) continue;
+    out.push(text);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileEntries(raw: unknown, limit = 16): AgentProfileEntry[] | undefined {
+  const input = Array.isArray(raw)
+    ? raw
+    : (_plainObj(raw)
+        ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
+            const obj = _plainObj(value);
+            return obj ? { title: key, ...obj } : { title: key, description: value };
+          })
+        : []);
+  const out: AgentProfileEntry[] = [];
+  for (const item of input) {
+    if (typeof item === 'string' || typeof item === 'number') {
+      const title = _cleanProfileString(item, 220);
+      if (title) out.push({ title });
+    } else {
+      const obj = _plainObj(item);
+      if (!obj) continue;
+      const title = _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k'], 220);
+      const description = _firstProfileString(obj, ['description', 'd', 'summary', 'detail', 'body'], 520);
+      if (!title && !description) continue;
+      const entry: AgentProfileEntry = { title: title || description };
+      if (description && description !== entry.title) entry.description = description;
+      const tool = _firstProfileString(obj, ['tool', 'skill', 'action'], 120);
+      const source = _firstProfileString(obj, ['source', 'from'], 160);
+      const scope = _firstProfileString(obj, ['scope', 'visibility'], 120);
+      const updatedAt = _firstProfileString(obj, ['updated_at', 'updatedAt', 'when'], 80);
+      if (tool) entry.tool = tool;
+      if (source) entry.source = source;
+      if (scope) entry.scope = scope;
+      if (updatedAt) entry.updated_at = updatedAt;
+      if (obj.kept === false || obj.enabled === false) entry.kept = false;
+      out.push(entry);
+    }
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+/** One warn per distinct (owner, field, damage) so a hot normalize path cannot
+ *  spam the log while a change in damage still gets reported. */
+const _profileOverflowWarned = new Set<string>();
+
+function _profileTextList(
+  raw: unknown,
+  limit = 16,
+  max = 220,
+  overflow?: { field: string; ownerId?: string },
+): string[] | undefined {
+  const input = Array.isArray(raw)
+    ? raw
+    : (_plainObj(raw) ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
+        const obj = _plainObj(value);
+        if (!obj) return value ?? key;
+        return obj.title ?? obj.name ?? obj.t ?? obj.label ?? obj.description ?? obj.d ?? key;
+      }) : []);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let dropped = 0;
+  let truncated = 0;
+  const textFor = (item: unknown, boundedMax: number): string => {
+    const direct = _cleanProfileString(item, boundedMax);
+    if (direct) return direct;
+    const obj = _plainObj(item);
+    if (!obj || obj.kept === false || obj.enabled === false) return '';
+    return _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k', 'description', 'd', 'summary', 'detail', 'body'], boundedMax);
+  };
+  for (const item of input) {
+    const text = textFor(item, max);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    if (out.length >= limit) {
+      // Same admission rules as a kept item; only the limit stops it. Counted
+      // instead of silently skipped so the loss is observable.
+      dropped++;
+      continue;
+    }
+    // The unbounded read picks the same source key (cleaning never empties a
+    // non-empty value), so a longer result means this exact line was cut.
+    if (textFor(item, Number.MAX_SAFE_INTEGER).length > text.length) truncated++;
+    out.push(text);
+  }
+  if (overflow && (dropped > 0 || truncated > 0)) {
+    const owner = String(overflow.ownerId || 'unknown').slice(0, 6);
+    const key = `${owner}|${overflow.field}|${dropped}|${truncated}`;
+    if (!_profileOverflowWarned.has(key)) {
+      _profileOverflowWarned.add(key);
+      // Counts only — the dropped lines are user-authored content.
+      log.warn('agent profile list over budget', {
+        agent: owner,
+        field: overflow.field,
+        kept: out.length,
+        dropped,
+        truncated,
+        limit,
+        max_chars: max,
+      });
+    }
+  }
+  return out.length ? out : undefined;
+}
+
+/** Resident runtime guidance is paid on every Agent turn. Keep new authored
+ * lists small; legacy specs remain readable through the separate 16-item
+ * normalization path above. */
+export const AGENT_GUIDANCE_ITEM_LIMIT = 5;
+
+function _guidanceListOverLimit(raw: unknown): boolean {
+  return (_profileTextList(raw, AGENT_GUIDANCE_ITEM_LIMIT + 1)?.length || 0)
+    > AGENT_GUIDANCE_ITEM_LIMIT;
+}
+
+function _assertAgentGuidanceMutationValid(
+  updates: Pick<UpdateAgentFields, 'profile' | 'knowhow' | 'standards'>,
+): void {
+  const over: Array<'knowhow' | 'standards'> = [];
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'knowhow')
+    && _guidanceListOverLimit(updates.knowhow)) over.push('knowhow');
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'standards')
+    && _guidanceListOverLimit(updates.standards)) over.push('standards');
+  if (updates?.profile && typeof updates.profile === 'object') {
+    if (_guidanceListOverLimit(updates.profile.knowhow)) over.push('knowhow');
+    if (_guidanceListOverLimit(updates.profile.standards)) over.push('standards');
+  }
+  if (!over.length) return;
+  const fields = [...new Set(over)].join(', ');
+  throw new Error(
+    `${fields} exceeds the maximum of ${AGENT_GUIDANCE_ITEM_LIMIT} items; `
+    + 'merge overlapping items or move route-specific rules into Skills',
+  );
+}
+
+function _profileStats(raw: unknown, limit = 8): AgentProfileStat[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: AgentProfileStat[] = [];
+  for (const item of arr) {
+    const obj = _plainObj(item);
+    if (!obj) continue;
+    const key = _firstProfileString(obj, ['key', 'k', 'label', 'title'], 80);
+    const rawValue = obj.value ?? obj.v ?? obj.count;
+    const value = (typeof rawValue === 'number' && Number.isFinite(rawValue))
+      ? rawValue
+      : _cleanProfileString(rawValue, 80);
+    if (!key || value === '') continue;
+    const stat: AgentProfileStat = { key, value };
+    const unit = _firstProfileString(obj, ['unit', 'u'], 32);
+    const label = _firstProfileString(obj, ['label'], 80);
+    if (unit) stat.unit = unit;
+    if (label && label !== key) stat.label = label;
+    out.push(stat);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileRecent(raw: unknown, limit = 8): AgentProfileRecent[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: AgentProfileRecent[] = [];
+  for (const item of arr) {
+    const obj = _plainObj(item);
+    if (!obj) continue;
+    const title = _firstProfileString(obj, ['title', 't', 'name'], 220);
+    if (!title) continue;
+    const recent: AgentProfileRecent = { title };
+    const when = _firstProfileString(obj, ['when', 'time', 'updated_at', 'updatedAt'], 80);
+    const project = _firstProfileString(obj, ['project', 'proj'], 140);
+    if (when) recent.when = when;
+    if (project) recent.project = project;
+    out.push(recent);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileValue(profile: Record<string, unknown>, raw: Record<string, unknown>, keys: string[]): unknown {
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(profile, k)) return profile[k];
+  }
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(raw, k)) return raw[k];
+  }
+  return undefined;
+}
+
+function normalizeAgentProfile(
+  raw: AgentRaw | null | undefined,
+  ownerId?: string,
+): AgentProfile | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const outer = raw as Record<string, unknown>;
+  const embedded = _plainObj(raw.profile) || {};
+  const profile: AgentProfile = {};
+
+  const role = _cleanProfileString(_profileValue(embedded, outer, ['role']), 140);
+  const dispatch = _cleanProfileString(_profileValue(embedded, outer, ['dispatch']), 520);
+  if (role) profile.role = role;
+  if (dispatch) profile.dispatch = dispatch;
+
+  const knowhow = _profileTextList(
+    Object.prototype.hasOwnProperty.call(outer, 'knowhow') ? outer.knowhow : embedded.knowhow,
+    16,
+    220,
+    { field: 'knowhow', ownerId },
+  );
+  const standards = _profileTextList(
+    Object.prototype.hasOwnProperty.call(outer, 'standards') ? outer.standards : embedded.standards,
+    16,
+    220,
+    { field: 'standards', ownerId },
+  );
+  if (knowhow) profile.knowhow = knowhow;
+  if (standards) profile.standards = standards;
+
+  const scopeObj = _plainObj(embedded.scope) || {};
+  const accepts = _profileStringList(
+    scopeObj.accepts ?? scopeObj.accept ?? embedded.doYes ?? outer.doYes,
+    16,
+  );
+  const rejects = _profileStringList(
+    scopeObj.rejects ?? scopeObj.reject ?? embedded.doNo ?? outer.doNo,
+    16,
+  );
+  if (accepts || rejects) {
+    profile.scope = {};
+    if (accepts) profile.scope.accepts = accepts;
+    if (rejects) profile.scope.rejects = rejects;
+  }
+
+  const stats = _profileStats(_profileValue(embedded, outer, ['stats']), 8);
+  const recent = _profileRecent(_profileValue(embedded, outer, ['recent']), 8);
+  const assets = _profileStringList(_profileValue(embedded, outer, ['assets']), 12);
+  const serving = _profileStringList(_profileValue(embedded, outer, ['serving']), 12);
+  if (stats) profile.stats = stats;
+  if (recent) profile.recent = recent;
+  if (assets) profile.assets = assets;
+  if (serving) profile.serving = serving;
+
+  return Object.keys(profile).length ? profile : undefined;
+}
+
+function normalizeAgentRuntimeStats(raw: unknown): AgentRuntimeStats | undefined {
+  const stats = normalizeAgentRuntimeStatsFile(raw);
+  return (
+    stats.attempts
+    || stats.successes
+    || stats.deliveries
+    || stats.execution_failures
+    || stats.failures
+    || stats.errors
+    || stats.total_duration_ms
+    || stats.successful_duration_ms
+    || stats.updated_at
+  )
+    ? stats
+    : undefined;
+}
+
+export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSourceInput): Agent | null {
+  if (!raw || typeof raw !== 'object' || !raw.agent_id) return null;
+  // Migrate legacy single-`description` into the matching language slot.
+  // Same Chinese-character heuristic as the skill loader; explicit > legacy.
+  const legacyDesc = typeof raw.description === 'string' ? raw.description.trim() : '';
+  const explicitZh = typeof raw.description_zh === 'string' ? raw.description_zh.trim() : '';
+  const explicitEn = typeof raw.description_en === 'string' ? raw.description_en.trim() : '';
+  const legacyHasChinese = /[一-鿿]/.test(legacyDesc);
+  const agent: Agent = {
+    agent_id: raw.agent_id,
+    name: typeof raw.name === 'string' ? raw.name : '',
+    description_zh: explicitZh || (legacyDesc && legacyHasChinese ? legacyDesc : ''),
+    description_en: explicitEn || (legacyDesc && !legacyHasChinese ? legacyDesc : ''),
+    workflow: typeof raw.workflow === 'string' ? raw.workflow : '',
+    category: typeof raw.category === 'string' ? raw.category : '',
+    ...(typeof raw.status === 'string' ? { status: raw.status } : (
+      typeof raw.state === 'string' ? { status: raw.state } : {}
+    )),
+    source: normalizeAgentSource(source),
+    created_at: raw.created_at || '',
+    updated_at: raw.updated_at || '',
+    // Defaults to enabled; overlaid by listAgents / getAgent from the
+    // per-user enabled-overrides map. Don't read this field from raw JSON —
+    // it is never persisted.
+    enabled: true,
+  };
+  const profile = normalizeAgentProfile(raw, raw.agent_id);
+  if (profile) agent.profile = profile;
+  const runtimeStats = normalizeAgentRuntimeStats(raw.runtime_stats);
+  if (runtimeStats) agent.runtime_stats = runtimeStats;
+  // skill_list is authoring metadata / compatibility state. Anything else
+  // (string, object, null) is treated as "unset" so malformed JSON does not
+  // produce misleading dependency metadata.
+  if (Array.isArray(raw.skill_list)) {
+    agent.skill_list = raw.skill_list.filter(
+      (v): v is string => typeof v === 'string' && safeId(v),
+    );
+  }
+  const hasToolList = Object.prototype.hasOwnProperty.call(raw, 'tool_list');
+  if (Array.isArray(raw.tool_list)) {
+    const invalid = raw.tool_list.filter((value) => (
+      typeof value !== 'string' || invalidAgentToolGroupRefs([value]).length > 0
+    ));
+    if (!invalid.length) {
+      agent.tool_list = canonicalizeAgentToolGroups(raw.tool_list as string[]);
+    } else {
+      // An explicitly malformed dependency contract must never broaden into
+      // the historical missing-field compatibility surface.
+      agent.tool_list = [];
+      log.warn('agent invalid tool_list normalized to host-only', { agent_id: maskId(raw.agent_id) });
+    }
+  } else if (hasToolList) {
+    agent.tool_list = [];
+    log.warn('agent malformed tool_list normalized to host-only', { agent_id: maskId(raw.agent_id) });
+  }
+  // inputs follows the same three-state convention as skill_list. Only the
+  // exact-array branch makes it through; malformed JSON is treated as "unset"
+  // rather than "zero", so a corrupted field never silently erases the real
+  // schema at read time.
+  if (Array.isArray(raw.inputs)) {
+    agent.inputs = validateAgentInputs(raw.inputs);
+  }
+  if (avatars.isKnownIcon(raw.icon)) agent.icon = raw.icon;
+  if (avatars.isKnownColor(raw.color)) agent.color = raw.color;
+  // interactive — tolerant boolean coerce (LLMs sometimes emit "true"/"false"
+  // strings). Missing/malformed → undefined; downstream readers treat
+  // undefined the same as false.
+  if (typeof raw.interactive === 'boolean') {
+    agent.interactive = raw.interactive;
+  } else if (raw.interactive === 'true') {
+    agent.interactive = true;
+  } else if (raw.interactive === 'false') {
+    agent.interactive = false;
+  }
+  // input_channel — closed enum; anything but the explicit prose opt-out
+  // collapses to "no field set" (downstream readers default to form).
+  if (raw.input_channel === 'prose') agent.input_channel = 'prose';
+  const rt = _normalizeRuntime(raw.runtime);
+  if (rt) {
+    agent.runtime = rt;
+    if (rt.kind === 'cli' && cliIsCodingAgent(rt.cli)) {
+      // Older coding-agent specs can predate the host-owned project_dir
+      // schema. Repair only the normalized read view: the empty default means
+      // "inherit workspace", and no machine-specific path is written back to
+      // the cloud-synced agent.json.
+      agent.inputs = _withCodingProjectDirInput(agent.inputs || []);
+    }
+  }
+  // output_format: enum-coerce + legacy alias canonicalization. Missing /
+  // unknown collapses to "no field set" (downstream reads default to 'auto').
+  const outputFormat = _canonicalOutputFormat(raw.output_format);
+  if (outputFormat && outputFormat !== 'auto') {
+    agent.output_format = outputFormat;
+  }
+  return agent;
+}
+
+/** Validate / coerce a raw `runtime` field. Unknown shapes return null
+ *  (= drop the field; the agent falls back to the in-process default).
+ *  Kept loose on purpose: front-end and edit-prompt may both write here
+ *  and a malformed value mustn't poison reads. */
+function _normalizeRuntime(raw: unknown): AgentRuntime | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const kind = r.kind;
+  if (kind === 'in_process') return { kind: 'in_process' };
+  if (kind !== 'cli') return null;
+  const cli = typeof r.cli === 'string' ? r.cli.trim() : '';
+  if (!cli) return null;
+  const out: AgentRuntime = { kind: 'cli', cli };
+  const modelOverride = _normalizeCliRuntimeOverride(r.model_override);
+  if (modelOverride) out.model_override = modelOverride;
+  const thinkingLevel = _normalizeCliRuntimeOverride(r.thinking_level);
+  if (thinkingLevel) out.thinking_level = thinkingLevel;
+  const permissionPolicy = r.permission_policy;
+  if ((permissionPolicy === 'ask' || permissionPolicy === 'full_access')
+      && localCliSupportsPermissionPolicy(cli, permissionPolicy)
+      && permissionPolicy !== localCliDefaultPermissionPolicy(cli)) {
+    out.permission_policy = permissionPolicy;
+  }
+  if (Array.isArray(r.custom_args)) {
+    const args = r.custom_args.filter((s): s is string => typeof s === 'string');
+    if (args.length) out.custom_args = args;
+  }
+  return out;
+}
+
+function _normalizeCliRuntimeOverride(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) return '';
+  return trimmed;
+}
+
+/** True when this CLI is a coding agent with project-directory support. Coding
+ *  agents are dispatched with a per-conversation project directory as
+ *  cwd instead of the user workspace; the chip in the conversation
+ *  surface lets the user set it. Single source of truth for both UI
+ *  visibility and dispatch routing. */
+export function cliIsCodingAgent(cli: string | undefined): boolean {
+  return localCliCapabilities(cli).codingProjectDirectory;
+}
+
+/** True when this agent runs via a local CLI rather than in-process
+ *  core-agent. Single source of truth — group_chat / chats / renderer
+ *  all import this rather than re-checking `runtime?.kind` directly. */
+export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): boolean {
+  return !!agent && agent.runtime?.kind === 'cli';
+}
+
+interface AgentRuntimeLocalConfig {
+  version: 2;
+  project_dirs: Record<string, { path: string; updated_at?: string }>;
+  resolved_models: Record<string, AgentCliResolvedModelInfo>;
+}
+
+export interface AgentCliResolvedModelInfo {
+  cli: LocalCliType;
+  /** Empty means the run inherited Claude Code's account/config default. */
+  requested_model: string;
+  resolved_model: string;
+  updated_at: string;
+}
+
+export interface AgentCliProjectDirInfo {
+  agent_id: string;
+  is_coding: boolean;
+  /** `workspace` means no per-agent override; `custom` means the user picked a directory. */
+  mode: 'workspace' | 'custom';
+  /** Display path. For a missing custom dir this remains the selected path. */
+  path: string;
+  /** Actual cwd used by dispatch. Falls back to workspace when a custom dir vanished. */
+  effective_path: string;
+  workspace_path: string;
+  custom_path?: string;
+  exists: boolean;
+}
+
+function _emptyAgentRuntimeConfig(): AgentRuntimeLocalConfig {
+  return { version: 2, project_dirs: {}, resolved_models: {} };
+}
+
+function _readAgentRuntimeConfig(uid: string): AgentRuntimeLocalConfig {
+  const file = userAgentRuntimeConfigFile(uid);
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const out = _emptyAgentRuntimeConfig();
+    const dirs = raw && typeof raw === 'object' ? (raw as any).project_dirs : null;
+    if (dirs && typeof dirs === 'object') {
+      for (const [agentId, entry] of Object.entries(dirs)) {
+        if (!safeId(agentId) || !entry || typeof entry !== 'object') continue;
+        const p = typeof (entry as any).path === 'string' ? (entry as any).path.trim() : '';
+        if (!p) continue;
+        out.project_dirs[agentId] = {
+          path: path.resolve(p),
+          ...(typeof (entry as any).updated_at === 'string' ? { updated_at: (entry as any).updated_at } : {}),
+        };
+      }
+    }
+    const resolvedModels = raw && typeof raw === 'object' ? (raw as any).resolved_models : null;
+    if (resolvedModels && typeof resolvedModels === 'object') {
+      for (const [agentId, entry] of Object.entries(resolvedModels)) {
+        if (!safeId(agentId) || !entry || typeof entry !== 'object') continue;
+        const cli = typeof (entry as any).cli === 'string'
+          && (LOCAL_CLI_TYPES as readonly string[]).includes((entry as any).cli)
+          ? (entry as any).cli as LocalCliType
+          : null;
+        const resolvedModel = _normalizeCliRuntimeOverride((entry as any).resolved_model);
+        const requestedModel = _normalizeCliRuntimeOverride((entry as any).requested_model) || '';
+        const updatedAt = typeof (entry as any).updated_at === 'string'
+          ? (entry as any).updated_at.trim().slice(0, 80)
+          : '';
+        if (!cli || !resolvedModel || !updatedAt) continue;
+        out.resolved_models[agentId] = {
+          cli,
+          requested_model: requestedModel,
+          resolved_model: resolvedModel,
+          updated_at: updatedAt,
+        };
+      }
+    }
+    return out;
+  } catch {
+    return _emptyAgentRuntimeConfig();
+  }
+}
+
+function _writeAgentRuntimeConfig(uid: string, cfg: AgentRuntimeLocalConfig): void {
+  const file = userAgentRuntimeConfigFile(uid);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function _deleteAgentRuntimeConfigEntry(uid: string, agentId: string): void {
+  const cfg = _readAgentRuntimeConfig(uid);
+  const hasProjectDir = Object.prototype.hasOwnProperty.call(cfg.project_dirs, agentId);
+  const hasResolvedModel = Object.prototype.hasOwnProperty.call(cfg.resolved_models, agentId);
+  if (!hasProjectDir && !hasResolvedModel) return;
+  delete cfg.project_dirs[agentId];
+  delete cfg.resolved_models[agentId];
+  _writeAgentRuntimeConfig(uid, cfg);
+}
+
+/** Last concrete model reported by a local CLI for this Agent on this device.
+ * It is intentionally local-only: account configuration and provider routing
+ * can resolve the same stable alias differently on another machine. */
+export function getAgentCliResolvedModelInfo(
+  userId: string,
+  agentId: string,
+): AgentCliResolvedModelInfo | null {
+  if (!safeId(agentId)) return null;
+  return _readAgentRuntimeConfig(userId).resolved_models[agentId] || null;
+}
+
+export function recordAgentCliResolvedModel(
+  userId: string,
+  agentId: string,
+  cli: string,
+  requestedModel: unknown,
+  resolvedModel: unknown,
+): AgentCliResolvedModelInfo | null {
+  if (!safeId(agentId) || !(LOCAL_CLI_TYPES as readonly string[]).includes(cli)) return null;
+  const resolved = _normalizeCliRuntimeOverride(resolvedModel);
+  if (!resolved) return null;
+  const observation: AgentCliResolvedModelInfo = {
+    cli: cli as LocalCliType,
+    requested_model: _normalizeCliRuntimeOverride(requestedModel) || '',
+    resolved_model: resolved,
+    updated_at: nowIso(),
+  };
+  const cfg = _readAgentRuntimeConfig(userId);
+  cfg.resolved_models[agentId] = observation;
+  _writeAgentRuntimeConfig(userId, cfg);
+  return observation;
+}
+
+function _dirExists(dirPath: string): boolean {
+  try { return fs.statSync(dirPath).isDirectory(); }
+  catch { return false; }
+}
+
+/** Resolve the per-agent project directory shown on the detail page and
+ *  used to initialise each conversation's coding cwd. Stored overrides are
+ *  local-only because absolute paths are machine-specific. Missing config =
+ *  effective workspace for the conversation/project scope. */
+export function getCliProjectDirInfoForAgent(
+  userId: string,
+  agent: Pick<Agent, 'agent_id' | 'runtime'>,
+  projectId?: string,
+): AgentCliProjectDirInfo {
+  const workspacePath = getWorkspacePath(userId, projectId);
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const isCoding = cliIsCodingAgent(cli);
+  const entry = isCoding ? _readAgentRuntimeConfig(userId).project_dirs[agent.agent_id] : undefined;
+  const customPath = entry?.path ? path.resolve(entry.path) : '';
+  const customExists = !!customPath && _dirExists(customPath);
+  return {
+    agent_id: agent.agent_id,
+    is_coding: isCoding,
+    mode: customPath ? 'custom' : 'workspace',
+    path: customPath || workspacePath,
+    effective_path: customExists ? customPath : workspacePath,
+    workspace_path: workspacePath,
+    ...(customPath ? { custom_path: customPath } : {}),
+    exists: customPath ? customExists : true,
+  };
+}
+
+export async function getAgentCliProjectDirInfo(
+  userId: string,
+  agentId: string,
+  projectId?: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  return getCliProjectDirInfoForAgent(userId, agent, projectId);
+}
+
+/** Set or clear the detail-page project directory for an external coding
+ *  agent. `dirPath=''` clears the override and returns to workspace mode. */
+export async function setAgentCliProjectDir(
+  userId: string,
+  agentId: string,
+  dirPath: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  if (!cliIsCodingAgent(cli)) {
+    const err: any = new Error('agent is not an external coding agent');
+    err.code = 'E_AGENT_NOT_CODING_CLI';
+    throw err;
+  }
+
+  const cfg = _readAgentRuntimeConfig(userId);
+  const trimmed = String(dirPath || '').trim();
+  if (!trimmed) {
+    delete cfg.project_dirs[agentId];
+  } else {
+    const resolved = path.resolve(trimmed);
+    if (!_dirExists(resolved)) {
+      const err: any = new Error(t('errors.dir_not_exists'));
+      err.code = 'E_DIR_NOT_EXISTS';
+      throw err;
+    }
+    cfg.project_dirs[agentId] = { path: resolved, updated_at: nowIso() };
+  }
+  _writeAgentRuntimeConfig(userId, cfg);
+  return getCliProjectDirInfoForAgent(userId, agent);
+}
+
+// Bump when normalized rows or scan completeness changes. Version 4 rebuilds
+// snapshots that older tolerant reads could persist after a source failure.
+const AGENT_CATALOG_CACHE_VERSION = 4;
+const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
+// A scan that skipped an unreadable definition is reused only briefly, then
+// retried, so a repaired file reappears without a catalog-root change.
+const AGENT_PARTIAL_CATALOG_TTL_MS = 2_000;
+
+// `expiresAt` is set only for partial scans; complete scans live until the stamp changes.
+interface AgentListCache { stamp: string; data: Agent[]; expiresAt?: number }
+interface AgentEnrichedCache { specs: Agent[]; uid: string; expiresAt: number; data: Agent[] }
+let _agentListCache: AgentListCache | null = null;
+let _agentEnrichedCache: AgentEnrichedCache | null = null;
+let _agentListCacheGeneration = 0;
+
+function _agentCatalogCacheFile(userId = getActiveUserId()): string {
+  return userAgentCatalogCacheFile(userId);
+}
+
+function _readPersistedAgentCatalog(stamp: string): Agent[] | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(_agentCatalogCacheFile(), 'utf8'));
+    if (raw?.version !== AGENT_CATALOG_CACHE_VERSION || raw?.stamp !== stamp || !Array.isArray(raw.data)) return null;
+    return raw.data as Agent[];
+  } catch {
+    return null;
+  }
+}
+
+function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
+  try {
+    writeJsonSync(_agentCatalogCacheFile(), {
+      version: AGENT_CATALOG_CACHE_VERSION,
+      stamp,
+      data,
+    });
+  } catch (err) {
+    log.warn('agent catalog cache write failed', { error: logErrorSummary(err) });
+  }
+}
+
+function _invalidateAgentListCache(opts: { userId?: string } = {}): void {
+  const userId = opts.userId || getActiveUserId();
+  _agentListCacheGeneration += 1;
+  _agentListCache = null;
+  _agentEnrichedCache = null;
+  try { fs.rmSync(_agentCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
+}
+
+/** Re-read definitions after an external writer changes Agent files. */
+export function invalidateAgentListCache(): void {
+  _invalidateAgentListCache();
+}
+
+/** Drop memory and disk catalog caches after marketplace reconciliation. */
+export function clearAgentListCache(): void {
+  _invalidateAgentListCache();
+}
+
+/** Persist the active user's enabled override; list reads overlay it separately. */
+export function setAgentEnabledForActiveUser(agentId: string, enabled: boolean): void {
+  setAgentEnabled(getActiveUserId(), agentId, enabled);
+}
+
+// Six fixed source/stage buckets cap failure storms without retaining account,
+// Agent or path identifiers. Never forward an OS/JSON error's private text.
+const _catalogFailureWarnedAt = new Map<string, number>();
+const CATALOG_READ_ERROR_CODES = new Set([
+  'EACCES', 'EPERM', 'EIO', 'EBUSY', 'ENOTDIR', 'EISDIR',
+  'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
+]);
+
+function _catalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate', error: unknown): Error {
+  _warnCatalogReadFailure(source, stage, error);
+  return new Error('Agent catalog unavailable');
+}
+
+function _warnCatalogReadFailure(source: 'custom' | 'marketplace', stage: 'stamp' | 'enumerate' | 'definition', error: unknown): void {
+  const key = `${source}:${stage}`;
+  const now = Date.now();
+  const previous = _catalogFailureWarnedAt.get(key);
+  if (previous === undefined || now < previous || now - previous >= 60_000) {
+    _catalogFailureWarnedAt.set(key, now);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    log.warn('agent catalog read failed', {
+      source, stage,
+      error_code: error instanceof SyntaxError ? 'syntax_error'
+        : typeof code === 'string' && CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
+    });
+  }
+}
+
+function _agentDirStamp(): string {
+  let stamp = '';
+  for (const [source, d] of [['custom', CUSTOM_AGENTS_DIR()], ['marketplace', userMarketplaceAgentsDir(getActiveUserId())]] as const) {
+    try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _catalogReadFailure(source, 'stamp', error);
+      stamp += `${d}:0;`;
+    }
+  }
+  return stamp;
+}
+
+function _childDirectoryIds(dir: string): Set<string> {
+  try {
+    return new Set(fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name));
+  } catch {
+    return new Set();
+  }
+}
+
+function _enrichAgentSpecs(uid: string, specs: Agent[]): Promise<Agent[]> {
+  if (
+    _agentEnrichedCache
+    && _agentEnrichedCache.uid === uid
+    && _agentEnrichedCache.specs === specs
+    && _agentEnrichedCache.expiresAt > Date.now()
+  ) {
+    return Promise.resolve(_agentEnrichedCache.data);
+  }
+  return _skillSpecsForDisplay().then((displaySkillSpecs) => {
+    // Most installed agents live under local/marketplace and have neither
+    // memory nor runtime stats. Two directory reads identify the sparse set
+    // that can have overlays, avoiding two failed file opens per catalog row.
+    const cloudAgentIds = _childDirectoryIds(userAgentsDir(uid));
+    const memoryAgentIds = _childDirectoryIds(path.join(userMemoryDir(uid), 'agents'));
+    const data = specs
+      .map((agent) => _withDisplaySkillRefs(agent, displaySkillSpecs))
+      .map((agent) => (
+        cloudAgentIds.has(agent.agent_id) || memoryAgentIds.has(agent.agent_id)
+          ? _withAgentMemoryEntries(uid, agent)
+          : agent
+      ))
+      .map((agent) => (
+        cloudAgentIds.has(agent.agent_id) ? _withAgentRuntimeStats(uid, agent) : agent
+      ));
+    _agentEnrichedCache = {
+      specs,
+      uid,
+      expiresAt: Date.now() + AGENT_ENRICHED_CACHE_TTL_MS,
+      data,
+    };
+    return data;
+  });
+}
+
+/** Read the normalized catalog specs once. Full listings add mutable display
+ * overlays below; chat-startup summaries deliberately do not. */
+async function _listAgentSpecs(): Promise<Agent[]> {
+  const generation = _agentListCacheGeneration;
+  const stamp = _agentDirStamp();
+  let specs: Agent[];
+  const now = Date.now();
+  const expiresAt = _agentListCache?.expiresAt;
+  if (
+    _agentListCache && _agentListCache.stamp === stamp
+    // A backwards clock jump must not extend a partial scan's lifetime.
+    && (expiresAt === undefined || (expiresAt > now && expiresAt - now <= AGENT_PARTIAL_CATALOG_TTL_MS))
+  ) {
+    specs = _agentListCache.data;
+  } else {
+    const persisted = _readPersistedAgentCatalog(stamp);
+    let partial = false;
+    if (persisted) {
+      specs = persisted;
+    } else {
+      specs = [];
+      const seen = new Set<string>();
+      const sources = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]] as const;
+      for (const [source, dir] of sources) {
+        // An unreadable root hides every Agent in that source, so the catalog
+        // is unknown rather than smaller.
+        const entries = (await fsp.readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+          if (error?.code === 'ENOENT') return [];
+          throw _catalogReadFailure(source, 'enumerate', error);
+        }))
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        for (const e of entries) {
+          const full = path.join(dir, e.name, 'agent.json');
+          let data: AgentRaw;
+          try { data = await readJson<AgentRaw>(full, { strict: true }); }
+          catch (error) {
+            // A staging directory may not contain a definition yet.
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+            // One unreadable/malformed definition hides only that Agent. Keep
+            // its id reserved so a same-id custom copy cannot take its place.
+            _warnCatalogReadFailure(source, 'definition', error);
+            partial = true;
+            seen.add(e.name);
+            continue;
+          }
+          const norm = normalizeAgent(data, source);
+          if (!norm) continue;
+          if (isMarketplaceSource(source)) {
+            // Marketplace-installed agents carry `_install.json` with version + freshness.
+            // Author uid may also be present there for install/reconcile compatibility, but the
+            // global UI intentionally does not surface it.
+            _applyMarketplaceInstallMeta(norm, path.join(dir, e.name));
+          }
+          if (seen.has(norm.agent_id)) {
+            if (source === 'custom') {
+              log.warn('agent id conflict: marketplace takes precedence over custom', { agent_id: maskId(norm.agent_id) });
+            }
+            continue;
+          }
+          seen.add(norm.agent_id);
+          specs.push(norm);
+        }
+      }
+      // A create/update can finish while this scan awaits disk IO. Directory
+      // mtime alone cannot detect it: creating agent.json changes the child,
+      // not the catalog root. Never republish a pre-invalidation snapshot.
+      if (generation !== _agentListCacheGeneration) return _listAgentSpecs();
+      // Never persist a partial scan: a later restart must retry the skipped file.
+      if (!partial) _writePersistedAgentCatalog(stamp, specs);
+    }
+    _agentListCache = partial
+      ? { stamp, data: specs, expiresAt: Date.now() + AGENT_PARTIAL_CATALOG_TTL_MS }
+      : { stamp, data: specs };
+    _agentEnrichedCache = null;
+  }
+  return specs;
+}
+
+/** The chat-first renderer needs identities for mentions, actor labels and
+ * avatars — not workflows, profiles, memory entries or skill metadata. Keep
+ * that startup IPC payload intentionally small; the full list remains the
+ * Agents-tab contract. */
+export type AgentSummary = Pick<
+  Agent,
+  'agent_id' | 'name' | 'source' | 'seed_source' | 'icon' | 'color' | 'category' | 'runtime'
+> & { enabled: boolean };
+
+/** Minimal data needed for global agent search. This deliberately avoids the
+ * full-list enrichments (workflow display skills, memory and runtime stats). */
+export type AgentSearchListing = Pick<
+  Agent,
+  'agent_id' | 'name' | 'source' | 'seed_source' | 'runtime' | 'description_zh' | 'description_en'
+> & { enabled: boolean };
+
+export async function listAgentSummaries(): Promise<AgentSummary[]> {
+  const specs = await _listAgentSpecs();
+  const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+  return specs.map((agent) => ({
+    agent_id: agent.agent_id,
+    name: agent.name,
+    source: agent.source,
+    seed_source: agent.seed_source,
+    icon: agent.icon,
+    color: agent.color,
+    category: agent.category,
+    runtime: agent.runtime,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
+}
+
+export async function listAgentSearchListings(): Promise<AgentSearchListing[]> {
+  const specs = await _listAgentSpecs();
+  const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+  return specs.map((agent) => ({
+    agent_id: agent.agent_id,
+    name: agent.name,
+    source: agent.source,
+    seed_source: agent.seed_source,
+    runtime: agent.runtime,
+    description_zh: agent.description_zh,
+    description_en: agent.description_en,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
+}
+
+export async function listAgents(): Promise<Agent[]> {
+  const specs = await _listAgentSpecs();
+  // Overlay per-user enabled overrides outside the cache so toggles take
+  // effect immediately without busting the disk-spec cache. Cheap — one
+  // small JSON file read per call.
+  const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+  const enriched = await _enrichAgentSpecs(getActiveUserId(), specs);
+  return enriched.map((agent) => ({
+    ...agent,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
+}
+
+/**
+ * Look up an agent by id. Marketplace/builtin wins on id collision.
+ * Returns normalized agent or null.
+ */
+export async function getAgent(agentId: string | null | undefined): Promise<Agent | null> {
+  if (!agentId) return null;
+  for (const source of ['marketplace', 'custom'] as AgentSource[]) {
+    const f = isMarketplaceSource(source)
+      ? _platformAgentSpecFile(agentId)
+      : agentDefinitionFile(getActiveUserId(), agentId);
+    if (!fs.existsSync(f)) continue;
+    try {
+      const data = await readJson<AgentRaw>(f);
+      const norm = normalizeAgent(data, source);
+      if (norm) {
+        if (isMarketplaceSource(source)) {
+          _applyMarketplaceInstallMeta(norm, path.dirname(f));
+        }
+        const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+        norm.enabled = !disabledAgentIds.has(norm.agent_id);
+        return _withAgentRuntimeStats(
+          getActiveUserId(),
+          _withAgentMemoryEntries(getActiveUserId(), _withDisplaySkillRefs(norm, await _skillSpecsForDisplay())),
+        );
+      }
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3. Custom CRUD
+// ─────────────────────────────────────────────────────────────────────────
+
+/** spec.json path for the active user's custom agent. Platform agents go
+ *  through `_platformAgentSpecFile` directly. */
+function customAgentFile(agentId: string): string {
+  return agentDefinitionFile(getActiveUserId(), agentId);
+}
+
+export interface CreateAgentOptions {
+  name?: string;
+  /** Single-language seed; routed into the current UI language slot. Use
+   *  `description_zh` / `description_en` directly only when both languages
+   *  are explicitly known. */
+  description?: string;
+  description_zh?: string;
+  description_en?: string;
+  workflow?: string;
+  icon?: string;
+  color?: string;
+  interactive?: boolean;
+  /** Optional structured display profile. Legacy callers omit this and keep
+   *  the old description/workflow-only shape. */
+  profile?: AgentProfile;
+  knowhow?: string[];
+  standards?: string[];
+  /** Fixed built-in tool groups for an in-process Agent. Omitted keeps the
+   * manual-create staging default (`[]`); model-authored creation requires an
+   * explicit array so a missing dependency list cannot create a broken Agent. */
+  tool_list?: string[];
+  /** Explicit enabled shared Skill dependencies, resolved before creating state. */
+  skill_list?: string[];
+  /** Picked at create time from the modal's runtime selector. Stored as
+   *  authored — `normalizeAgent` validates on read. */
+  runtime?: AgentRuntime;
+  /** Marketplace category code. Empty string / omitted remains tolerated for legacy/manual specs. */
+  category?: string;
+  /** Output rendering preference picked in the create-modal dropdown. Validated against
+   *  `_OUTPUT_FORMAT_VALUES` before persist — unknown values silently drop the field
+   *  (= default auto semantics). The modal sends `'auto'` by default; omitted = field
+   *  stays unset on disk and is treated as auto at dispatch time. */
+  output_format?: OutputFormat;
+}
+
+/** Route a single `description` input into the current UI language slot.
+ *  Explicit `description_zh` / `description_en` always win. Returns the
+ *  pair of resolved values (already trimmed; `''` when nothing to set). */
+function resolveBilingualDescription(
+  legacy: string | undefined,
+  zh: string | undefined,
+  en: string | undefined,
+): { description_zh: string; description_en: string } {
+  const l = (legacy || '').trim();
+  const z = (zh || '').trim();
+  const e = (en || '').trim();
+  const lang = descriptionLang(getLanguage());
+  return {
+    description_zh: z || (l && lang === 'zh' ? l : ''),
+    description_en: e || (l && lang !== 'zh' ? l : ''),
+  };
+}
+
+async function _skillSpecsForDisplay(userId = getActiveUserId()): Promise<SkillAllowlistRef[]> {
+  try { return await listSkillSpecsForAgentMetadata(userId); }
+  catch (err) {
+    log.warn('skill display-name map unavailable', { error: logErrorSummary(err) });
+    return [];
+  }
+}
+
+async function _normalizeWorkflowSkillIds(workflow: string, userId = getActiveUserId()): Promise<string> {
+  const text = String(workflow || '');
+  if (!text) return text;
+  return normalizeKnownSkillRefsForDisplay(text, await _skillSpecsForDisplay(userId));
+}
+
+function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent {
+  const workflow = normalizeKnownSkillRefsForDisplay(agent.workflow || '', specs);
+  return workflow === agent.workflow ? agent : { ...agent, workflow };
+}
+
+function _withAgentMemoryEntries(userId: string, agent: Agent): Agent {
+  if (!_agentSupportsMemory(agent)) {
+    if (!agent.profile || agent.profile.memory === undefined) return agent;
+    const { memory: _memory, ...profile } = agent.profile;
+    return { ...agent, profile };
+  }
+  if (!agent.agent_id) return agent;
+  const res = listAgentEntries(userId, agent.agent_id);
+  const fileEntries = res.entries || [];
+  if (!fileEntries.length) return agent;
+  const existing = agent.profile?.memory || [];
+  const seen = new Set(existing.map((entry) => (entry.title || entry.description || '').trim()).filter(Boolean));
+  const memory = [...existing];
+  for (const text of fileEntries) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    memory.push({ title: trimmed, source: 'agent_memory' });
+  }
+  return {
+    ...agent,
+    profile: {
+      ...(agent.profile || {}),
+      memory,
+    },
+  };
+}
+
+function _agentSupportsMemory(agent: Pick<Agent, 'runtime'>): boolean {
+  return agent.runtime?.kind !== 'cli' || localCliSupportsAgentMemory(agent.runtime.cli);
+}
+
+async function _resolveAgentMemoryTarget(agentId: string): Promise<{
+  source: AgentSource;
+  file: string;
+  data: AgentRaw;
+  agent: Agent;
+} | null> {
+  for (const source of ['marketplace', 'custom'] as AgentSource[]) {
+    const file = isMarketplaceSource(source)
+      ? _platformAgentSpecFile(agentId)
+      : customAgentFile(agentId);
+    if (!fs.existsSync(file)) continue;
+    try {
+      const data = await readJson<AgentRaw>(file);
+      const norm = normalizeAgent(data, source);
+      if (norm?.agent_id === agentId) return { source, file, data, agent: norm };
+    } catch {
+      /* try the next source */
+    }
+  }
+  return null;
+}
+
+function _readAgentRuntimeStats(userId: string, agentId: string): AgentRuntimeStats | undefined {
+  if (!safeId(agentId)) return undefined;
+  try {
+    const raw = JSON.parse(fs.readFileSync(agentRuntimeStatsFile(userId, agentId), 'utf8'));
+    return normalizeAgentRuntimeStats(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function _withAgentRuntimeStats(userId: string, agent: Agent): Agent {
+  const runtimeStats = _readAgentRuntimeStats(userId, agent.agent_id);
+  return runtimeStats ? { ...agent, runtime_stats: runtimeStats } : agent;
+}
+
+function bumpAgentSpecRevision(data: AgentRaw): void {
+  data._v = (Number(data._v) || 0) + 1;
+}
+
+/**
+ * Create a custom agent. The call shape keeps historical optional fields, but
+ * the quality gate requires a usable name plus at least one description variant
+ * before the spec is written.
+ */
+const agentCreationLocks = new Map<string, Promise<void>>();
+
+async function withAgentCreationLock<T>(userId: string, run: () => Promise<T>): Promise<T> {
+  const previous = agentCreationLocks.get(userId) || Promise.resolve();
+  let release: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  agentCreationLocks.set(userId, gate);
+  await previous;
+  try { return await run(); }
+  finally {
+    release!();
+    if (agentCreationLocks.get(userId) === gate) agentCreationLocks.delete(userId);
+  }
+}
+
+export async function createCustomAgent(options: CreateAgentOptions = {}): Promise<Agent | null> {
+  const userId = getActiveUserId();
+  return withAgentCreationLock(userId, () => _createCustomAgentForUser(userId, options));
+}
+
+async function _createCustomAgentForUser(
+  userId: string,
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, tool_list, skill_list, runtime, category, output_format }: CreateAgentOptions = {},
+): Promise<Agent | null> {
+  assertAgentNameAllowed(name);
+  await assertAgentNameUnique(String(name || '').trim(), undefined, userId);
+  _assertAgentGuidanceMutationValid({ profile, knowhow, standards });
+  if (tool_list !== undefined) _assertToolListMutationValid({ tool_list });
+  const rt = _normalizeRuntime(runtime);
+  const skillList = rt?.kind !== 'cli' && skill_list !== undefined
+    ? await _resolveAgentSkillDependencies(userId, skill_list)
+    : undefined;
+  fs.mkdirSync(userAgentsDir(userId), { recursive: true });
+  let agentId: string;
+  do { agentId = genAgentId(); }
+  while (fs.existsSync(path.join(userMarketplaceAgentDir(userId, agentId), 'agent.json'))
+      || fs.existsSync(agentDefinitionFile(userId, agentId)));
+  const desc = resolveBilingualDescription(description, description_zh, description_en);
+  const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''), userId);
+  const data: AgentRaw = {
+    agent_id: agentId,
+    name: String(name || '').trim() || t('agent.default_name'),
+    description_zh: desc.description_zh,
+    description_en: desc.description_en,
+    workflow: normalizedWorkflow,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    _v: 1,
+    status: 'approved',
+  };
+  // Only emit `category` to disk when supplied; empty string is omitted so existing agents
+  // don't get spurious "category: ''" lines through resave. Candidate membership is dynamic,
+  // so this layer only normalizes the code shape.
+  const cleanCategory = typeof category === 'string' && category.trim()
+    ? normalizeMarketplaceCategoryCode(category)
+    : '';
+  if (cleanCategory) data.category = cleanCategory;
+  if (avatars.isKnownIcon(icon)) data.icon = icon;
+  if (avatars.isKnownColor(color)) data.color = color;
+  if (typeof interactive === 'boolean') data.interactive = interactive;
+  const cleanProfile = normalizeAgentProfile({ profile, knowhow, standards });
+  if (cleanProfile?.knowhow) data.knowhow = cleanProfile.knowhow;
+  if (cleanProfile?.standards) data.standards = cleanProfile.standards;
+  // Persist `output_format` only when the caller supplied a non-auto value the
+  // enum recognizes. Auto is the implicit default, so leaving it off keeps
+  // agent specs clean while dispatch still injects automatic layout rules.
+  const cleanOutputFormat = _canonicalOutputFormat(output_format);
+  if (cleanOutputFormat && cleanOutputFormat !== 'auto') {
+    data.output_format = cleanOutputFormat;
+  }
+  // Persist runtime only when it survives validation; an in_process
+  // selection is the implicit default and not written to disk so old
+  // tooling diffs cleanly.
+  if (rt && rt.kind === 'cli') {
+    data.runtime = rt;
+    // Coding CLIs need a working directory. We inject
+    // a `project_dir` input dependency so the standard agent-input-form
+    // pipeline collects it before the first dispatch — same UX as any
+    // other required input. The agent worker reads the submitted
+    // value to set CLI cwd.
+    if (cliIsCodingAgent(rt.cli)) {
+      data.inputs = [_buildProjectDirInput()];
+    }
+  } else {
+    // New in-process Agents are fixed-surface from birth. Manual creation is a
+    // staging flow and starts host-only; model-authored creation passes its
+    // explicit dependencies here so the first persisted spec is executable.
+    data.tool_list = Array.isArray(tool_list)
+      ? canonicalizeAgentToolGroups(tool_list)
+      : [];
+    if (skillList !== undefined) data.skill_list = skillList;
+  }
+  // Quality validation gate. EXTREME findings (missing required fields / red
+  // flags in workflow text / etc.) block the write; MEDIUM warnings pass
+  // through but are persisted for UI surfacing. Persist runs in both branches
+  // so the latest report on disk always matches the most recent intent.
+  const [report] = await validateWithOperatorPolicy(userId, { kind: 'agent', args: { agentJson: data } });
+  void persistQualityReport({
+    uid: userId, kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    throw new Error(_validationErrorMessage(report));
+  }
+
+  fs.mkdirSync(agentDir(userId, agentId), { recursive: true });
+  await writeJson(agentDefinitionFile(userId, agentId), data);
+  _invalidateAgentListCache({ userId });
+  log.info('custom agent created', { agent_id: maskId(agentId) });
+  return normalizeAgent(data, 'custom');
+}
+
+/** Build a single-line error message from a failed report. Used to surface
+ *  validation rejection up the create/update path's existing throw flow. */
+function _validationErrorMessage(report: QualityReport): string {
+  const top = report.violations.find((v) => v.level === 'EXTREME');
+  if (!top) return 'validation failed';
+  return `validation failed (${top.rule}): ${top.suggested_fix}`;
+}
+
+/** Required-input schema injected on every external coding agent. The
+ *  field id `project_dir` is a contract — the dispatch path looks for
+ *  exactly this id when extracting the cwd from a form submission.
+ *  Built at injection time so the persisted `label` follows the user's
+ *  current UI language (single-language per agent.json — bilingual lives
+ *  only in the locale table, not in the persisted schema). */
+export const PROJECT_DIR_INPUT_ID = 'project_dir';
+function _buildProjectDirInput(): AgentInput {
+  return {
+    id: PROJECT_DIR_INPUT_ID,
+    type: 'directory',
+    label: t('agent.cli.project_dir.label'),
+    required: true,
+    default: '',
+  };
+}
+
+function _withCodingProjectDirInput(inputs: AgentInput[]): AgentInput[] {
+  return [
+    _buildProjectDirInput(),
+    ...inputs.filter((input) => input.id !== PROJECT_DIR_INPUT_ID),
+  ];
+}
+
+export interface UpdateAgentFields {
+  name?: string;
+  description?: string;
+  description_zh?: string;
+  description_en?: string;
+  workflow?: string;
+  /** Display avatar tokens. Pass a string to set; omitted = untouched. */
+  icon?: string;
+  color?: string;
+  /** Three-way update:
+   *   array → replace (resolve enabled, target-eligible dependencies or reject)
+   *   null  → drop the dependency metadata
+   *   omitted → untouched */
+  skill_list?: string[] | null;
+  /** Three-way update for Agent-declarable tool groups; null drops the field,
+   * an empty array requests the host-only surface. */
+  tool_list?: string[] | null;
+  /** Parser-only rejection evidence. Never persisted: an explicit `<tools>`
+   * tag containing an unknown, host-managed, runtime-only, or malformed group must reject
+   * the whole mutation instead of becoming an omitted legacy-all field. */
+  tool_list_invalid_refs?: string[];
+  /** Three-way update mirror of `skill_list`:
+   *   array → replace (validated via `validateAgentInputs`)
+   *   null  → drop the field
+   *   omitted → untouched */
+  inputs?: AgentInput[] | null;
+  /** Three-way update:
+   *   boolean → set the flag
+   *   null  → drop the field (revert to "missing" = false at read time)
+   *   omitted → untouched */
+  interactive?: boolean | null;
+  /** Legacy compatibility input:
+   *   object → extract knowhow / standards into top-level fields
+   *   null   → drop legacy profile plus top-level knowhow / standards
+   *   omitted → untouched */
+  profile?: AgentProfile | null;
+  /** Three-way update for display capabilities. Stored as top-level agent.json
+   *  fields; `profile` is only a legacy compatibility input. */
+  knowhow?: string[] | null;
+  standards?: string[] | null;
+  /** Three-way update:
+   *   AgentRuntime → replace (validated; in_process collapses to "drop")
+   *   null         → drop runtime (revert to in_process default)
+   *   omitted      → untouched
+   *  Authored by the create modal + edit UI, not the LLM edit prompt. */
+  runtime?: AgentRuntime | null;
+  /** Marketplace category code. Empty string drops the field; omitted = untouched.
+   *  Authored by hidden create defaults or by the agent-edit LLM via the `<category>` sub-tag.
+   *  Missing model output is repaired to the default category on create. */
+  category?: string;
+  /** Three-way update:
+   *   OutputFormat string → set (one of the constrained enum values)
+   *   null                 → drop (revert to default 'auto')
+   *   omitted              → untouched
+   *  Authored by the agent edit UI dropdown. */
+  output_format?: OutputFormat | null;
+}
+
+async function _resolveAgentSkillDependencies(
+  userId: string, refs: readonly string[], agentId = '',
+): Promise<string[]> {
+  const unavailable = () => new Error(
+    'Invalid or unavailable Agent Skill dependencies; choose enabled shared Skills or this Agent\'s own private Skills and retry',
+  );
+  if (!Array.isArray(refs) || refs.some((ref) => typeof ref !== 'string' || !ref.trim())) {
+    throw unavailable();
+  }
+  if (!refs.length) return [];
+  // Empty target means a new Agent: no existing Agent's private Skills qualify.
+  // Reuse the current trusted registry and enabled state, not the creator's
+  // broader runtime bindings or a fixed list of Skill names.
+  const specs = await listSkillSpecsForAgentMetadata(userId, { forAgentId: agentId });
+  const disabled = readDisabledSets(userId).skills;
+  const { ids, unknown } = resolveSkillAllowlistRefs(
+    specs.filter((spec) => !disabled.has(spec.id)), [...refs],
+  );
+  if (unknown.length || ids.some((id) => !safeId(id))) throw unavailable();
+  return ids;
+}
+
+function _assertToolListMutationValid(updates: UpdateAgentFields): void {
+  const invalid: unknown[] = [];
+  if (Array.isArray(updates?.tool_list_invalid_refs)) {
+    invalid.push(...updates.tool_list_invalid_refs);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'tool_list')
+    && Array.isArray(updates.tool_list)) {
+    invalid.push(...updates.tool_list.filter((item) => (
+      typeof item !== 'string' || invalidAgentToolGroupRefs([item]).length > 0
+    )));
+  }
+  if (!invalid.length) return;
+  const refs = [...new Set(invalid
+    .slice(0, 8)
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .map((value) => (/^[a-z][a-z0-9._-]{0,79}$/.test(value) ? value : '<invalid>')))];
+  throw new Error(`invalid, unknown, host-managed, or runtime-only tool groups: ${refs.join(', ')}`);
+}
+
+/** Resolve the initial capability groups for a model-authored Agent create.
+ *
+ * The resolver is catalog-driven rather than capability-specific: it merges
+ * the authored groups with exact tool names supplied by trusted structured
+ * UI selections. Workflow prose is not a dependency source. A missing
+ * tool is inferred only when it maps to one unambiguous Agent-dependency
+ * group. Ambiguous Office-style tools still require the author to choose the
+ * relevant leaf, and host/runtime/owner-only tools never become dependencies.
+ */
+function _resolveAgentCreationToolList(input: {
+  authoredGroups: readonly string[];
+  dependencyToolNames?: readonly string[];
+}): ToolGroupId[] {
+  let groups = canonicalizeAgentToolGroups(input.authoredGroups);
+  const toolNames = [...new Set([
+    ...(input.dependencyToolNames || []),
+  ])];
+
+  for (const name of toolNames) {
+    const entry = getToolCatalogEntry(name);
+    if (!entry) throw new Error(`unknown Agent tool dependency: ${name}`);
+    if (entry.agentAssignable === false) {
+      throw new Error(
+        `invalid Agent tool dependency: ${name} (cannot be declared for a named Agent)`,
+      );
+    }
+    if (entry.ownerAgent) {
+      throw new Error(
+        `invalid Agent tool dependency: ${name} (owned by another Agent)`,
+      );
+    }
+    if (toolNamesForAgentGroups(groups).includes(name)) continue;
+
+    const candidates = [...new Set(
+      (entry.loadGroups || []).filter(isAgentDependencyToolGroup),
+    )];
+    if (candidates.length === 1) {
+      groups = canonicalizeAgentToolGroups([...groups, candidates[0]]);
+      continue;
+    }
+    if (candidates.length > 1) {
+      throw new Error(
+        `ambiguous Agent tool dependency: ${name} (choose ${candidates.join(' or ')})`,
+      );
+    }
+    if (name === 'tool_load' || (entry.loadGroups || []).some(isLoadableToolGroup)) {
+      throw new Error(
+        `invalid Agent tool dependency: ${name} (cannot be declared for a named Agent)`,
+      );
+    }
+    // Host-managed tools need no persisted Agent dependency.
+  }
+  return groups;
+}
+
+/**
+ * Update any mutable field on a custom agent. Builtin agents are
+ * read-only — returns null if the target is builtin or missing.
+ */
+export async function updateCustomAgent(
+  agentId: string, updates: UpdateAgentFields,
+): Promise<Agent | null> {
+  if (!agentId) return null;
+  const userId = getActiveUserId();
+  const f = agentDefinitionFile(userId, agentId);
+  if (!fs.existsSync(f)) return null;
+  const data = await readJson<AgentRaw>(f);
+  const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  await _applyAgentUpdates(data, agentId, updates, userId);
+
+  // Quality gate (same policy as createCustomAgent): EXTREME blocks the
+  // write so the on-disk spec doesn't regress; MEDIUM persists but writes
+  // through.
+  const [report] = await validateWithOperatorPolicy(userId, { kind: 'agent', args: { agentJson: data } });
+  void persistQualityReport({
+    uid: userId, kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    throw new Error(_validationErrorMessage(report));
+  }
+
+  await writeJson(f, data);
+  _invalidateAgentListCache({ userId });
+  log.info('custom agent updated', { agent_id: maskId(agentId) });
+  // Propagate a name change into every conversation roster that already
+  // lists this agent. members.json snapshots the name at join time and the
+  // @-router resolves on roster-first, so without this sweep `@<old-name>`
+  // would keep matching in old chats.
+  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  if (newName && newName !== oldName) {
+    try { await renameAgentInMembers(userId, agentId, newName); }
+    catch (err) { log.warn('agent rename roster sweep failed', { agent_id: maskId(agentId), error: logErrorSummary(err) }); }
+  }
+  return normalizeAgent(data, 'custom');
+}
+
+/** Pure mutator: apply `updates` onto a raw agent spec object. Shared by
+ *  `updateCustomAgent` and the dev-mode built-in update path so the field
+ *  semantics stay identical regardless of source. Throws on reserved-name
+ *  collision (matches existing custom behavior). */
+function _stripEmbeddedProfileKeys(data: AgentRaw, keys: string[]): void {
+  const embedded = _plainObj(data.profile);
+  if (!embedded) return;
+  let changed = false;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(embedded, key)) {
+      delete embedded[key];
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  if (Object.keys(embedded).length) data.profile = embedded;
+  else delete data.profile;
+}
+
+function _setAgentTextListField(
+  data: AgentRaw,
+  key: 'knowhow' | 'standards',
+  value: string[] | null | undefined,
+): void {
+  _stripEmbeddedProfileKeys(data, [key]);
+  if (value === null) {
+    delete (data as Record<string, unknown>)[key];
+    return;
+  }
+  if (Array.isArray(value)) {
+    const clean = _profileTextList(value, AGENT_GUIDANCE_ITEM_LIMIT);
+    if (clean) (data as Record<string, unknown>)[key] = clean;
+    else delete (data as Record<string, unknown>)[key];
+  }
+}
+
+function _applyLegacyProfileUpdate(data: AgentRaw, value: AgentProfile | null | undefined): void {
+  _stripEmbeddedProfileKeys(data, ['knowhow', 'standards', 'workflow', 'flow', 'workflow_steps', 'memory']);
+  if (value === null) {
+    delete data.profile;
+    delete (data as Record<string, unknown>).knowhow;
+    delete (data as Record<string, unknown>).standards;
+    return;
+  }
+  const cleanProfile = normalizeAgentProfile({ profile: value });
+  if (cleanProfile?.knowhow) data.knowhow = cleanProfile.knowhow;
+  else delete data.knowhow;
+  if (cleanProfile?.standards) data.standards = cleanProfile.standards;
+  else delete data.standards;
+}
+
+async function _applyAgentUpdates(
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields, userId = getActiveUserId(),
+): Promise<void> {
+  _assertToolListMutationValid(updates);
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
+    const incomingName = typeof updates.name === 'string' ? updates.name : '';
+    assertAgentNameAllowed(incomingName);
+    const trimmed = incomingName.trim();
+    if (trimmed) await assertAgentNameUnique(trimmed, agentId, userId);
+  }
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // edit prompt forbids the LLM from emitting those tags, but if it
+  // slips up we silently drop the field so the spec stays clean.
+  // Compute on the post-update runtime: a runtime change in the same
+  // turn (in_process → cli) takes effect first, then the strip runs.
+  const incomingRuntime = Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')
+    ? _normalizeRuntime((updates as any).runtime)
+    : null;
+  const effectiveCli = incomingRuntime
+    ? incomingRuntime.kind === 'cli'
+    : (_normalizeRuntime((data as any).runtime)?.kind === 'cli');
+  if (effectiveCli) {
+    if ('workflow' in (updates || {})) delete (updates as any).workflow;
+    if ('skill_list' in (updates || {})) delete (updates as any).skill_list;
+    if ('tool_list' in (updates || {})) delete (updates as any).tool_list;
+    if ('profile' in (updates || {})) delete (updates as any).profile;
+    if ('knowhow' in (updates || {})) delete (updates as any).knowhow;
+    if ('standards' in (updates || {})) delete (updates as any).standards;
+  }
+  _assertAgentGuidanceMutationValid(updates);
+  for (const k of ['name', 'workflow'] as const) {
+    if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
+      const v = (updates as any)[k];
+      const next = typeof v === 'string' ? v : '';
+      (data as any)[k] = k === 'workflow' ? await _normalizeWorkflowSkillIds(next, userId) : next;
+    }
+  }
+  // First migrate any persisted legacy `description` into the bilingual pair
+  // (lossless, content-based for historical data). Then apply incoming
+  // updates: explicit `description_zh` / `description_en` write through;
+  // single `description` routes to the current UI language slot unless that
+  // slot was explicitly set this turn.
+  // Strip legacy `description` from the JSON at the end so it can't shadow
+  // explicit values on the next read.
+  {
+    const persisted = typeof (data as any).description === 'string' ? (data as any).description.trim() : '';
+    if (persisted) {
+      const isChinese = /[一-鿿]/.test(persisted);
+      if (isChinese && !(data as any).description_zh) (data as any).description_zh = persisted;
+      else if (!isChinese && !(data as any).description_en) (data as any).description_en = persisted;
+    }
+  }
+  const hasZh = Object.prototype.hasOwnProperty.call(updates || {}, 'description_zh');
+  const hasEn = Object.prototype.hasOwnProperty.call(updates || {}, 'description_en');
+  const hasLegacy = Object.prototype.hasOwnProperty.call(updates || {}, 'description');
+  if (hasZh) {
+    const v = (updates as any).description_zh;
+    data.description_zh = typeof v === 'string' ? v : '';
+  }
+  if (hasEn) {
+    const v = (updates as any).description_en;
+    data.description_en = typeof v === 'string' ? v : '';
+  }
+  if (hasLegacy) {
+    const v = (updates as any).description;
+    // Non-string legacy update is a no-op: with two distinct language slots
+    // there is no sane "clear description" interpretation. Use explicit
+    // `description_zh` / `description_en` updates to clear individual sides.
+    if (typeof v === 'string') {
+      const legacy = v.trim();
+      if (legacy) {
+        const lang = descriptionLang(getLanguage());
+        if (lang === 'zh' && !hasZh) data.description_zh = legacy;
+        if (lang !== 'zh' && !hasEn) data.description_en = legacy;
+      }
+    }
+  }
+  delete (data as any).description;
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'skill_list')) {
+    const v = updates.skill_list;
+    if (v === null) {
+      delete data.skill_list;
+    } else if (Array.isArray(v)) {
+      data.skill_list = await _resolveAgentSkillDependencies(userId, v, agentId);
+    }
+    // any other value (undefined sneaking through) is a no-op
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'tool_list')) {
+    const value = updates.tool_list;
+    if (value === null) {
+      delete data.tool_list;
+    } else if (Array.isArray(value)) {
+      data.tool_list = canonicalizeAgentToolGroups(value);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'inputs')) {
+    const v = updates.inputs;
+    if (v === null) {
+      delete data.inputs;
+    } else if (Array.isArray(v)) {
+      // Re-validate on every write so even a trusted caller can't slip a
+      // half-formed schema past us.
+      data.inputs = validateAgentInputs(v);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
+    const v = (updates as { output_format?: OutputFormat | null }).output_format;
+    const clean = _canonicalOutputFormat(v);
+    if (v === null || clean === 'auto') {
+      // 'auto' is the implicit default; don't write it to disk so spec
+      // diffs stay clean and unset agents don't suddenly get a field.
+      delete (data as { output_format?: unknown }).output_format;
+    } else if (clean) {
+      (data as { output_format?: OutputFormat }).output_format = clean;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {
+    const v = (updates as any).icon;
+    if (avatars.isKnownIcon(v)) data.icon = v;
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'color')) {
+    const v = (updates as any).color;
+    if (avatars.isKnownColor(v)) data.color = v;
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'interactive')) {
+    const v = updates.interactive;
+    if (v === null) {
+      delete data.interactive;
+    } else if (typeof v === 'boolean') {
+      data.interactive = v;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'profile')) {
+    _applyLegacyProfileUpdate(data, updates.profile);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'knowhow')) {
+    _setAgentTextListField(data, 'knowhow', updates.knowhow);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'standards')) {
+    _setAgentTextListField(data, 'standards', updates.standards);
+  }
+  // category: explicit empty-string drops the field; any non-empty string is normalized to a
+  // safe code shape. Candidate membership is prompt-time dynamic, not a static backend list.
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'category')) {
+    const v = (updates as any).category;
+    const trimmed = typeof v === 'string' ? v.trim() : '';
+    if (!trimmed) delete (data as any).category;
+    else (data as any).category = normalizeMarketplaceCategoryCode(trimmed);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')) {
+    const v = updates.runtime;
+    // The runtime *kind* is locked at create time. Once an agent is
+    // CLI-backed, post-create updates may only swap which CLI backs
+    // it (cli → cli with a different `cli` field); reverting to
+    // in-process would orphan the description / inputs that were
+    // authored for a CLI runtime. The renderer enforces this in the
+    // detail-page selector; we mirror it here so the rule survives
+    // any other update path (tests, future scripts, IPC misuse).
+    const existingKind: 'cli' | 'in_process' = data.runtime &&
+      _normalizeRuntime(data.runtime)?.kind === 'cli' ? 'cli' : 'in_process';
+    const incomingKind: 'cli' | 'in_process' | null = v === null
+      ? 'in_process'
+      : (_normalizeRuntime(v)?.kind === 'cli' ? 'cli' : 'in_process');
+    if (incomingKind !== null && incomingKind !== existingKind) {
+      log.warn('agent runtime kind switch ignored', { agent_id: maskId(agentId), from: existingKind, to: incomingKind });
+    } else if (v === null) {
+      delete data.runtime;
+    } else {
+      const rt = _normalizeRuntime(v);
+      if (!rt || rt.kind === 'in_process') delete data.runtime;
+      else data.runtime = rt;
+    }
+    // Reconcile the project_dir input with the (post-update) cli kind.
+    // Coding cli ↔ project_dir input is a contract, not a user-authored
+    // schema: swap claude → codex keeps it, swap to a non-coding cli
+    // drops it, etc. We don't touch any other input the user defined.
+    const finalCli = data.runtime && _normalizeRuntime(data.runtime)?.kind === 'cli'
+      ? (_normalizeRuntime(data.runtime) as Extract<AgentRuntime, { kind: 'cli' }>).cli
+      : '';
+    const wantsProjectDir = cliIsCodingAgent(finalCli);
+    const inputs = Array.isArray(data.inputs) ? validateAgentInputs(data.inputs) : [];
+    const without = inputs.filter((i) => i.id !== PROJECT_DIR_INPUT_ID);
+    if (wantsProjectDir) data.inputs = _withCodingProjectDirInput(without);
+    else if (without.length) data.inputs = without;
+    else delete data.inputs;
+  }
+  if (!data.name) data.name = t('agent.default_name');
+  bumpAgentSpecRevision(data);
+  data.updated_at = nowIso();
+}
+
+/** Edit-chat dispatcher: routes to custom write for custom agents, and to
+ *  the dev-only built-in dual-write (src + data) for built-in agents in
+ *  dev mode. Returns null if the id resolves to neither, or if a built-in
+ *  write is attempted outside dev mode. */
+export async function updateAgentSpec(
+  agentId: string, updates: UpdateAgentFields,
+): Promise<Agent | null> {
+  if (!agentId) return null;
+  if (fs.existsSync(customAgentFile(agentId))) {
+    return updateCustomAgent(agentId, updates);
+  }
+  if (fs.existsSync(_platformAgentSpecFile(agentId))) {
+    return null;
+  }
+  return null;
+}
+
+/** True iff `agentId` resolves to a built-in spec (the runtime data tree).
+ *  Mirrors `isBuiltinSkill`. */
+export function isBuiltinAgent(agentId: string): boolean {
+  if (!agentId) return false;
+  return fs.existsSync(_platformAgentSpecFile(agentId));
+}
+
+/** Internal: shared apply + cache invalidation for the dev module. */
+export async function _applyAgentUpdatesAndInvalidate(
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields,
+): Promise<Agent | null> {
+  await _applyAgentUpdates(data, agentId, updates);
+  _invalidateAgentListCache();
+  return normalizeAgent(data, 'marketplace');
+}
+
+/**
+ * Append a single learned skill id to the agent's skill_list metadata. Skips
+ * the unknown-id filter `updateCustomAgent` does — System B (self-evolution
+ * `SkillStore`) skills live in a different directory from System A
+ * (`SkillLoader`) and would be dropped.
+ *
+ * No-op when:
+ *   - agent missing / is builtin
+ *   - agent.skill_list is undefined (no explicit dependency list to extend)
+ *   - skillId is already in the list
+ */
+export async function appendAgentSkill(agentId: string, skillId: string): Promise<boolean> {
+  if (!agentId || !safeId(skillId)) return false;
+  const f = customAgentFile(agentId);
+  if (!fs.existsSync(f)) return false;
+  const data = await readJson<AgentRaw>(f);
+  if (!Array.isArray(data.skill_list)) return false;
+  if (data.skill_list.includes(skillId)) return false;
+  data.skill_list = [...data.skill_list, skillId];
+  bumpAgentSpecRevision(data);
+  data.updated_at = nowIso();
+  await writeJson(f, data);
+  _invalidateAgentListCache();
+  log.info('agent skill appended', { agent_id: maskId(agentId), skill_id: maskId(skillId) });
+  return true;
+}
+
+export async function addCustomAgentMemory(agentId: string, content: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
+  const res = await addMemoryEntry(getActiveUserId(), { agent: agentId }, content);
+  if (res.ok) _invalidateAgentListCache();
+  return res;
+}
+
+export async function removeCustomAgentMemory(agentId: string, oldText: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
+  const fileRes = removeAgentEntry(getActiveUserId(), agentId, oldText);
+  if (fileRes.ok) {
+    _invalidateAgentListCache();
+  }
+  return fileRes;
+}
+
+export async function updateCustomAgentMemory(agentId: string, oldText: string, content: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
+  const res = await replaceMemoryEntry(getActiveUserId(), { agent: agentId }, oldText, content);
+  if (res.ok) _invalidateAgentListCache();
+  return res;
+}
+
+function _unsupportedCliAgentMemoryResult() {
+  return {
+    ok: false,
+    error: 'agent memory is supported only for Claude and Codex CLI agents',
+    entries: [],
+    usage: { current: 0, limit: 0 },
+  };
+}
+
+export async function recordAgentRuntimeStats(
+  agentId: string,
+  result: { duration_ms?: unknown; durationMs?: unknown; success?: unknown; aborted?: unknown; errored?: unknown; status?: unknown } = {},
+): Promise<{ ok: boolean; error?: string; stats?: AgentRuntimeStats }> {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id' };
+  const agent = await getAgent(agentId);
+  if (!agent) return { ok: false, error: 'agent not found' };
+
+  const userId = getActiveUserId();
+  const raw = await readJson(agentRuntimeStatsFile(userId, agentId));
+  const device = getCurrentDevice();
+  const statsFile = recordAgentRuntimeStatsForDevice(raw, device.id || device.name, result, nowIso());
+  await writeJson(agentRuntimeStatsFile(userId, agentId), statsFile);
+  _invalidateAgentListCache();
+  return { ok: true, stats: normalizeAgentRuntimeStats(statsFile) };
+}
+
+export async function deleteCustomAgent(agentId: string): Promise<boolean> {
+  if (!agentId || !safeId(agentId)) return false;
+  const userId = getActiveUserId();
+  const dir = agentDir(userId, agentId);
+  if (!fs.existsSync(dir)) return false;
+  // Wipe the whole `agents/<aid>/` directory in one shot — agent.json,
+  // meta/, and skills/ all live inside it, so we no longer need separate
+  // cascades for metacognition.purgeAgent / SkillStore.delete.
+  try { await fsp.rm(dir, { recursive: true, force: true }); }
+  catch (err) { log.warn('agent directory removal failed', { directory: logPathRef(dir), error: logErrorSummary(err) }); return false; }
+  _invalidateAgentListCache({ userId });
+
+  // Drop this account's per-agent memory, edit chat, session, and local
+  // runtime override. Another account may own a distinct Agent with the
+  // same id, so cleanup must never walk the whole workspace.
+  const memoryDir = path.join(userMemoryDir(userId), 'agents', agentId);
+  try { await fsp.rm(memoryDir, { recursive: true, force: true }); }
+  catch (err) { log.warn('agent memory removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
+
+  // Drop this account's per-agent edit chat directory + the matching
+  // core-agent session jsonl. Without the session purge, recreating an
+  // agent with the same name would reload the deleted agent's transcript
+  // and the LLM would appear to "remember" the previous attempt.
+  const chatDir = userAgentChatDir(userId, agentId);
+  if (fs.existsSync(chatDir)) {
+    try { await fsp.rm(chatDir, { recursive: true, force: true }); }
+    catch (err) { log.warn('agent chat removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
+    invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
+  }
+  const sessionId = defaultAgentEditSessionId(agentId);
+  try { evictSession(sessionId); } catch { /* cache may not hold it */ }
+  const sessionJsonl = userSessionFile(userId, sessionId);
+  try { await fsp.unlink(sessionJsonl); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('agent session removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) });
+    }
+  }
+  try { _deleteAgentRuntimeConfigEntry(userId, agentId); }
+  catch (err) { log.warn('agent runtime config cleanup failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) }); }
+
+  // Metacognition + evolved skills are already wiped by the
+  // `rm -rf agents/<aid>/` above — meta / skills sub-directories live
+  // inside that tree. No separate purge is needed.
+
+  log.info('custom agent deleted', { agent_id: maskId(agentId) });
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. Inline edit chat (per user × agent)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Single outer container: `<agent>...</agent>`. Inside: child tags `<name>`,
+// `<description>`, `<icon>`, `<workflow>`, `<skills>`, `<tools>`, `<inputs>`. One
+// container per turn gives us atomic extraction (all fields in or none) and
+// a single placeholder to stream-hide. Shared between agent-edit chat and main-chat
+// quick-create; see the "Create agent" section of
+// `chat_agent_setup.md` / `chat_commander.md`.
+const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+
+const AGENT_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+
+export type AgentMutationOperation = 'create' | 'edit';
+
+export interface ExtractedFields {
+  /** Explicit mutation intent for an unbound Commander session. Bound Agent
+   * editors omit it because the host already owns the edit target. Unknown
+   * values are dropped so the mutation boundary can fail closed. */
+  operation?: AgentMutationOperation;
+  /** Parsed from `<agent_id>` inside `<agent>`. Required for an unbound edit
+   * and forbidden for create. The Agent-edit-chat surface ignores this field
+   * because the target id is supplied by URL context. Body must pass `safeId`;
+   * otherwise the key is dropped. The mutation boundary validates it together
+   * with `operation`, so a malformed edit id can never fall through to create. */
+  agent_id?: string;
+  /** Internal parse evidence that an `<agent_id>` tag was present but invalid.
+   * It lets the mutation boundary reject create+id instead of silently treating
+   * a malformed id tag as if it had never been emitted. */
+  agent_id_invalid?: boolean;
+  name?: string;
+  description?: string;
+  description_zh?: string;
+  description_en?: string;
+  /** Parsed only when the model emits a token from the avatar catalog. */
+  icon?: string;
+  workflow?: string;
+  /** Parsed from independent `<knowhow>` / `<standards>` line lists.
+   *  JSON arrays and legacy `<profile>` remain accepted for compatibility. */
+  knowhow?: string[];
+  standards?: string[];
+  /** Parsed from `<skills>` inside `<agent>`. Empty tag body → `[]` (explicit
+   * zero). Absent tag → key omitted (leave `skill_list` untouched). */
+  skill_list?: string[];
+  /** Parsed from `<tools>`; empty body means explicit host-only tools. */
+  tool_list?: ToolGroupId[];
+  /** Explicit invalid `<tools>` values retained until the mutation boundary
+   * can reject the complete create/edit atomically. */
+  tool_list_invalid_refs?: string[];
+  /** Parsed from `<inputs>` inside `<agent>`. Empty body → `[]` (explicit
+   * zero). Absent or malformed JSON → key omitted. */
+  inputs?: AgentInput[];
+  /** Parsed from `<interactive>` inside `<agent>`. Body must be `true` or
+   * `false` (case-insensitive); anything else → key omitted (leave the
+   * existing flag untouched). */
+  interactive?: boolean;
+  /** Parsed from `<category>` inside `<agent>`. Candidate membership is
+   *  prompt-time dynamic; parsing only enforces a safe code shape. */
+  category?: string;
+}
+
+function _parseAgentBlock(inner: string): ExtractedFields {
+  const fields: ExtractedFields = {};
+  const operationM = inner.match(AGENT_CHILD_RE('operation'));
+  if (operationM) {
+    const value = operationM[1].trim().toLowerCase();
+    if (value === 'create' || value === 'edit') fields.operation = value;
+  }
+  const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
+  if (aidM) {
+    const v = aidM[1].trim();
+    if (safeId(v)) fields.agent_id = v;
+    else fields.agent_id_invalid = true;
+  }
+  const nameM = inner.match(AGENT_CHILD_RE('name'));
+  if (nameM) {
+    const v = nameM[1].trim();
+    if (v) fields.name = v;
+  }
+  const descM = inner.match(AGENT_CHILD_RE('description'));
+  if (descM) {
+    const v = descM[1].trim();
+    if (v) fields.description = v;
+  }
+  const descZhM = inner.match(AGENT_CHILD_RE('description_zh'));
+  if (descZhM) {
+    const v = descZhM[1].trim();
+    if (v) fields.description_zh = v;
+  }
+  const descEnM = inner.match(AGENT_CHILD_RE('description_en'));
+  if (descEnM) {
+    const v = descEnM[1].trim();
+    if (v) fields.description_en = v;
+  }
+  const iconM = inner.match(AGENT_CHILD_RE('icon'));
+  if (iconM) {
+    const v = iconM[1].trim();
+    if (avatars.isKnownIcon(v) && v !== avatars.getCatalog().commander_default.icon) {
+      fields.icon = v;
+    }
+  }
+  const wfM = inner.match(AGENT_CHILD_RE('workflow'));
+  if (wfM) {
+    const v = wfM[1].trim();
+    if (v) fields.workflow = v;
+  }
+  const profileM = inner.match(AGENT_CHILD_RE('profile'));
+  if (profileM) {
+    const trimmed = profileM[1].trim();
+    if (trimmed) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const profile = normalizeAgentProfile({ profile: parsed });
+        if (profile?.knowhow) fields.knowhow = profile.knowhow;
+        if (profile?.standards) fields.standards = profile.standards;
+      } catch (err) {
+        log.warn('agent field JSON parse failed', { field: 'profile', error: logErrorSummary(err) });
+      }
+    }
+  }
+  const parseTextListBody = (body: string, tag: 'knowhow' | 'standards'): string[] | undefined => {
+    const trimmed = body.trim();
+    if (trimmed === '' || trimmed === '[]') return [];
+    if (/^[\[{]/.test(trimmed)) {
+      try {
+        // Keep one item past the write limit so the mutation boundary can
+        // reject overflow instead of silently storing a truncated list.
+        return _profileTextList(JSON.parse(trimmed), AGENT_GUIDANCE_ITEM_LIMIT + 1);
+      } catch (err) {
+        log.warn('agent field JSON parse failed', { field: tag, error: logErrorSummary(err) });
+        return undefined;
+      }
+    }
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const rawLine of body.split(/\r?\n/)) {
+      const line = rawLine.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '');
+      const text = _cleanProfileString(line, 220);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length > AGENT_GUIDANCE_ITEM_LIMIT) break;
+    }
+    return out.length ? out : undefined;
+  };
+
+  const knowhowM = inner.match(AGENT_CHILD_RE('knowhow'));
+  if (knowhowM) {
+    const knowhow = parseTextListBody(knowhowM[1], 'knowhow');
+    if (knowhow) fields.knowhow = knowhow;
+    else if (knowhowM[1].trim() === '' || knowhowM[1].trim() === '[]') fields.knowhow = [];
+  }
+  const standardsM = inner.match(AGENT_CHILD_RE('standards'));
+  if (standardsM) {
+    const standards = parseTextListBody(standardsM[1], 'standards');
+    if (standards) fields.standards = standards;
+    else if (standardsM[1].trim() === '' || standardsM[1].trim() === '[]') fields.standards = [];
+  }
+  const skM = inner.match(AGENT_CHILD_RE('skills'));
+  if (skM) {
+    // Preserve submitted names/ids for dependency validation at the save
+    // boundary; only blank lines mean no dependency.
+    fields.skill_list = skM[1]
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  const toolsM = inner.match(AGENT_CHILD_RE('tools'));
+  if (toolsM) {
+    const values = toolsM[1]
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const invalid = invalidAgentToolGroupRefs(values);
+    if (!invalid.length) fields.tool_list = canonicalizeAgentToolGroups(values);
+    else fields.tool_list_invalid_refs = invalid;
+  }
+  const inM = inner.match(AGENT_CHILD_RE('inputs'));
+  if (inM) {
+    const trimmed = inM[1].trim();
+    if (trimmed === '' || trimmed === '[]') {
+      fields.inputs = [];
+    } else {
+      try {
+        const parsed = JSON.parse(trimmed);
+        fields.inputs = validateAgentInputs(parsed);
+      } catch (err) {
+        log.warn('agent field JSON parse failed', { field: 'inputs', error: logErrorSummary(err) });
+        // Leave fields.inputs unset — malformed JSON shouldn't erase the
+        // previous schema; let the next turn re-emit and fix it.
+      }
+    }
+  }
+  const itM = inner.match(AGENT_CHILD_RE('interactive'));
+  if (itM) {
+    const v = itM[1].trim().toLowerCase();
+    if (v === 'true') fields.interactive = true;
+    else if (v === 'false') fields.interactive = false;
+    // Any other body → leave key omitted; previous flag survives.
+  }
+  const catM = inner.match(AGENT_CHILD_RE('category'));
+  if (catM) {
+    const v = catM[1].trim().toLowerCase();
+    if (AGENT_CATEGORY_CODE_RE.test(v)) fields.category = v;
+  }
+  return fields;
+}
+
+/**
+ * Extract every `<agent>...</agent>` container in emission order. Each
+ * block is parsed independently; a malformed sub-tag in one block does
+ * not affect the others. Returns `blocks: []` when no container exists.
+ */
+export function extractAgentFieldBlocks(
+  text: string,
+): { cleanText: string; blocks: ExtractedFields[] } {
+  if (!text || text.indexOf('<agent') < 0) return { cleanText: text, blocks: [] };
+  const ranges = findOuterTagRanges(text, 'agent');
+  if (!ranges.length) return { cleanText: text, blocks: [] };
+  const blocks: ExtractedFields[] = [];
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.endsWith('</agent>')) {
+      const openEnd = block.indexOf('>');
+      if (openEnd >= 0) {
+        const inner = block.slice(openEnd + 1, block.length - '</agent>'.length);
+        blocks.push(_parseAgentBlock(inner));
+      }
+    }
+    cursor = e;
+  }
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText: cleaned, blocks };
+}
+
+function _visibleAgentEditText(text: string): string {
+  let visible = extractAgentFieldBlocks(text || '').cleanText;
+  const open = visible.lastIndexOf('<agent');
+  if (open >= 0 && visible.indexOf('</agent>', open + '<agent'.length) < 0) {
+    visible = visible.slice(0, open);
+  }
+  const scanStart = Math.max(0, visible.length - '<agent'.length);
+  for (let i = scanStart; i < visible.length; i += 1) {
+    const tail = visible.slice(i);
+    if (tail.length >= 2 && '<agent'.startsWith(tail)) {
+      visible = visible.slice(0, i);
+      break;
+    }
+  }
+  return visible.replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+function agentChatDir(userId: string, agentId: string): string {
+  const d = userAgentChatDir(userId, agentId);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function agentChatMsgsPath(userId: string, agentId: string): string {
+  return path.join(agentChatDir(userId, agentId), 'chat.jsonl');
+}
+
+function agentChatMetaPath(userId: string, agentId: string): string {
+  return path.join(agentChatDir(userId, agentId), 'chat.json');
+}
+
+function defaultAgentEditSessionId(agentId: string): string {
+  return `agent-${agentId}`;
+}
+
+async function loadAgentChatMeta(userId: string, agentId: string): Promise<AgentChatMeta> {
+  const p = agentChatMetaPath(userId, agentId);
+  if (!fs.existsSync(p)) return {};
+  try {
+    const data: any = await readJson(p);
+    return (data && typeof data === 'object') ? (data as AgentChatMeta) : {};
+  } catch { return {}; }
+}
+
+async function saveAgentChatMeta(userId: string, agentId: string, meta: AgentChatMeta): Promise<void> {
+  await writeJson(agentChatMetaPath(userId, agentId), meta);
+}
+
+export async function getAgentChatMessages(userId: string, agentId: string, limit = 500): Promise<any[]> {
+  return readJsonl(agentChatMsgsPath(userId, agentId), limit);
+}
+
+async function _appendAgentChatMessage(userId: string, agentId: string, record: any): Promise<void> {
+  const file = agentChatMsgsPath(userId, agentId);
+  await appendJsonlAtomic(file, record);
+}
+
+export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
+  const agent = await getAgent(agentId);
+  // Only custom Agent chat records can be cleared locally.
+  if (!agent) return false;
+  if (agent.source !== 'custom') return false;
+  for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
+    if (fs.existsSync(p)) {
+      try { await fsp.unlink(p); }
+      catch (err) { log.warn('agent chat file removal failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
+    }
+  }
+  invalidateLineCount(agentChatMsgsPath(userId, agentId));
+  // Also evict + drop the core-agent persistent session jsonl. Without this
+  // the LLM retains its full prior context even though the UI history is
+  // empty — same bug pattern as clearSkillChat (paths from before a
+  // promote-to-builtin survive in the LLM's memory).
+  const sessionId = defaultAgentEditSessionId(agentId);
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  try { await fsp.unlink(userSessionFile(userId, sessionId)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('agent session removal failed', { user_id: maskId(userId), agent_id: maskId(agentId), error: logErrorSummary(err) });
+    }
+  }
+  log.info('agent chat cleared', { user_id: maskId(userId), agent_id: maskId(agentId) });
+  return true;
+}
+
+/**
+ * Build the system prompt for the agent-edit chat. Includes the current
+ * agent fields so the LLM always sees up-to-date state — re-run every turn.
+ * Includes knowhow / standards / inputs / skill metadata so the editor can
+ * preserve and complete the richer agent structure.
+ */
+export function buildAgentEditSystemPrompt(agent: {
+  name?: string;
+  /** Legacy single-language seed; auto-routed via Chinese-character heuristic. */
+  description?: string;
+  description_zh?: string;
+  description_en?: string;
+  icon?: string;
+  workflow?: string;
+  skill_list?: string[];
+  tool_list?: string[];
+  inputs?: AgentInput[];
+  profile?: AgentProfile;
+  knowhow?: string[];
+  standards?: string[];
+  category?: string;
+  interactive?: boolean;
+  /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
+   *  which omits workflow/skills authoring and tells the LLM not to
+   *  emit those sub-tags. */
+  runtime?: AgentRuntime;
+}): string {
+  // Resolve all three forms into a single legacy `$description` placeholder
+  // (template still uses $description in this phase) plus the bilingual
+  // pair for forward-compat. Phase 2 will split the template.
+  const legacy = (agent.description || '').trim();
+  const isChinese = /[一-鿿]/.test(legacy);
+  const zh = (agent.description_zh || '').trim() || (legacy && isChinese ? legacy : '');
+  const en = (agent.description_en || '').trim() || (legacy && !isChinese ? legacy : '');
+  const display = legacy || zh || en;
+  const isCli = agent.runtime?.kind === 'cli';
+  // Pick the right template + the placeholder set it expects. The CLI
+  // template doesn't reference `$workflow` (workflow is hidden for CLI
+  // agents) and deliberately stays independent of the selected CLI/model.
+  const profile = normalizeAgentProfile({
+    profile: agent.profile,
+    knowhow: agent.knowhow,
+    standards: agent.standards,
+  });
+  const knowhowText = profile?.knowhow?.length ? profile.knowhow.join('\n') : '(not provided)';
+  const standardsText = profile?.standards?.length ? profile.standards.join('\n') : '(not provided)';
+  const inputsJson = Array.isArray(agent.inputs) ? JSON.stringify(agent.inputs, null, 2) : '(not provided)';
+  const skillsText = Array.isArray(agent.skill_list) ? agent.skill_list.join('\n') : '(not provided)';
+  const toolsText = Array.isArray(agent.tool_list) ? agent.tool_list.join('\n') : '(not provided)';
+  const body = isCli
+    ? prompts.load('chat_agent_setup_cli', {
+        // Runtime cli + model are deliberately NOT passed: the LLM is
+        // told to stay CLI-agnostic in the description, and surfacing
+        // the current binding tempts it to name the CLI inline (which
+        // forbiddenly bakes a brand into the description).
+        name: agent.name || '',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        inputs_json: inputsJson,
+        category: agent.category || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      })
+    : prompts.load('chat_agent_setup', {
+        name: agent.name || '',
+        description: display || '(not provided)',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        icon: avatars.isKnownIcon(agent.icon) ? agent.icon : '(not provided)',
+        workflow: (agent.workflow || '').trim() || '(not provided)',
+        skills: skillsText || '(not provided)',
+        tools: toolsText || '(not provided)',
+        inputs_json: inputsJson,
+        knowhow_text: knowhowText,
+        standards_text: standardsText,
+        category: agent.category || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      });
+  const tail = buildLanguageDirective(getLanguage());
+  return `${body}\n\n---\n\n${tail}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
+}
+
+export interface AgentEditResult {
+  ok: boolean;
+  message?: string;
+  error?: string;
+  updated?: ExtractedFields;
+}
+
+function agentEditAttachmentCid(agentId: string): string {
+  return `agent-edit-${agentId}`;
+}
+
+async function buildAgentEditMessageWithAttachments(
+  userId: string,
+  agentId: string,
+  content: string,
+  attachments?: string[],
+): Promise<{
+  message: string;
+  images: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  attachmentNames: string[];
+  attachmentCid: string;
+  attachmentMetadata: { hasAttachments: boolean; attachmentTypes: string[] };
+}> {
+  const attachmentNames = Array.isArray(attachments)
+    ? attachments.filter((n): n is string => typeof n === 'string' && !!n.trim())
+    : [];
+  const attachmentCid = agentEditAttachmentCid(agentId);
+  if (!attachmentNames.length) {
+    return {
+      message: content,
+      images: [],
+      attachmentNames,
+      attachmentCid,
+      attachmentMetadata: { hasAttachments: false, attachmentTypes: [] },
+    };
+  }
+  const { manifest, images, metadata } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
+  return {
+    message: manifest ? `${manifest}\n${content}` : content,
+    images,
+    attachmentNames,
+    attachmentCid,
+    attachmentMetadata: metadata,
+  };
+}
+
+function agentEditReadOnlyRoots(userId: string, attachmentCid?: string): string[] {
+  const roots = [
+    userMarketplaceSkillsDir(userId),
+    userSkillsDir(userId),
+  ];
+  if (attachmentCid) roots.push(chatAttachmentDirForConversation(userId, attachmentCid));
+  return roots;
+}
+
+export async function sendToAgentEditChat(
+  userId: string,
+  agentId: string,
+  content: string,
+  opts: { attachments?: string[]; modelText?: string } = {},
+): Promise<AgentEditResult> {
+  const agent = await getAgent(agentId);
+  if (!agent) return { ok: false, error: 'agent not found' };
+  if (agent.source !== 'custom') {
+    return { ok: false, error: t('errors.builtin_agent_not_editable') };
+  }
+
+  const meta = await loadAgentChatMeta(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
+
+  const systemPrompt = buildAgentEditSystemPrompt(agent);
+  const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
+  const modelContent = modelText || content;
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
+  const readOnlyRoots = agentEditReadOnlyRoots(
+    userId,
+    attachmentCtx.attachmentNames.length ? attachmentCtx.attachmentCid : undefined,
+  );
+
+  await _appendAgentChatMessage(userId, agentId,
+    {
+      time: nowIso(), role: 'user', content,
+      ...(modelText ? { model_text: modelText } : {}),
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
+
+  const { chatWithModel } = await import('../model/client');
+  // The runner binds only `agent-creator` as a logical `@skill/...` read for
+  // this authoring session. No write side — every mutation goes through the
+  // `<agent>` container parser post-stream.
+  const result = await chatWithModel({
+    userId, message: attachmentCtx.message, sessionId, systemPrompt,
+    agentName: 'orkas_chat', timeout: 300,
+    systemSkillList: ['agent-creator'],
+    ...(!isCliAgent(agent) ? { agentToolDependencyAuthoring: true } : {}),
+    readOnlyExtraRoots: readOnlyRoots,
+    attachmentMetadata: attachmentCtx.attachmentMetadata,
+    ...(attachmentCtx.attachmentNames.length ? { images: attachmentCtx.images } : {}),
+  });
+
+  if (!result.ok) {
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
+    const partial = String(result.text || '').trim();
+    const content = partial ? `${result.text}\n\n${errMsg}` : errMsg;
+    await _appendAgentChatMessage(userId, agentId,
+      { time: nowIso(), role: 'assistant', content });
+    return { ok: false, message: content, error: result.error || '' };
+  }
+
+  const { cleanText, blocks } = extractAgentFieldBlocks(result.text);
+  // Inline edit chat is bound to one agent; apply only the first block.
+  const fields = blocks[0] || {};
+  const updated: ExtractedFields = {};
+  if (Object.keys(fields).length) {
+    await updateAgentSpec(agentId, fields);
+    Object.assign(updated, fields);
+  }
+
+  await _appendAgentChatMessage(userId, agentId,
+    { time: nowIso(), role: 'assistant', content: cleanText });
+  await saveAgentChatMeta(userId, agentId, { session_id: sessionId });
+
+  return { ok: true, message: cleanText, updated };
+}
+
+const MAX_AGENT_PROCESS_ITEMS = 300;
+
+export async function* streamSendToAgentEditChat(
+  userId: string, agentId: string, content: string,
+  opts: { abortSignal?: AbortSignal; attachments?: string[]; modelText?: string } = {},
+): AsyncGenerator<any, void, unknown> {
+  const agent = await getAgent(agentId);
+  if (!agent) {
+    yield { type: 'error', text: 'agent not found' };
+    yield { type: 'done' };
+    return;
+  }
+  if (agent.source !== 'custom') {
+    yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
+    yield { type: 'done' };
+    return;
+  }
+
+  const meta = await loadAgentChatMeta(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
+
+  const systemPrompt = buildAgentEditSystemPrompt(agent);
+  const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
+  const modelContent = modelText || content;
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
+  const readOnlyRoots = agentEditReadOnlyRoots(
+    userId,
+    attachmentCtx.attachmentNames.length ? attachmentCtx.attachmentCid : undefined,
+  );
+
+  await _appendAgentChatMessage(userId, agentId,
+    {
+      time: nowIso(), role: 'user', content,
+      ...(modelText ? { model_text: modelText } : {}),
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
+
+  const { streamChatWithModel } = await import('../model/client');
+  let finalText: string | null = null;
+  let errMsg: string | null = null;
+  let waitingForInput = false;
+  // Running assistant delta buffer. On user abort the IPC layer's `break`
+  // triggers `return()` at the current yield, which skips the post-loop
+  // append — finally salvages whatever was already rendered.
+  let streamingText = '';
+  const updated: ExtractedFields = {};
+  const processItems: any[] = [];
+  const runStartedAt = Date.now();
+
+  try {
+    for await (let event of streamChatWithModel({
+      userId, message: attachmentCtx.message, sessionId, systemPrompt,
+      agentName: 'orkas_chat',
+      systemSkillList: ['agent-creator'],
+      ...(!isCliAgent(agent) ? { agentToolDependencyAuthoring: true } : {}),
+      cacheRetention: 'short',
+      readOnlyExtraRoots: readOnlyRoots,
+      attachmentMetadata: attachmentCtx.attachmentMetadata,
+      ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
+      ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+    }) as AsyncIterable<any>) {
+      event = normalizeEditChatRuntimeEvent(event);
+      if (isEditChatWaitingForInputEvent(event)) waitingForInput = true;
+      const etype = event.type;
+      if (etype === 'delta' && typeof event.text === 'string') {
+        if (event.phase === 'commentary') {
+          appendEditChatCommentaryProcessItem(
+            processItems,
+            event.text,
+            MAX_AGENT_PROCESS_ITEMS,
+          );
+        } else {
+          // Legacy unphased deltas remain final-answer compatible. Current
+          // core-agent streams always carry an explicit phase.
+          streamingText += event.text;
+        }
+      }
+      // Domain events from field-block extraction are synthesized *before*
+      // the transformed `final` yields, so they land in the process rail
+      // above the assistant reply — same ordering as tool_start lines in
+      // main chat. Populated only on the final-event branch below.
+      const synthesizedProgress: string[] = [];
+      if (etype === 'final') {
+        const raw = event.text || '';
+        const { cleanText, blocks } = extractAgentFieldBlocks(raw);
+        // Inline edit chat is bound to one agent; apply only the first block.
+        const fields = blocks[0] || {};
+        if (Object.keys(fields).length) {
+          await updateAgentSpec(agentId, fields);
+          Object.assign(updated, fields);
+          for (const [fieldKey, labelKey] of [
+            ['name', 'process.agent.field.name'],
+            ['workflow', 'process.agent.field.workflow'],
+            ['category', 'process.agent.field.category'],
+          ] as const) {
+            if (fields[fieldKey] !== undefined) {
+              synthesizedProgress.push(t('process.agent.update_field', { field: t(labelKey) }));
+            }
+          }
+          if (fields.knowhow !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.knowhow') }));
+          }
+          if (fields.standards !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.standards') }));
+          }
+          // Collapse description / description_zh / description_en into one
+          // user-facing progress event — the user sees "description updated"
+          // regardless of which language slot the LLM filled this turn.
+          const descTouched = fields.description !== undefined
+            || fields.description_zh !== undefined
+            || fields.description_en !== undefined;
+          if (descTouched) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.description') }));
+          }
+          if (fields.skill_list !== undefined) {
+            synthesizedProgress.push(fields.skill_list.length
+              ? t('process.agent.update_skills', { list: fields.skill_list.join(', ') })
+              : t('process.agent.clear_skills'));
+          }
+          if (fields.tool_list !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.tools') }));
+          }
+          if (fields.inputs !== undefined) {
+            synthesizedProgress.push(fields.inputs.length
+              ? t('process.agent.update_inputs', { list: fields.inputs.map((i) => i.id).join(', ') })
+              : t('process.agent.clear_inputs'));
+          }
+          if (fields.interactive !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_interactive', {
+              value: t(fields.interactive
+                ? 'process.agent.interactive_enabled'
+                : 'process.agent.interactive_disabled'),
+            }));
+          }
+        }
+        finalText = cleanText;
+        event = { type: 'final', text: cleanText, updated };
+      } else if (etype === 'error') {
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
+      }
+
+      for (const text of synthesizedProgress) {
+        if (processItems.length < MAX_AGENT_PROCESS_ITEMS) {
+          processItems.push({ type: 'progress', text });
+        }
+        yield { type: 'progress', text };
+      }
+
+      if (processItems.length < MAX_AGENT_PROCESS_ITEMS) {
+        if (etype === 'progress' && event.text) {
+          processItems.push({ type: 'progress', text: event.text });
+        } else if (etype === 'event') {
+          const inner = event.event || {};
+          if (inner.stream && inner.stream !== 'assistant') {
+            processItems.push({ type: 'event', event: inner });
+          }
+        }
+      }
+      yield event;
+    }
+
+  } catch (err) {
+    log.error('agent edit stream failed', { error: logErrorSummary(err) });
+    const msg = (err as Error).message || String(err);
+    errMsg = `Model response failed: ${msg}`;
+    yield { type: 'error', text: msg };
+  } finally {
+    // Must live in finally: on user abort the IPC layer breaks out of the
+    // for-await, which triggers `return()` on this generator — bypassing any
+    // append placed after the loop. Keeping it here covers normal finish,
+    // caught errors, and abort-driven returns alike.
+    const hadProcessItems = processItems.length > 0;
+    ensureEditChatRuntimeProcessItem(processItems, runStartedAt, {
+      aborted: opts.abortSignal?.aborted,
+      errored: !!errMsg,
+    });
+    const saved = sanitizeEditChatCommentaryProcessItems(
+      processItems,
+      _visibleAgentEditText,
+    );
+    try {
+      if (finalText !== null) {
+        await _appendAgentChatMessage(userId, agentId,
+          { time: nowIso(), role: 'assistant', content: finalText, ...(saved ? { process: saved } : {}) });
+        await saveAgentChatMeta(userId, agentId, { session_id: sessionId });
+      } else if (errMsg) {
+        const partial = _visibleAgentEditText(streamingText).trim();
+        const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
+        await _appendAgentChatMessage(userId, agentId,
+          { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+      } else if (waitingForInput && !opts.abortSignal?.aborted) {
+        await _appendAgentChatMessage(userId, agentId,
+          { time: nowIso(), role: 'assistant', content: '', process: saved });
+        await saveAgentChatMeta(userId, agentId, { session_id: sessionId });
+      } else if (streamingText.trim() || hadProcessItems) {
+        const partial = _visibleAgentEditText(streamingText).trim();
+        const content = partial
+          ? `${partial}\n\n(reply interrupted)`
+          : '(reply interrupted)';
+        await _appendAgentChatMessage(userId, agentId,
+          { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+      }
+    } catch (e) {
+      log.warn('agent chat assistant persistence failed', { agent_id: maskId(agentId), error: logErrorSummary(e) });
+    }
+  }
+}
+
+export function isValidAgentId(id: unknown): boolean {
+  return typeof id === 'string' && id.length > 0 && safeId(id);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5. Quick-create agent from main chat
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Turn parsed `<agent>` container fields (from `extractAgentFieldBlocks`)
+ * into a brand-new custom agent. Returns null if the mandatory fields
+ * (name + workflow) are missing or the underlying create/update calls
+ * fail — caller decides how to surface the failure to the user.
+ *
+ * Same container format as the agent-edit chat — parsing is shared
+ * (`extractAgentFieldBlocks`), only the outcome differs: agent-edit
+ * updates an existing agent, this one creates a fresh one.
+ */
+export async function createAgentFromBlocks(
+  fields: ExtractedFields,
+  opts: { dependencyToolNames?: readonly string[] } = {},
+): Promise<Agent | null> {
+  // Validate before createCustomAgent allocates an id/directory. Otherwise an
+  // invalid explicit `<tools>` tag would be omitted by parsing and leave a
+  // successfully-created legacy-all Agent behind.
+  _assertToolListMutationValid(fields);
+  _assertAgentGuidanceMutationValid(fields);
+  if (!Array.isArray(fields.tool_list)) {
+    throw new Error('Agent creation requires an explicit <tools> list; use an empty tag only for an intentional host-only Agent');
+  }
+  // Only authored groups and trusted structured selections define dependencies.
+  // Workflow and Skill prose never grant or invalidate a capability.
+  const toolList = _resolveAgentCreationToolList({
+    authoredGroups: fields.tool_list,
+    ...(opts.dependencyToolNames
+      ? { dependencyToolNames: opts.dependencyToolNames }
+      : {}),
+  });
+  const name = (fields.name || '').trim();
+  const workflow = (fields.workflow || '').trim();
+  const category = fields.category
+    ? normalizeMarketplaceCategoryCode(fields.category)
+    : DEFAULT_MARKETPLACE_CATEGORY_CODE;
+  if (!name || !workflow) return null;
+  const description = (fields.description || '').trim();
+  const description_zh = (fields.description_zh || '').trim();
+  const description_en = (fields.description_en || '').trim();
+
+  const created = await createCustomAgent({
+    name, description, description_zh, description_en, workflow, category,
+    tool_list: toolList,
+    ...(Array.isArray(fields.skill_list) ? { skill_list: fields.skill_list } : {}),
+    ...(fields.icon ? { icon: fields.icon } : {}),
+    ...(fields.knowhow ? { knowhow: fields.knowhow } : {}),
+    ...(fields.standards ? { standards: fields.standards } : {}),
+    ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
+  });
+  if (!created) return null;
+  // Dependencies were validated before allocation and persisted in the first
+  // write. Fold the remaining optional fields through their existing validators.
+  const updates: UpdateAgentFields = {};
+  if (Array.isArray(fields.inputs)) updates.inputs = fields.inputs;
+  if (Array.isArray(fields.knowhow)) updates.knowhow = fields.knowhow;
+  if (Array.isArray(fields.standards)) updates.standards = fields.standards;
+  if (Object.keys(updates).length) {
+    const updated = await updateCustomAgent(created.agent_id, updates);
+    return updated || created;
+  }
+  return created;
+}

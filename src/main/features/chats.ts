@@ -1,0 +1,3231 @@
+import { taskForPath, conversationFileInventory, invalidateTaskDeletions, type TaskOwnership } from './conversation_deletions';
+/**
+ * Conversations (per-user) — CRUD + message reads.
+ *
+ * Send paths live in `features/group_chat/` — every conversation is a group
+ * chat now (commander + user + N agents). This module owns:
+ *
+ *   - The per-conversation `<cid>/meta.json` recovery metadata
+ *   - The `_index.json` registry (primary list snapshot for versioned rows)
+ *   - The on-disk `<cid>.jsonl` (group message log; format: GroupMessage)
+ *   - Conversation-level CRUD (create / list / get / update / delete)
+ *   - Cascade cleanup on delete (group dir + sessions + attachments)
+ *
+ * "Processing" state (a turn is currently running) lives in
+ * `<cid>/state.json` (`status: 'idle' | 'running' | 'aborted'` +
+ * `in_flight: actor_id[]`). Stale-state sweep on boot lives here too.
+ */
+
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+import * as readline from 'node:readline';
+import { randomUUID } from 'node:crypto';
+import { turnIndexRequest } from './conversation-history-client';
+
+import {
+  appConversationOwner, appConversationRoot,
+  userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, userProjectsDir,
+  WS_ROOT, userCloudRoot, projectMetaFile,
+  localCliDirectoryFile,
+} from '../paths';
+import {
+  conversationLayout,
+  cloudRelForAbs,
+  assertConversationRelocationReady,
+  setConversationRelocationBlocked,
+  chatAttachmentDirForConversation,
+  conversationMessageFile,
+  conversationMessageReadFile,
+  invalidateConversationProjectCache,
+  listProjectIds,
+  projectSessionRoots,
+} from '../util/project-layout';
+import {
+  relocateConversationIntoProject,
+  relocateConversationOutOfProject,
+  recoverConversationRelocation,
+  commitConversationRelocation,
+  type RelocatedPaths,
+} from '../util/conversation-relocate';
+import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
+import {
+  nowIso, genConversationId, genId12, safeId,
+  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets, readJsonlWindow, appendJsonlAtomic,
+} from '../storage';
+import { removeCodingDirectory } from './local_agents/project-directory';
+import { createLogger } from '../logger';
+import { resolveCloudRelPath } from '../util/cloud-path';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { t } from '../i18n';
+import {
+  ZH_FILLER_RE, EN_FILLER_RE, truncateTitleToWidth, CONVERSATION_TITLE_MAX_UNITS,
+} from '../util/auto-title';
+import { isExpiredIsoTombstone, pruneExpiredDeletedRecords } from '../util/tombstone_retention';
+import {
+  RECORD_SYNC_DEVICE_FIELD,
+  RECORD_SYNC_REV_FIELD,
+  bumpRecordSyncVersion,
+  recordSyncRev,
+} from '../util/record_sync_fields';
+import { limitNameDisplayText } from '../util/name-limit';
+import { versionChatMediaLocalUrlsInText } from '../util/chat-media-url';
+import { isPathAllowed } from '../util/path-sandbox';
+import {
+  persistedCodexOutputCitationPaths,
+  sanitizePersistedCodexFileCitations,
+} from './local_agents/public-output';
+import {
+  readConversationHistoryWindow,
+  readConversationHistoryWindowAtMessage,
+  purgeConversationHistoryCache,
+  readConversationHistoryPage,
+  readConversationProcessPage,
+} from './conversation_history_cache';
+
+const log = createLogger('chats');
+// A boot-time stale-state sweep may run twice: once before the first window
+// and again as a deferred cross-user maintenance pass. Only a state whose
+// activity predates this main-process module can belong to a previous crash.
+// Without this cutoff, the deferred pass can wake several minutes later while
+// a newly-started long VideoStudio turn is legitimately running and manufacture
+// a false "reply interrupted" message in the middle of that live bubble.
+const PROCESS_BOOT_CUTOFF_MS = Date.now();
+import * as search from './search';
+import {
+  ensureRunningConversationRegistry,
+  purgeGroupDir,
+  readMembers,
+  readRunningConversationRegistry,
+  readState,
+  parseInFlightTurns,
+  recoverOrphanRunningState,
+  untrackRunningConversation,
+} from './group_chat/state';
+import type { ActorKind, StateFile } from './group_chat/state';
+import type { GroupMessage } from './group_chat/visibility';
+
+function conversationIndexName(): string {
+  return '_index.json';
+}
+
+function conversationMetaName(): string {
+  return 'meta.json';
+}
+
+const RESERVED_CHAT_DIRS = new Set(['agent', 'skill', 'subagents']);
+
+function isConversationMetaDirName(name: string): boolean {
+  return safeId(name) && !RESERVED_CHAT_DIRS.has(name);
+}
+
+function buildConversationSessionId(cid: string): string {
+  return `gconv-${cid}`;
+}
+
+export type ConversationKind = 'normal' | string;
+
+export interface ConnectorSetupAssistance {
+  kind: 'connector_setup';
+  connector_id: string;
+}
+
+/** Compatible reader: retain only the known association, never arbitrary context or secrets. */
+export function normalizeConnectorSetupAssistance(raw: unknown): ConnectorSetupAssistance | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (value.kind !== 'connector_setup' || typeof value.connector_id !== 'string'
+    || value.connector_id.length > 160 || !safeId(value.connector_id)) return undefined;
+  return { kind: 'connector_setup', connector_id: value.connector_id };
+}
+
+export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation'; appType?: 'local' | 'web' }
+  | { kind: 'app_editing'; title: string; sourceFileName: string };
+
+/** Persist only known entry metadata, never caller-authored model instructions. */
+export function normalizeConversationAssistance(raw: unknown): ConversationAssistance | undefined {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const value = raw as Record<string, unknown>;
+    if (value.kind === 'app_editing') {
+      if (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 1024
+        || typeof value.sourceFileName !== 'string' || !/^[A-Za-z0-9_.-]{1,255}$/.test(value.sourceFileName)
+        || value.sourceFileName === '.' || value.sourceFileName === '..') return undefined;
+      return { kind: 'app_editing', title: value.title, sourceFileName: value.sourceFileName };
+    }
+  }
+
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)
+    && (raw as Record<string, unknown>).kind === 'app_creation') {
+    const suppliedType=(raw as Record<string,unknown>).appType;
+    const appType=suppliedType==='cloud'?'web':suppliedType;
+    if(appType!==undefined&&appType!=='local'&&appType!=='web')return undefined;
+    return {kind:'app_creation',...(appType ? {appType} : {})} as ConversationAssistance;
+  }
+  return normalizeConnectorSetupAssistance(raw);
+}
+
+export interface Conversation {
+  conversation_id: string;
+  /** Historical task entry association; does not imply active work, success, or permission. */
+  assistance?: ConversationAssistance;
+  title: string;
+  kind: ConversationKind;
+  /** Optional starting agent — UI can suggest "@<this agent>" on the input
+   * draft. The bus does not bind to it; group membership is dynamic. */
+  agent_id: string;
+  skill_id: string;
+  /** Commander session id (`<uid>-gconv-<cid>`). Stored for cleanup;
+   * agents in the group have their own per-(conv,agent) session ids derived
+   * via state.buildGmemberSessionId. */
+  session_id: string;
+  /** Optional project membership. Frozen at create time; not mutable after
+   *  creation. Empty / absent → conversation lives outside any project (the
+   *  default sidebar group). The project itself is just metadata —
+   *  `<cid>.jsonl`, `groupChatDir`, `chat_attachments`, and `session_id`
+   *  paths stay verbatim, so cid uniqueness + §5 isolation are unaffected. */
+  project_id?: string;
+  /** Set when this conversation was created by an auto-task fire (sidebar
+   *  "Automation" tab). Used by the renderer to render the clock icon next
+   *  to the title and to group the conv under its originating task in the
+   *  auto-tab expand panel. Stable id; survives task deletion. */
+  origin_auto_task_id?: string;
+  /** Ephemeral navigation projection; never persisted in conversation metadata. */
+  task_links?: import('./chat_task_references').ConversationTaskLink[];
+  /** Optional sidebar pin timestamp. Pinned conversations sort to the top of
+   *  whichever sidebar list currently contains them (project or unprojected). */
+  pinned_at?: string;
+  /** Logical clock for pin/unpin state. Unlike `updated_at`, this does not
+   *  affect last-activity ordering; it exists so sync/meta merges can tell a
+   *  deliberate unpin from an old missing/duplicated `pinned_at` value. */
+  pin_state_updated_at?: string;
+  /** True after an explicit user rename. Auto-title must never overwrite a
+   *  title once the user has named the task, even if they chose default-like
+   *  text such as "New conversation". */
+  title_manually_set?: boolean;
+  /** Record-level sync tombstone. Deleted conversations stay in `_index.json`
+   *  long enough to propagate across offline devices; user-facing readers
+   *  filter them out. */
+  deleted_at?: string;
+  restored_at?: string;
+  /** Record-level conflict clock for aggregate `_index.json` merges. */
+  _sync_rev?: number;
+  _sync_device_id?: string;
+  created_at: string;
+  updated_at: string;
+  /** Derived from group_chat state.json at read time; never persisted on
+   * the index. */
+  processing?: boolean;
+  processing_since?: string | null;
+  /** Derived: max(<cid>.jsonl mtime, updated_at). Drives sidebar
+   * last-activity ordering; never persisted. */
+  last_active_at?: string;
+  /** Denormalized sidebar participant summary. Current records persist this
+   *  on the index/meta and update it with message activity; legacy records
+   *  derive it once from members.json and are backfilled. */
+  agent_ids?: string[];
+  /** Denormalized true iff the main JSONL contains a commander message.
+   *  `members.json` is not a reliable signal because commander is seeded
+   *  before it speaks. */
+  commander_in_chat?: boolean;
+  /** Activity timestamp covered by the participant summary. A record from an
+   *  older client can advance `updated_at` without updating the summary; the
+   *  mismatch makes the reader fall back to members/history instead of
+   *  trusting stale data. */
+  participant_summary_updated_at?: string;
+}
+
+/** Persisted record on `<cid>.jsonl`. Aliased for legacy callers; the new
+ *  canonical type is `GroupMessage` from the group-chat message module. */
+export type MessageRecord = GroupMessage;
+
+interface MessageDisplayContext {
+  citationWorkingDir?: string;
+  /** Base for resolving a media destination the author wrote relative to its
+   *  own working directory, per `readConversationAuthoringDir`. */
+  mediaBaseDir?: string;
+  allowedCitationRoots: string[];
+}
+
+/** Display context per (user, conversation, project). Reuse state and
+ *  conversation reads while the state file and effective workspace are
+ *  unchanged. Workspace selection and fallback can change independently of
+ *  state, and sync can replace state while preserving its size and mtime. */
+const MESSAGE_DISPLAY_CONTEXT_MEMO_MAX = 32;
+const _messageDisplayContextMemo = new Map<string, { stamp: string; context: MessageDisplayContext }>();
+
+function _fileStamp(file: string): string {
+  try {
+    const stat = fs.statSync(file);
+    return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  } catch {
+    return 'missing';
+  }
+}
+
+export function _resetMessageDisplayContextMemoForTest(): void {
+  _messageDisplayContextMemo.clear();
+}
+
+async function _messageDisplayContext(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<MessageDisplayContext> {
+  const layout = conversationLayout(userId, cid, projectIdHint);
+  const memoKey = `${userId}\u0000${cid}\u0000${layout.projectId || ''}`;
+  let workspaceRoot: string | undefined;
+  try {
+    const userWorkspace = await import('./user_workspace');
+    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined);
+  } catch (err) {
+    log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
+  }
+  const stamp = JSON.stringify([layout.stateFile, _fileStamp(layout.stateFile),
+    _fileStamp(localCliDirectoryFile(userId, cid)), workspaceRoot]);
+  const remembered = _messageDisplayContextMemo.get(memoKey);
+  if (remembered && remembered.stamp === stamp) return remembered.context;
+  const context = await _computeMessageDisplayContext(userId, cid, layout, workspaceRoot);
+  if (_messageDisplayContextMemo.size >= MESSAGE_DISPLAY_CONTEXT_MEMO_MAX) {
+    const oldest = _messageDisplayContextMemo.keys().next().value;
+    if (oldest !== undefined) _messageDisplayContextMemo.delete(oldest);
+  }
+  _messageDisplayContextMemo.set(memoKey, { stamp, context });
+  return context;
+}
+
+async function _computeMessageDisplayContext(
+  userId: string,
+  cid: string,
+  layout: ReturnType<typeof conversationLayout>,
+  workspaceRoot: string | undefined,
+): Promise<MessageDisplayContext> {
+  const state = await readState(userId, cid, layout.projectId);
+  const allowedCitationRoots = [
+    state.coding_project_dir,
+    ...(state.tool_extra_roots || []),
+    chatAttachmentDirForConversation(userId, cid, layout.projectId),
+  ].filter((root): root is string => typeof root === 'string' && path.isAbsolute(root));
+
+  if (workspaceRoot && path.isAbsolute(workspaceRoot)) allowedCitationRoots.push(workspaceRoot);
+
+  // Same rule the bus applies when it persists the reply, so a stored message
+  // and its re-read display resolve a relative media destination identically.
+  let mediaBaseDir: string | undefined;
+  try {
+    const convWorkspace = await import('./group_chat/conv_workspace');
+    mediaBaseDir = await convWorkspace.readConversationAuthoringDir(userId, cid);
+  } catch (err) {
+    log.warn('resolve media base dir failed', {
+      cid: maskId(cid),
+      error: logErrorSummary(err),
+    });
+  }
+
+  return {
+    citationWorkingDir: state.coding_project_dir && path.isAbsolute(state.coding_project_dir)
+      ? state.coding_project_dir
+      : workspaceRoot,
+    ...(mediaBaseDir ? { mediaBaseDir } : {}),
+    allowedCitationRoots,
+  };
+}
+
+function _isAuthorizedLegacyOutputFile(candidate: string, allowedRoots: readonly string[]): boolean {
+  if (!path.isAbsolute(candidate) || !isPathAllowed(candidate, allowedRoots)) return false;
+  try { return fs.statSync(candidate).isFile(); }
+  catch { return false; }
+}
+
+function _storedProducedPaths(message: Pick<MessageRecord, 'produced'>): string[] {
+  return Array.isArray(message.produced)
+    ? message.produced.filter((item): item is string => typeof item === 'string' && !!item.trim())
+    : [];
+}
+
+/** Resolve the produced-file paths a stored record presents. `backing` is the
+ *  stored list plus any authorized legacy Codex output citation; `display` is
+ *  what the renderer footer, the file panel, and file-action authorization
+ *  see. A native output citation is an exact publication declaration.
+ *  Historical rows predate a separate `published` field, so only the cited
+ *  files are displayed while the complete list remains sanitizer backing.
+ *  Without a trusted citation, the stored footer is preserved verbatim. */
+function _producedPathsForDisplay(
+  message: Pick<MessageRecord, 'from' | 'text' | 'produced'>,
+  context: MessageDisplayContext,
+): { backing: string[]; display: string[] } {
+  const storedProduced = _storedProducedPaths(message);
+  if (message.from === 'user') return { backing: storedProduced, display: storedProduced };
+  const produced = [...storedProduced];
+  const producedKeys = new Set(produced.map((item) => path.resolve(item)));
+  const citedOutputs: string[] = [];
+  for (const candidate of persistedCodexOutputCitationPaths(
+    message.text,
+    context.citationWorkingDir,
+  )) {
+    const resolved = path.resolve(candidate);
+    if (!producedKeys.has(resolved)) {
+      if (!_isAuthorizedLegacyOutputFile(resolved, context.allowedCitationRoots)) continue;
+      produced.push(resolved);
+      producedKeys.add(resolved);
+    }
+    citedOutputs.push(resolved);
+  }
+  return { backing: produced, display: citedOutputs.length ? citedOutputs : storedProduced };
+}
+
+function _messageForDisplay(message: MessageRecord, context: MessageDisplayContext): MessageRecord {
+  if (message.from === 'user') return message;
+  const storedProduced = _storedProducedPaths(message);
+  const { backing: produced, display: displayProduced } = _producedPathsForDisplay(message, context);
+  const text = versionChatMediaLocalUrlsInText(
+    sanitizePersistedCodexFileCitations(message.text, produced, context.citationWorkingDir),
+    context.mediaBaseDir || '',
+  );
+  const producedUnchanged = displayProduced.length === storedProduced.length
+    && displayProduced.every((item, index) => item === storedProduced[index]);
+  if (text === message.text && producedUnchanged) return message;
+  return {
+    ...message,
+    text,
+    ...(displayProduced.length ? { produced: displayProduced } : {}),
+  };
+}
+
+// ── CRUD ─────────────────────────────────────────────────────────────────
+
+function isDeletedConversation(c: Pick<Conversation, 'deleted_at'> | null | undefined): boolean {
+  return typeof c?.deleted_at === 'string' && c.deleted_at.length > 0;
+}
+
+function tsMs(value: unknown): number {
+  if (typeof value !== 'string' || !value) return 0;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function ensureUserDir(userId: string): string {
+  const d = userChatsDir(userId);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function conversationMetaFile(userId: string, cid: string, projectId?: string | null): string {
+  if (!projectId) ensureUserDir(userId);
+  return conversationLayout(userId, cid, projectId).metaFile;
+}
+
+function conversationIndexFile(userId: string, projectId?: string | null): string {
+  if (projectId) return projectChatIndexFile(userId, projectId);
+  return path.join(ensureUserDir(userId), conversationIndexName());
+}
+
+function conversationRoots(userId: string): Array<{ projectId: string | null; dir: string; indexFile: string }> {
+  const roots: Array<{ projectId: string | null; dir: string; indexFile: string }> = [{
+    projectId: null,
+    dir: ensureUserDir(userId),
+    indexFile: conversationIndexFile(userId),
+  }];
+  for (const pid of listProjectIds(userId)) {
+    roots.push({
+      projectId: pid,
+      dir: projectChatsDir(userId, pid),
+      indexFile: conversationIndexFile(userId, pid),
+    });
+  }
+  return roots;
+}
+
+async function _runBounded<T>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      if (signal?.aborted) return;
+      const index = next++;
+      if (index >= items.length) return;
+      await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function _cleanConversation(c: Conversation): Conversation {
+  const { processing, processing_since, last_active_at, ...rest } = c;
+  const assistance = normalizeConversationAssistance(c.assistance);
+  if (assistance) rest.assistance = assistance;
+  else delete rest.assistance;
+  return rest;
+}
+
+function _cleanConversationMeta(c: Conversation): Conversation {
+  const out = _cleanConversation(c);
+  delete out._sync_rev;
+  delete out._sync_device_id;
+  return out;
+}
+
+function _normaliseConversation(raw: any, fallbackCid = ''): Conversation | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const cid = typeof raw.conversation_id === 'string' && safeId(raw.conversation_id)
+    ? raw.conversation_id
+    : (safeId(fallbackCid) ? fallbackCid : '');
+  if (!cid) return null;
+  const createdAt = typeof raw.created_at === 'string' && raw.created_at
+    ? raw.created_at
+    : (typeof raw.updated_at === 'string' && raw.updated_at ? raw.updated_at : nowIso());
+  const updatedAt = typeof raw.updated_at === 'string' && raw.updated_at ? raw.updated_at : createdAt;
+  const out: Conversation = {
+    conversation_id: cid,
+    title: normaliseConversationTitle(raw.title),
+    kind: typeof raw.kind === 'string' && raw.kind ? raw.kind : 'normal',
+    agent_id: typeof raw.agent_id === 'string' ? raw.agent_id : '',
+    skill_id: typeof raw.skill_id === 'string' ? raw.skill_id : '',
+    session_id: typeof raw.session_id === 'string' && raw.session_id ? raw.session_id : buildConversationSessionId(cid),
+    created_at: createdAt,
+    updated_at: updatedAt,
+  };
+  if (typeof raw.project_id === 'string' && raw.project_id) out.project_id = raw.project_id;
+  if (typeof raw.origin_auto_task_id === 'string' && raw.origin_auto_task_id) out.origin_auto_task_id = raw.origin_auto_task_id;
+  const assistance = normalizeConversationAssistance(raw.assistance);
+  if (assistance) out.assistance = assistance;
+  if (typeof raw.pinned_at === 'string' && raw.pinned_at) out.pinned_at = raw.pinned_at;
+  if (typeof raw.pin_state_updated_at === 'string' && raw.pin_state_updated_at) out.pin_state_updated_at = raw.pin_state_updated_at;
+  if (raw.title_manually_set === true) out.title_manually_set = true;
+  if (typeof raw.restored_at === 'string' && raw.restored_at) out.restored_at = raw.restored_at;
+  if (typeof raw.deleted_at === 'string' && raw.deleted_at) out.deleted_at = raw.deleted_at;
+  if (Array.isArray(raw.agent_ids)) out.agent_ids = _normaliseAgentIds(raw.agent_ids);
+  if (typeof raw.commander_in_chat === 'boolean') out.commander_in_chat = raw.commander_in_chat;
+  if (typeof raw.participant_summary_updated_at === 'string' && raw.participant_summary_updated_at) {
+    out.participant_summary_updated_at = raw.participant_summary_updated_at;
+  }
+  const syncRev = Number(raw[RECORD_SYNC_REV_FIELD]) || 0;
+  if (Number.isFinite(syncRev) && syncRev > 0) out._sync_rev = Math.floor(syncRev);
+  if (typeof raw[RECORD_SYNC_DEVICE_FIELD] === 'string' && raw[RECORD_SYNC_DEVICE_FIELD]) {
+    out._sync_device_id = raw[RECORD_SYNC_DEVICE_FIELD];
+  }
+  return out;
+}
+
+function _normaliseAgentIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of raw) {
+    const id = typeof value === 'string' ? value : '';
+    if (!safeId(id) || id === 'commander' || id === 'user' || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function _hasFreshParticipantSummary(c: Conversation): boolean {
+  if (!Array.isArray(c.agent_ids) || typeof c.commander_in_chat !== 'boolean') return false;
+  if (!c.participant_summary_updated_at || c.participant_summary_updated_at !== c.updated_at) return false;
+  return !c.agent_id || c.agent_ids.includes(c.agent_id);
+}
+
+function _lastActionMs(c: Conversation | null | undefined): number {
+  if (!c) return 0;
+  return Math.max(tsMs(c.deleted_at), tsMs(c.updated_at), tsMs(c.created_at));
+}
+
+function _recordDeviceFile(userId: string): string {
+  return path.join(userLocalConfigDir(userId), 'record-sync-device.json');
+}
+
+function _recordDeviceId(userId: string): string {
+  const file = _recordDeviceFile(userId);
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const id = typeof raw?.device_id === 'string' ? raw.device_id : '';
+    if (id) return id;
+  } catch { /* create below */ }
+  const id = randomUUID();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, device_id: id }), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, file);
+    try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
+  } catch { /* a missing device id only weakens conflict detection */ }
+  return id;
+}
+
+function _stampConversationSync(userId: string, c: Conversation): Conversation {
+  return bumpRecordSyncVersion(c, _recordDeviceId(userId)) as Conversation;
+}
+
+const CLEARABLE_CONVERSATION_FIELDS = [
+  'project_id',
+  'origin_auto_task_id',
+  'pinned_at',
+  'pin_state_updated_at',
+  'title_manually_set',
+  'deleted_at',
+] as const satisfies readonly (keyof Conversation)[];
+
+function hasOwn(obj: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function _mergeWithWinningConversationFields(
+  loser: Conversation,
+  winner: Conversation,
+  clearMissingWinnerFields = false,
+): Conversation {
+  const out = { ...loser, ...winner };
+  if (clearMissingWinnerFields) {
+    for (const field of CLEARABLE_CONVERSATION_FIELDS) {
+      if (!hasOwn(winner, field)) delete (out as any)[field];
+    }
+  }
+  return out;
+}
+
+function _mergeWithWinningMetaFields(indexRow: Conversation, metaRow: Conversation): Conversation {
+  const out = { ...indexRow, ...metaRow };
+  const metaPinClock = tsMs(metaRow.pin_state_updated_at);
+  const indexPinClock = tsMs(indexRow.pin_state_updated_at);
+  if (metaPinClock && metaPinClock >= indexPinClock && !hasOwn(metaRow, 'pinned_at')) {
+    delete out.pinned_at;
+  }
+  return out;
+}
+
+function _mergeConversationRecord(indexRow: Conversation | undefined, metaRow: Conversation): Conversation {
+  if (!indexRow) return metaRow;
+  const indexMs = _lastActionMs(indexRow);
+  const metaMs = _lastActionMs(metaRow);
+  if (metaMs > indexMs) return _mergeWithWinningMetaFields(indexRow, metaRow);
+  if (indexMs > metaMs) return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  if (isDeletedConversation(indexRow) && !isDeletedConversation(metaRow)) {
+    return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  }
+  // When sync pulls a newer `_index.json` before the matching per-cid
+  // `meta.json`, timestamps can tie because pin/unpin intentionally does not
+  // bump `updated_at`. In that case the sync-stamped index row is the better
+  // authority; otherwise stale meta can resurrect an old `pinned_at`.
+  if (recordSyncRev(indexRow) > 0) {
+    return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  }
+  return _mergeWithWinningMetaFields(indexRow, metaRow);
+}
+
+async function _readConversationIndexRoot(
+  userId: string,
+  projectId?: string | null,
+): Promise<Conversation[]> {
+  const indexFile = conversationIndexFile(userId, projectId);
+  const data: any = await readJson(indexFile);
+  const rawItems = Array.isArray(data)
+    ? data : (data && Array.isArray(data.items) ? data.items : []);
+  const rows: Conversation[] = [];
+  for (const raw of rawItems) {
+    const row = _normaliseConversation(raw);
+    if (!row) continue;
+    if (projectId && !row.project_id) row.project_id = projectId;
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function _readIndexConversations(userId: string): Promise<Conversation[]> {
+  const cached = _conversationIndexCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return _cloneConversationList(cached.items);
+  const existing = _conversationIndexInFlight.get(userId);
+  if (existing) return _cloneConversationList(await existing);
+
+  const generation = _conversationIndexGeneration.get(userId) || 0;
+  const run = (async () => {
+    const roots = conversationRoots(userId);
+    const rowsByRoot: Conversation[][] = roots.map(() => []);
+    await _runBounded(
+      roots.map((root, index) => ({ root, index })),
+      8,
+      async ({ root, index }) => {
+        rowsByRoot[index] = await _readConversationIndexRoot(userId, root.projectId);
+      },
+    );
+    return rowsByRoot.flat();
+  })();
+  _conversationIndexInFlight.set(userId, run);
+  try {
+    const items = await run;
+    if ((_conversationIndexGeneration.get(userId) || 0) === generation) {
+      _conversationIndexCache.set(userId, {
+        expiresAt: Date.now() + CONVERSATION_INDEX_CACHE_TTL_MS,
+        items: _cloneConversationList(items),
+      });
+    }
+    return _cloneConversationList(items);
+  } finally {
+    if (_conversationIndexInFlight.get(userId) === run) {
+      _conversationIndexInFlight.delete(userId);
+    }
+  }
+}
+
+/** Compact project counts derived from the same parsed index snapshot the
+ * Stage B conversation list consumes. Stage A can call this first without
+ * causing every project `_index.json` to be reopened moments later. */
+export async function getProjectConversationCounts(userId: string): Promise<Map<string, number>> {
+  const liveByProject = new Map<string, Map<string, boolean>>();
+  for (const row of await _readIndexConversations(userId)) {
+    const pid = typeof row.project_id === 'string' && safeId(row.project_id)
+      ? row.project_id : '';
+    if (!pid) continue;
+    let liveByCid = liveByProject.get(pid);
+    if (!liveByCid) {
+      liveByCid = new Map();
+      liveByProject.set(pid, liveByCid);
+    }
+    liveByCid.set(row.conversation_id, !isDeletedConversation(row));
+  }
+  const counts = new Map<string, number>();
+  for (const [pid, liveByCid] of liveByProject) {
+    let count = 0;
+    for (const live of liveByCid.values()) if (live) count += 1;
+    counts.set(pid, count);
+  }
+  return counts;
+}
+
+/** Compact maintenance reader for session ownership. It opens only aggregate
+ * conversation indexes and skips runtime/member/history enrichment. */
+export async function listActiveConversationIds(userId: string): Promise<string[]> {
+  const ids = new Set<string>();
+  for (const row of await _readIndexConversations(userId)) {
+    if (!isDeletedConversation(row) && safeId(row.conversation_id)) ids.add(row.conversation_id);
+  }
+  return Array.from(ids);
+}
+
+/** Destructive maintenance must not turn unreadable indexes into an empty account.
+ * Unindexed metadata directories are retained for the normal recovery path. */
+export async function retainedConversationIdsForEditCleanup(uid: string): Promise<Set<string>> {
+  const roots = [{ dir: userChatsDir(uid), indexFile: conversationIndexFile(uid) }];
+  let projects: fs.Dirent[] = [];
+  try { projects = await fsp.readdir(userProjectsDir(uid), { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  for (const entry of projects) {
+    if (entry.isSymbolicLink()) throw new Error('unsafe project root');
+    if (entry.isDirectory() && safeId(entry.name)) roots.push({ dir: projectChatsDir(uid, entry.name), indexFile: projectChatIndexFile(uid, entry.name) });
+  }
+  const ids = new Set<string>();
+  for (const root of roots) {
+    let entries: fs.Dirent[];
+    try {
+      if ((await fsp.lstat(root.dir)).isSymbolicLink()) throw new Error('unsafe conversation root');
+      entries = await fsp.readdir(root.dir, { withFileTypes: true });
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) throw new Error('unsafe conversation entry');
+      if (entry.isDirectory() && safeId(entry.name)) ids.add(entry.name);
+    }
+    let raw: any;
+    try { raw = JSON.parse(await fsp.readFile(root.indexFile, 'utf8')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+    const items = Array.isArray(raw) ? raw : raw?.items;
+    if (!Array.isArray(items)) throw new Error('invalid conversation index');
+    for (const item of items) {
+      const row = _normaliseConversation(item);
+      if (!row) throw new Error('invalid conversation record');
+      if (!isDeletedConversation(row)) ids.add(row.conversation_id);
+    }
+  }
+  return ids;
+}
+
+export interface ConversationDisplayRow {
+  deleted: boolean;
+  hidden?: boolean;
+  conversation_id: string;
+  title: string;
+  project_id: string;
+}
+
+/** Metadata-only maintenance snapshot; avoids loading every conversation's history. */
+export async function listCleanupConversationRows(userId: string): Promise<Conversation[]> {
+  const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
+  return items.filter(row => !isDeletedConversation(row));
+}
+
+/** Deletion discovers durable metadata, including legacy and already deleted
+ * children, without history/runtime enrichment or silently losing recoverable rows. */
+export async function listConversationDeletionRows(userId: string, projectId: string): Promise<Conversation[]> {
+  return (await _readRawConversations(userId)).filter(row => row.project_id === projectId);
+}
+
+/** Compact search/display catalog. Reuses the central parsed index snapshot
+ * and deliberately excludes runtime, participants, history, and metadata. */
+export async function listConversationDisplayRows(
+  userId: string, options: { includeDeleted?: boolean; includeHidden?: boolean } = {},
+): Promise<ConversationDisplayRow[]> {
+  const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
+  return items
+    .filter((row) => (options.includeHidden || row.kind !== 'app_task') && (options.includeDeleted || !isDeletedConversation(row)))
+    .map((row) => ({
+      deleted: isDeletedConversation(row),
+      ...(row.kind === 'app_task' ? { hidden: true } : {}),
+      conversation_id: row.conversation_id,
+      title: row.title || '',
+      project_id: typeof row.project_id === 'string' ? row.project_id : '',
+    }));
+}
+
+async function _readConversationMetas(
+  userId: string,
+  authoritativeIndexCids: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<Conversation[]> {
+  const out: Conversation[] = [];
+  await Promise.all(conversationRoots(userId).map(async (root) => {
+    if (signal?.aborted) return;
+    let entries: fs.Dirent[] = [];
+    try { entries = await fsp.readdir(root.dir, { withFileTypes: true }); }
+    catch { return; }
+    await _runBounded(entries, 32, async (entry) => {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || !isConversationMetaDirName(entry.name)) return;
+      // Current writers persist the complete record to the aggregate index
+      // and stamp it with a record-level sync revision. Its duplicate
+      // meta.json is a recovery copy, not a routine list dependency. Legacy
+      // rows (no revision) and cids absent from the index still take the
+      // compatibility path below.
+      if (authoritativeIndexCids.has(entry.name)) return;
+      const file = path.join(root.dir, entry.name, conversationMetaName());
+      try {
+        const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+        const hasMetaShape = typeof raw.conversation_id === 'string'
+          || typeof raw.title === 'string'
+          || typeof raw.created_at === 'string'
+          || typeof raw.updated_at === 'string';
+        if (!hasMetaShape) return;
+        const row = _normaliseConversation(raw, entry.name);
+        if (row) {
+          if (root.projectId && !row.project_id) row.project_id = root.projectId;
+          out.push(row);
+        }
+      } catch { /* ignore malformed metadata */ }
+    }, signal);
+  }));
+  return out;
+}
+
+/** Read recovery metadata only for revisionless rows already present in an
+ * aggregate index. This preserves legacy timestamp merging without listing
+ * every conversation directory on the routine startup path. Discovery of
+ * metadata that is missing from all indexes remains an explicit repair job. */
+async function _readKnownConversationMetas(
+  userId: string,
+  indexRows: readonly Conversation[],
+): Promise<Conversation[]> {
+  const out: Conversation[] = [];
+  const legacyRows = indexRows.filter((row) => recordSyncRev(row) <= 0 && safeId(row.conversation_id));
+  await _runBounded(legacyRows, 32, async (row) => {
+    const root = row.project_id ? projectChatsDir(userId, row.project_id) : userChatsDir(userId);
+    const file = path.join(root, row.conversation_id, conversationMetaName());
+    try {
+      const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+      const metaRow = _normaliseConversation(raw, row.conversation_id);
+      if (!metaRow) return;
+      if (row.project_id && !metaRow.project_id) metaRow.project_id = row.project_id;
+      out.push(metaRow);
+    } catch { /* missing/malformed recovery copy is non-authoritative */ }
+  });
+  return out;
+}
+
+interface ReadRawConversationOptions {
+  /** Enumerate conversation directories to discover recovery rows absent
+   * from aggregate indexes. Expensive; routine startup deliberately opts out. */
+  discoverUnindexedMetas?: boolean;
+  signal?: AbortSignal;
+}
+
+async function _mergeConversationIndexRows(
+  userId: string,
+  indexRows: Conversation[],
+  discoverUnindexedMetas: boolean,
+  signal?: AbortSignal,
+): Promise<Conversation[]> {
+  const { items: out, positions } = _mergeNormalizedConversationRows(indexRows);
+  const authoritativeIndexCids = new Set(
+    out.filter((row) => recordSyncRev(row) > 0).map((row) => row.conversation_id),
+  );
+  const metaRows = discoverUnindexedMetas
+    ? await _readConversationMetas(userId, authoritativeIndexCids, signal)
+    : await _readKnownConversationMetas(userId, out);
+  for (const metaRow of metaRows) {
+    const pos = positions.get(metaRow.conversation_id);
+    if (pos === undefined) {
+      positions.set(metaRow.conversation_id, out.length);
+      out.push(metaRow);
+    } else {
+      out[pos] = _mergeConversationRecord(out[pos], metaRow);
+    }
+  }
+  return out;
+}
+
+/** Merge duplicate normalized index rows without opening recovery metadata. */
+function _mergeNormalizedConversationRows(
+  indexRows: readonly Conversation[],
+): { items: Conversation[]; positions: Map<string, number> } {
+  const out: Conversation[] = [];
+  const positions = new Map<string, number>();
+  for (const row of indexRows) {
+    const pos = positions.get(row.conversation_id);
+    if (pos === undefined) {
+      positions.set(row.conversation_id, out.length);
+      out.push(row);
+    } else {
+      out[pos] = _mergeConversationRecord(out[pos], row);
+    }
+  }
+  return { items: out, positions };
+}
+
+async function _readRawConversations(
+  userId: string,
+  { discoverUnindexedMetas = true, signal }: ReadRawConversationOptions = {},
+): Promise<Conversation[]> {
+  const indexRows = await _readIndexConversations(userId);
+  return _mergeConversationIndexRows(userId, indexRows, discoverUnindexedMetas, signal);
+}
+
+/** Read one physical conversation root. A warm startup snapshot can satisfy
+ * this without disk I/O; once it expires, project/old-bucket interactions open
+ * only their owning compact index instead of reconstructing every root. */
+async function _readScopedRawConversations(
+  userId: string,
+  projectId?: string | null,
+): Promise<Conversation[]> {
+  const cached = _conversationIndexCache.get(userId);
+  const rows = cached && cached.expiresAt > Date.now()
+    ? _cloneConversationList(cached.items).filter((row) => (
+        projectId ? row.project_id === projectId : !row.project_id
+      ))
+    : await _readConversationIndexRoot(userId, projectId);
+  return _mergeConversationIndexRows(userId, rows, false);
+}
+
+/** Resolve one conversation from its physical index root. `projectIdHint` is
+ * supplied by the renderer's already-loaded sidebar row: string = project
+ * root, null = global root, undefined = no trustworthy hint. Main validates
+ * the hint by finding the cid in that root; stale hints fall back to the
+ * shared all-root index snapshot so project moves and sync races stay correct.
+ * Only the selected row is passed into legacy-meta and runtime enrichment. */
+async function _readTargetRawConversation(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<Conversation[]> {
+  if (appConversationRoot(userId, cid)) {
+    const value = await readJson<Conversation>(conversationLayout(userId, cid).metaFile);
+    return value?.conversation_id === cid && value.kind === 'app_task' ? [value] : [];
+  }
+  const cached = _conversationIndexCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    const matches = _cloneConversationList(cached.items)
+      .filter((row) => row.conversation_id === cid);
+    if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
+      const hintedMatches = matches.filter((row) => (
+        projectIdHint === null ? !row.project_id : row.project_id === projectIdHint
+      ));
+      if (hintedMatches.length) {
+        return _mergeConversationIndexRows(userId, hintedMatches, false);
+      }
+    }
+    return _mergeConversationIndexRows(userId, matches, false);
+  }
+
+  if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
+    const hintedRows = (await _readConversationIndexRoot(userId, projectIdHint))
+      .filter((row) => row.conversation_id === cid);
+    if (hintedRows.length) {
+      return _mergeConversationIndexRows(userId, hintedRows, false);
+    }
+  }
+
+  const matches = (await _readIndexConversations(userId))
+    .filter((row) => row.conversation_id === cid);
+  return _mergeConversationIndexRows(userId, matches, false);
+}
+
+async function _writeJsonIfChanged(file: string, data: unknown): Promise<void> {
+  const next = JSON.stringify(data, null, 2);
+  try {
+    const cur = await fsp.readFile(file, 'utf8');
+    if (cur === next) return;
+  } catch { /* missing or unreadable => write */ }
+  await writeJson(file, data);
+}
+
+async function _saveConversationMetas(
+  userId: string,
+  items: Conversation[],
+  changedCids?: ReadonlySet<string>,
+): Promise<void> {
+  const selected = changedCids
+    ? items.filter((c) => changedCids.has(c.conversation_id))
+    : items;
+  await _runBounded(selected, 32, async (c) => {
+    if (!safeId(c.conversation_id)) return;
+    const file = conversationMetaFile(userId, c.conversation_id, c.project_id);
+    if (isDeletedConversation(c)) {
+      try { await fsp.unlink(file); } catch { /* missing is fine */ }
+      return;
+    }
+    await _writeJsonIfChanged(file, _cleanConversationMeta(c));
+  });
+}
+
+async function _removeConversationMeta(cid: string, roots: ReadonlyArray<{ dir: string }>): Promise<void> {
+  if (!safeId(cid)) return;
+  for (const root of roots) {
+    try { await fsp.unlink(path.join(root.dir, cid, conversationMetaName())); } catch { /* ignore */ }
+  }
+}
+
+function _messageText(raw: any): string {
+  if (!raw || typeof raw !== 'object') return '';
+  if (typeof raw.text === 'string') return raw.text;
+  if (typeof raw.content === 'string') return raw.content;
+  if (Array.isArray(raw.content)) {
+    return raw.content
+      .map((part: any) => (typeof part === 'string'
+        ? part
+        : (part && typeof part.text === 'string' ? part.text : '')))
+      .filter(Boolean)
+      .join(' ');
+  }
+  return '';
+}
+
+function _normaliseMessageTs(raw: any): string | null {
+  const ts = typeof raw?.ts === 'string' ? raw.ts : (typeof raw?.created_at === 'string' ? raw.created_at : '');
+  if (!ts) return null;
+  const ms = new Date(ts).getTime();
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+const REPAIR_SEED_MAX_LINES = 200;
+
+async function _readConversationSeed(
+  file: string,
+  signal?: AbortSignal,
+): Promise<{ title: string; createdAt: string | null; updatedAt: string | null } | null> {
+  let firstUserText = '';
+  let createdMs = 0;
+  let stream: fs.ReadStream | null = null;
+  let lines: readline.Interface | null = null;
+  try {
+    stream = fs.createReadStream(file, { encoding: 'utf8', signal });
+    lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    let inspected = 0;
+    for await (const line of lines) {
+      if (signal?.aborted) return null;
+      inspected += 1;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let msg: any;
+      try { msg = JSON.parse(trimmed); } catch { continue; }
+      const iso = _normaliseMessageTs(msg);
+      if (iso) {
+        const ms = new Date(iso).getTime();
+        if (!createdMs || ms < createdMs) createdMs = ms;
+      }
+      const from = typeof msg?.from === 'string' ? msg.from : (typeof msg?.role === 'string' ? msg.role : '');
+      if (!firstUserText && from === 'user') {
+        firstUserText = _messageText(msg).trim();
+      }
+      if (firstUserText || inspected >= REPAIR_SEED_MAX_LINES) break;
+    }
+  } catch (err) {
+    if (signal?.aborted || (err as NodeJS.ErrnoException).name === 'AbortError') return null;
+    // Fall back to stat/default title for unreadable recovery candidates.
+  } finally {
+    lines?.close();
+    stream?.destroy();
+  }
+  return {
+    title: firstUserText ? autoTitle(firstUserText) : t('chat.default_title'),
+    createdAt: createdMs ? new Date(createdMs).toISOString() : null,
+    // File mtime is the bounded recovery source for latest activity; scanning
+    // an entire multi-year JSONL only to rediscover its tail is not justified.
+    updatedAt: null,
+  };
+}
+
+interface ConversationRepairRun {
+  items: Conversation[];
+  cancelled: boolean;
+}
+
+function _repairIndexTails(): Map<string, Promise<ConversationRepairRun>> {
+  const g = globalThis as typeof globalThis & { __orkasChatRepairIndexTails?: Map<string, Promise<ConversationRepairRun>> };
+  if (!g.__orkasChatRepairIndexTails) g.__orkasChatRepairIndexTails = new Map();
+  return g.__orkasChatRepairIndexTails;
+}
+
+function _conversationWriteTails(): Map<string, Promise<void>> {
+  const g = globalThis as typeof globalThis & { __orkasChatWriteTails?: Map<string, Promise<void>> };
+  if (!g.__orkasChatWriteTails) g.__orkasChatWriteTails = new Map();
+  return g.__orkasChatWriteTails;
+}
+
+async function _withConversationWrite<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  const tails = _conversationWriteTails();
+  const previous = tails.get(userId) || Promise.resolve();
+  const result = previous.catch(() => undefined).then(fn);
+  const tail = result.then(() => undefined, () => undefined);
+  tails.set(userId, tail);
+  try {
+    return await result;
+  } finally {
+    if (tails.get(userId) === tail) tails.delete(userId);
+  }
+}
+
+/** Tombstones cleaned per lifecycle-lock hold. */
+const TOMBSTONE_CLEANUP_BATCH = 32;
+
+/**
+ * Remove the files a published repair left behind, in short lifecycle-lock holds
+ * so that a new task never queues behind the whole list. Each hold rechecks the
+ * index, because a restore between holds must keep the metadata it just wrote.
+ *
+ * `pruned` rows just left the index: nothing would clean them later and discovery
+ * would revive whatever stays on disk. They go first and ignore cancellation, while
+ * the others wait for the next repair. Returns false when cancelled.
+ */
+async function _removeTombstoneFiles(
+  userId: string,
+  tombstones: readonly Conversation[],
+  pruned: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!tombstones.length) return true;
+  const isPruned = (c: Conversation) => pruned.has(c.conversation_id);
+  const ordered = [...tombstones.filter(isPruned), ...tombstones.filter(c => !isPruned(c))];
+  const roots = conversationRoots(userId);
+  let checkedGeneration = -1;
+  let live = new Set<string>();
+  for (let start = 0; start < ordered.length; start += TOMBSTONE_CLEANUP_BATCH) {
+    const batch = ordered.slice(start, start + TOMBSTONE_CLEANUP_BATCH);
+    if (signal?.aborted && !isPruned(batch[0])) return false;
+    await _withConversationWrite(userId, async () => {
+      const generation = _conversationListGeneration.get(userId) || 0;
+      if (generation !== checkedGeneration) {
+        checkedGeneration = generation;
+        // The index cache is per module instance; the generation spans them.
+        _invalidateConversationIndexCache(userId);
+        live = new Set((await _readIndexConversations(userId))
+          .filter(row => !isDeletedConversation(row)).map(row => row.conversation_id));
+      }
+      for (const c of batch) {
+        if (live.has(c.conversation_id)) continue;
+        await _removeConversationMeta(c.conversation_id, roots);
+        if (isExpiredIsoTombstone(c.deleted_at)) {
+          const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
+          try { await fsp.unlink(file); } catch { /* missing is fine */ }
+          invalidateLineCount(file);
+        }
+      }
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return true;
+}
+
+async function _repairConversationIndexFromDiskUnlocked(
+  userId: string,
+  items: Conversation[],
+  discoveredMetaRows: number,
+  generation: number,
+  signal?: AbortSignal,
+): Promise<ConversationRepairRun> {
+  if (signal?.aborted) return { items, cancelled: true };
+  const existing = new Set(items.map((c) => c.conversation_id).filter(Boolean));
+  const recovered: Conversation[] = [];
+  const tombstones = items.filter(c => isDeletedConversation(c) && safeId(c.conversation_id));
+  const compacted = pruneExpiredDeletedRecords(items) as Conversation[];
+  const expiredTombstoneCount = items.length - compacted.length;
+  const keptCids = new Set(compacted.map(c => c.conversation_id));
+  const prunedCids = new Set(tombstones.map(c => c.conversation_id).filter(cid => !keptCids.has(cid)));
+  items = compacted;
+
+  const finish = async (cancelled: boolean, includeRecovered: boolean): Promise<ConversationRepairRun> => {
+    const acceptedRecovered = includeRecovered ? recovered : [];
+    const snapshot = [...items, ...acceptedRecovered];
+    let published = false;
+    // Do not hold the lifecycle lock during discovery. Validate the snapshot
+    // inside that lock before any index, metadata, or transcript mutation.
+    const run = await _withConversationWrite<ConversationRepairRun>(userId, async () => {
+      if ((_conversationListGeneration.get(userId) || 0) !== generation) {
+        _invalidateConversationIndexCache(userId);
+        return { items: await _readIndexConversations(userId), cancelled: true };
+      }
+      const repaired = snapshot;
+      const changed = acceptedRecovered.length || expiredTombstoneCount || discoveredMetaRows;
+      try {
+        // Persist deletion intent before removing any remaining metadata.
+        if (changed) await _saveConversationsUnlocked(userId, repaired);
+        published = true;
+        if (changed) {
+          try {
+            createLogger('chats').info(
+              `repaired conversation index recovered=${acceptedRecovered.length} recovered_meta=${discoveredMetaRows} pruned_tombstones=${expiredTombstoneCount} cancelled=${cancelled}`,
+            );
+          } catch { /* early circular init */ }
+        }
+        return { items: repaired, cancelled };
+      } finally {
+        if (changed) _invalidateConversationListCache(userId);
+      }
+    });
+    // A rejected snapshot lost to a newer write and removes nothing.
+    if (!published) return run;
+    const cleaned = await _removeTombstoneFiles(userId, tombstones, prunedCids, signal);
+    return cleaned ? run : { ...run, cancelled: true };
+  };
+
+  if (signal?.aborted) return finish(true, false);
+  for (const root of conversationRoots(userId)) {
+    if (signal?.aborted) return finish(true, false);
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = await fsp.readdir(root.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (let index = 0; index < entries.length; index++) {
+      if (index > 0 && index % 100 === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal?.aborted) return finish(true, false);
+      }
+      const e = entries[index];
+      if (!e.isFile() || !e.name.endsWith('.jsonl') || e.name.startsWith('.')) continue;
+      const cid = e.name.slice(0, -'.jsonl'.length);
+      if (!safeId(cid) || existing.has(cid)) continue;
+      const file = path.join(root.dir, e.name);
+      let st: fs.Stats | null = null;
+      try { st = await fsp.stat(file); } catch { continue; }
+      if (!st.isFile()) continue;
+      const seed = await _readConversationSeed(file, signal);
+      if (!seed && signal?.aborted) return finish(true, false);
+      const fallbackTs = new Date(Number.isFinite(st.mtimeMs) ? st.mtimeMs : Date.now()).toISOString();
+      const createdAt = seed?.createdAt || fallbackTs;
+      const updatedAt = seed?.updatedAt || fallbackTs;
+      recovered.push(_stampConversationSync(userId, {
+        conversation_id: cid,
+        title: seed?.title || t('chat.default_title'),
+        kind: 'normal',
+        agent_id: '',
+        skill_id: '',
+        session_id: buildConversationSessionId(cid),
+        ...(root.projectId ? { project_id: root.projectId } : {}),
+        created_at: createdAt,
+        updated_at: updatedAt,
+      }));
+      existing.add(cid);
+    }
+  }
+  return finish(false, true);
+}
+
+async function _repairConversationIndexFromDisk(
+  userId: string,
+  signal?: AbortSignal,
+): Promise<ConversationRepairRun> {
+  const tails = _repairIndexTails();
+  const prev = tails.get(userId) || Promise.resolve({ items: [], cancelled: false });
+  const next = prev.catch(() => ({ items: [], cancelled: false })).then(async () => {
+    const generation = _conversationListGeneration.get(userId) || 0;
+    const indexed = await _readIndexConversations(userId);
+    if (signal?.aborted) return { items: indexed, cancelled: true };
+    const indexedCids = new Set(indexed.map((row) => row.conversation_id));
+    const latest = await _readRawConversations(userId, { signal });
+    if (signal?.aborted) return { items: indexed, cancelled: true };
+    const discoveredMetaRows = latest.reduce(
+      (count, row) => count + (indexedCids.has(row.conversation_id) ? 0 : 1),
+      0,
+    );
+    return _repairConversationIndexFromDiskUnlocked(userId, latest, discoveredMetaRows, generation, signal);
+  });
+  tails.set(userId, next);
+  try {
+    return await next;
+  } finally {
+    if (tails.get(userId) === next) tails.delete(userId);
+  }
+}
+
+/** Full recovery hook for maintenance / explicit repair. Unlike the routine
+ * sidebar list, this enumerates metadata directories and JSONLs so files
+ * dropped in out-of-band are promoted back into aggregate indexes. */
+export async function repairConversationIndex(
+  userId: string,
+  signal?: AbortSignal,
+): Promise<{ conversations: number; cancelled?: boolean }> {
+  const run = await _repairConversationIndexFromDisk(userId, signal);
+  _invalidateConversationListCache(userId);
+  return {
+    conversations: run.items.filter((c) => !isDeletedConversation(c)).length,
+    ...(run.cancelled ? { cancelled: true } : {}),
+  };
+}
+
+// Covers the complete renderer Stage A → Stage B handoff even on a slow disk.
+// Normal writes and sync pulls invalidate eagerly, so this is not a freshness
+// delay for supported mutation paths.
+const CONVERSATION_INDEX_CACHE_TTL_MS = 10_000;
+const _conversationIndexCache = new Map<string, { expiresAt: number; items: Conversation[] }>();
+const _conversationIndexInFlight = new Map<string, Promise<Conversation[]>>();
+const _conversationIndexGeneration = new Map<string, number>();
+
+function _invalidateConversationIndexCache(userId: string): void {
+  _conversationIndexCache.delete(userId);
+  _conversationIndexInFlight.delete(userId);
+  _conversationIndexGeneration.set(userId, (_conversationIndexGeneration.get(userId) || 0) + 1);
+  search.invalidateChatDisplayCatalog(userId);
+}
+
+const CONVERSATION_LIST_CACHE_TTL_MS = 2_000;
+const _conversationListCache = new Map<string, { expiresAt: number; items: Conversation[] }>();
+const _conversationListInFlight = new Map<string, Promise<Conversation[]>>();
+// Match the shared write queue across CJS/ESM instances. A module-local
+// generation would miss lifecycle mutations made through the other loader.
+const _conversationGenerationRegistry = globalThis as typeof globalThis & {
+  __orkasConversationListGeneration?: Map<string, number>;
+};
+const _conversationListGeneration = _conversationGenerationRegistry.__orkasConversationListGeneration ||= new Map<string, number>();
+
+function _cloneConversationList(items: Conversation[]): Conversation[] {
+  return items.map((c) => ({
+    ...c,
+    ...(c.agent_ids ? { agent_ids: [...c.agent_ids] } : {}),
+    ...(c.assistance ? { assistance: { ...c.assistance } } : {}),
+  }));
+}
+
+function _invalidateConversationListCache(userId: string): void {
+  invalidateTaskDeletions(userId);
+  _invalidateConversationIndexCache(userId);
+  _conversationListCache.delete(userId);
+  _conversationListInFlight.delete(userId);
+  _conversationListGeneration.set(userId, (_conversationListGeneration.get(userId) || 0) + 1);
+}
+
+/** Sync pulls bypass normal conversation writers, so their data-changed hook
+ * uses this public invalidation before the renderer asks for fresh rows. */
+export function invalidateConversationCaches(userId: string): void {
+  _invalidateConversationListCache(userId);
+}
+
+async function _listConversationsUncached(
+  userId: string,
+  shouldPersistBackfill: () => boolean,
+  selectItems?: (items: Conversation[]) => Conversation[],
+  readRawItems: () => Promise<Conversation[]> = () => (
+    _readRawConversations(userId, { discoverUnindexedMetas: false })
+  ),
+  includeAppTasks = false,
+): Promise<Conversation[]> {
+  // First paint trusts aggregate indexes and directly opens recovery metadata
+  // only for revisionless legacy rows. Directory/JSONL discovery is deferred
+  // to `repairConversationIndex` outside the startup interaction window.
+  const rawItems = (await readRawItems())
+    .filter((c) => !isDeletedConversation(c) && (includeAppTasks || c.kind !== 'app_task'));
+  const items = selectItems ? selectItems(rawItems) : rawItems;
+  if (!items.length) return items;
+  // Derive `processing` from each cid's state.json AND the bus's in-memory
+  // quiescence. Two cases mean "renderer should keep watching":
+  //   1. state.status === 'running' — the obvious one
+  //   2. bus is mid-flush — e.g. user clicked abort while a tool was in
+  //      flight; state.json flips to 'aborted' immediately but the worker's
+  //      runTurn still has to unwind (await tool finish → outcome → enqueue
+  //      the "(stopped)" + processItems message). On-disk status looks
+  //      terminal but jsonl is still growing. If the renderer reloads in
+  //      this window (Cmd+R right after stop) and we say processing=false,
+  //      it stops polling and never picks up the late abort message — user
+  //      sees only their own msg, "everything I watched stream is gone".
+  // Parallelize the remaining per-conversation enrichment. Current records
+  // carry a participant summary, so they need at most the recent state read;
+  // legacy records additionally read members.json + <cid>.jsonl once and
+  // backfill the summary. The bus module is loaded once outside the map so
+  // we don't re-enter the module cache N times.
+  //
+  // CJS require (not dynamic `import()`) so bus.ts resolves through the
+  // same module cache as the static-import chain. Node's dynamic `import()`
+  // is always ESM, which would load bus.ts as a SECOND module instance with
+  // its own _cids Map — splitting the bus state into two and silently
+  // losing every event that's emitted on the wrong half (see the dual-loader
+  // note on bus.ts `_cids` for why ESM-vs-CJS duplication corrupts shared
+  // bus state).
+  const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+  // 15-minute fast-path for the `processing` derivation only: any conv
+  // whose last_active_at is older than the renderer's `processingFresh`
+  // window (`conversation.js`: 15 * 60 * 1000) CAN'T surface a
+  // `processing: true` chip in the UI even if state.json still says
+  // `running` (crashed prior session, stuck flag) — the renderer filters
+  // it out. So we skip the `readState` IO for stale convs entirely.
+  // The in-memory `bus.isQuiescent` Map lookup still applies to ALL
+  // convs, including stale ones whose clock skewed past 15min.
+  // A fresh participant summary removes members/history IO for all age
+  // buckets. Legacy rows still take the compatibility scan once so their
+  // sidebar badges remain correct before the summary is persisted.
+  const STALE_MS = 15 * 60 * 1000;
+  const now = Date.now();
+  const summariesToBackfill: Conversation[] = [];
+  const out: Conversation[] = await Promise.all(items.map(async (c) => {
+    let processing = false;
+    let since: string | null = null;
+    const summaryFresh = _hasFreshParticipantSummary(c);
+    let agentIds: string[] = summaryFresh ? _normaliseAgentIds(c.agent_ids) : [];
+    let commanderInChat = summaryFresh ? c.commander_in_chat === true : false;
+    const updatedMs = c.updated_at ? new Date(c.updated_at).getTime() : 0;
+    const createdMs = c.created_at ? new Date(c.created_at).getTime() : 0;
+    const lastActiveMs = Math.max(updatedMs || 0, createdMs || 0);
+    const busBusy = !bus.isQuiescent(userId, c.conversation_id);
+    const stale = lastActiveMs > 0 && (now - lastActiveMs) > STALE_MS;
+    const [stateRes, membersRes, commRes] = await Promise.allSettled([
+      stale ? Promise.resolve(null) : readState(userId, c.conversation_id, c.project_id ?? null),
+      summaryFresh ? Promise.resolve(null) : readMembers(userId, c.conversation_id, c.project_id ?? null),
+      // Substring scan of `<cid>.jsonl` for any `from:"commander"` line.
+      // Cheaper than per-line JSON.parse and good enough — `commander` is
+      // an actor id, never legitimately a free-form value of any other
+      // field. False positives would require a user message containing
+      // that exact quoted pattern (and even then the read returns true,
+      // which is the conservative outcome: show commander when in doubt).
+      summaryFresh ? Promise.resolve(null) : (async () => {
+        const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
+        if (!fs.existsSync(file)) return false;
+        try {
+          const text = await fsp.readFile(file, 'utf8');
+          return /"from"\s*:\s*"commander"/.test(text);
+        } catch { return false; }
+      })(),
+    ]);
+    if (stale) {
+      // Stale: state.json was skipped, only bus quiescence drives processing.
+      processing = busBusy;
+    } else if (stateRes.status === 'fulfilled' && stateRes.value) {
+      const s = stateRes.value;
+      processing = s.status === 'running' || busBusy;
+      since = processing ? s.last_active_at : null;
+    }
+    if (!summaryFresh && commRes.status === 'fulfilled') {
+      commanderInChat = commRes.value;
+    }
+    if (!summaryFresh && membersRes.status === 'fulfilled' && membersRes.value) {
+      const seen = new Set<string>();
+      for (const a of membersRes.value.actors) {
+        if (a && a.kind === 'agent' && a.id && !seen.has(a.id)) {
+          seen.add(a.id);
+          agentIds.push(a.id);
+        }
+      }
+      // Union in the starting `agent_id` defensively — `members.json` is
+      // populated by the bus once a turn runs, so a freshly-created conv
+      // can have agent_id set before its members file lands.
+      if (c.agent_id && !seen.has(c.agent_id)) {
+        agentIds.push(c.agent_id);
+      }
+    } else if (!summaryFresh && c.agent_id) {
+      agentIds = [c.agent_id];
+    }
+    if (!summaryFresh) {
+      c.agent_ids = _normaliseAgentIds(agentIds);
+      c.commander_in_chat = commanderInChat;
+      c.participant_summary_updated_at = c.updated_at;
+      summariesToBackfill.push(c);
+    }
+    // Last-activity = max(updated_at, created_at). `updated_at` is bumped
+    // by `bumpConversationActivity` on every message append (group_chat/
+    // bus.ts::appendMain), so it tracks the real per-conversation timeline
+    // and survives sync. The _index.json array merge now prefers the
+    // record-level `_sync_rev` written by local index mutations, falling
+    // back to updated_at only for legacy rows. We deliberately do NOT
+    // consult `<cid>.jsonl` mtime: sync rewrites mtime when pulling, and any
+    // file-system tool
+    // that touches the bytes (backup restore, IDE, tar, manual edit) would
+    // falsify the sort.
+    //
+    // CAREFUL: `nowIso()` returns local-time ISO without `Z` suffix
+    // ("2026-05-07T15:00:00") while ISO with `Z` is UTC. Compare on
+    // numeric ms and emit a UTC ISO so the downstream sort can
+    // string-compare safely across both shapes.
+    const lastActiveAt = lastActiveMs ? new Date(lastActiveMs).toISOString() : (c.updated_at || c.created_at || '');
+    return {
+      ...c,
+      processing,
+      processing_since: since,
+      last_active_at: lastActiveAt,
+      agent_ids: _normaliseAgentIds(agentIds),
+      commander_in_chat: commanderInChat,
+    };
+  }));
+  if (summariesToBackfill.length && shouldPersistBackfill()) {
+    await _withConversationWrite(userId, async () => {
+      // Recheck after waiting for the user's write queue. A normal mutation
+      // invalidates this list generation before it queues its own write, so
+      // an older startup snapshot can never commit after a newer mutation.
+      if (!shouldPersistBackfill()) return;
+      const deviceId = _recordDeviceId(userId);
+      for (const c of summariesToBackfill) bumpRecordSyncVersion(c, deviceId);
+      const cleaned = pruneExpiredDeletedRecords(items.map(_cleanConversation)) as Conversation[];
+      await _writeConversationIndexes(userId, cleaned);
+
+      log.info(`backfilled participant summaries user=${userId} conversations=${summariesToBackfill.length}`);
+    });
+  }
+  out.sort((a, b) => {
+    const ap = a.pinned_at || '';
+    const bp = b.pinned_at || '';
+    if (ap && !bp) return -1;
+    if (!ap && bp) return 1;
+    if (ap && bp) {
+      const pinCmp = bp.localeCompare(ap);
+      if (pinCmp) return pinCmp;
+    }
+    return (b.last_active_at || '').localeCompare(a.last_active_at || '');
+  });
+  return out;
+}
+
+export async function listConversations(userId: string): Promise<Conversation[]> {
+  const cached = _conversationListCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return _cloneConversationList(cached.items);
+  const existing = _conversationListInFlight.get(userId);
+  if (existing) return _cloneConversationList(await existing);
+
+  const generation = _conversationListGeneration.get(userId) || 0;
+  const run = _listConversationsUncached(
+    userId,
+    () => (_conversationListGeneration.get(userId) || 0) === generation,
+  );
+  _conversationListInFlight.set(userId, run);
+  try {
+    const items = await run;
+    if ((_conversationListGeneration.get(userId) || 0) === generation) {
+      _conversationListCache.set(userId, {
+        expiresAt: Date.now() + CONVERSATION_LIST_CACHE_TTL_MS,
+        items: _cloneConversationList(items),
+      });
+    }
+    return _cloneConversationList(items);
+  } finally {
+    if (_conversationListInFlight.get(userId) === run) _conversationListInFlight.delete(userId);
+  }
+}
+
+export interface StartupConversationList {
+  conversations: Conversation[];
+  unprojected_pagination: ConversationPageInfo;
+  loaded_project_ids: string[];
+  project_pagination: Record<string, ConversationPageInfo>;
+}
+
+export interface ConversationPageInfo {
+  total: number;
+  next_offset: number | null;
+}
+
+export interface ConversationPage extends ConversationPageInfo {
+  conversations: Conversation[];
+}
+
+export const CONVERSATION_LIST_PAGE_SIZE = 10;
+// Retain compatibility with older renderers' two-calendar-day windows (up to
+// 49h across a DST fallback). Current renderers request a rolling 24h window.
+const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 50 * 60 * 60 * 1000;
+
+function _conversationActivityMs(c: Conversation): number {
+  return Math.max(tsMs(c.updated_at), tsMs(c.created_at));
+}
+
+function _compareConversationIndexRows(a: Conversation, b: Conversation): number {
+  const ap = a.pinned_at || '';
+  const bp = b.pinned_at || '';
+  if (ap && !bp) return -1;
+  if (!ap && bp) return 1;
+  if (ap && bp) {
+    const pinCmp = bp.localeCompare(ap);
+    if (pinCmp) return pinCmp;
+  }
+  const activityCmp = _conversationActivityMs(b) - _conversationActivityMs(a);
+  if (activityCmp) return activityCmp;
+  return String(a.conversation_id || '').localeCompare(String(b.conversation_id || ''));
+}
+
+function _pageOffset(value: unknown): number {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+}
+
+async function _enrichConversationPage(
+  userId: string,
+  rows: Conversation[],
+  offset: number,
+): Promise<ConversationPage> {
+  const start = _pageOffset(offset);
+  const sorted = rows
+    .filter((c) => !isDeletedConversation(c) && c.kind !== 'app_task')
+    .sort(_compareConversationIndexRows);
+  const pageRows = sorted.slice(start, start + CONVERSATION_LIST_PAGE_SIZE);
+  const conversations = await _listConversationsUncached(
+    userId,
+    () => false,
+    undefined,
+    () => Promise.resolve(pageRows),
+  );
+  const next = start + pageRows.length;
+  return {
+    conversations,
+    total: sorted.length,
+    next_offset: next < sorted.length ? next : null,
+  };
+}
+
+/** Startup-only sidebar slice. Aggregate indexes are still the authority, but
+ * per-conversation state/member/history enrichment is limited to rows that can
+ * actually appear on first paint. Project and unprojected task lists each use
+ * one chronological 10-row page; time buckets are only a renderer grouping.
+ * Pinned rows and rows active at or after `activeSinceMs` (the recent-task cutoff)
+ * are always included, whatever their project, so the sidebar's recent-task aggregate can
+ * show tasks under collapsed projects; page totals and cursors are unchanged. */
+export async function listStartupConversations(
+  userId: string,
+  options: { activeConversationId?: string; expandedProjectIds?: string[]; activeSinceMs?: number } = {},
+): Promise<StartupConversationList> {
+  const requestedProjects = new Set(
+    (options.expandedProjectIds || []).filter((id) => typeof id === 'string' && safeId(id)),
+  );
+  const activeCid = safeId(options.activeConversationId || '') ? options.activeConversationId! : '';
+  const nowMs = Date.now();
+  const activeSinceMs = typeof options.activeSinceMs === 'number'
+    && Number.isFinite(options.activeSinceMs)
+    && options.activeSinceMs <= nowMs
+    && options.activeSinceMs >= nowMs - STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS
+    ? options.activeSinceMs
+    : null;
+  let loadedProjects: string[] = [];
+  let unprojectedPagination: ConversationPageInfo = { total: 0, next_offset: null };
+  const projectPagination: Record<string, ConversationPageInfo> = {};
+  const conversations = await _listConversationsUncached(userId, () => false, (all) => {
+    const visibleProjects = new Set(requestedProjects);
+    const active = activeCid ? all.find((c) => c.conversation_id === activeCid) : undefined;
+    if (active?.project_id && safeId(active.project_id)) visibleProjects.add(active.project_id);
+    loadedProjects = Array.from(visibleProjects);
+    const selectedProjectCids = new Set<string>();
+    const unprojectedRows = all
+      .filter((c) => !c.project_id)
+      .sort(_compareConversationIndexRows);
+    const selectedUnprojectedCids = new Set(
+      unprojectedRows
+        .slice(0, CONVERSATION_LIST_PAGE_SIZE)
+        .map((c) => c.conversation_id),
+    );
+    unprojectedPagination = {
+      total: unprojectedRows.length,
+      next_offset: unprojectedRows.length > CONVERSATION_LIST_PAGE_SIZE
+        ? CONVERSATION_LIST_PAGE_SIZE
+        : null,
+    };
+    for (const projectId of visibleProjects) {
+      const rows = all
+        .filter((c) => c.project_id === projectId)
+        .sort(_compareConversationIndexRows);
+      for (const row of rows.slice(0, CONVERSATION_LIST_PAGE_SIZE)) {
+        selectedProjectCids.add(row.conversation_id);
+      }
+      projectPagination[projectId] = {
+        total: rows.length,
+        next_offset: rows.length > CONVERSATION_LIST_PAGE_SIZE
+          ? CONVERSATION_LIST_PAGE_SIZE
+          : null,
+      };
+    }
+    if (active?.project_id) selectedProjectCids.add(active.conversation_id);
+    else if (active) selectedUnprojectedCids.add(active.conversation_id);
+    return all.filter((c) => {
+      if (c.pinned_at) return true;
+      if (activeSinceMs !== null && _conversationActivityMs(c) >= activeSinceMs) return true;
+      if (c.project_id) return selectedProjectCids.has(c.conversation_id);
+      return selectedUnprojectedCids.has(c.conversation_id);
+    });
+  });
+  return {
+    conversations,
+    unprojected_pagination: unprojectedPagination,
+    loaded_project_ids: loadedProjects,
+    project_pagination: projectPagination,
+  };
+}
+
+/** Read and enrich one 10-row page from exactly one project's compact index. */
+export async function listProjectConversationPage(
+  userId: string,
+  projectId: string,
+  offset = 0,
+): Promise<ConversationPage> {
+  if (!safeId(projectId)) return { conversations: [], total: 0, next_offset: null };
+  return _enrichConversationPage(
+    userId,
+    await _readScopedRawConversations(userId, projectId),
+    offset,
+  );
+}
+
+/** Read one chronological 10-row page from the project-less task list.
+ * Relative-time buckets are deliberately not part of this contract: the
+ * renderer groups whichever rows have been loaded using the current time. */
+export async function listUnprojectedConversationPage(
+  userId: string,
+  offset = 0,
+): Promise<ConversationPage> {
+  const rows = (await _readScopedRawConversations(userId))
+    .filter((c) => !c.project_id);
+  return _enrichConversationPage(userId, rows, offset);
+}
+
+/** Read one 10-row execution-history page for an automation task.
+ *
+ * Automation runs may live in the global conversation root or in any
+ * project root, so this intentionally reads the compact aggregate indexes
+ * once and filters before enrichment. It must not reuse the renderer's
+ * startup slice: that cache only contains the first visible project page and
+ * would make both the total and the pagination cursor incorrect. */
+export async function listAutoTaskConversationPage(
+  userId: string,
+  taskId: string,
+  offset = 0,
+  /** The task's run conversation, listed even when the task did not create it. */
+  runConversationId = '',
+): Promise<ConversationPage> {
+  if (!safeId(taskId)) return { conversations: [], total: 0, next_offset: null };
+  const rows = (await _readRawConversations(userId, { discoverUnindexedMetas: false }))
+    .filter((c) => c.origin_auto_task_id === taskId
+      || (!!runConversationId && c.conversation_id === runConversationId && !isDeletedConversation(c)));
+  return _enrichConversationPage(userId, rows, offset);
+}
+
+/** Count execution conversations for many automation tasks with one index
+ * scan. The task list uses this before rendering so its labels show the real
+ * total instead of the number currently present in the bounded sidebar
+ * cache. A task's run conversation counts once, whoever created it. */
+export async function countAutoTaskConversations(
+  userId: string,
+  taskIds: string[],
+  runConversationIds: Record<string, string> = {},
+): Promise<Record<string, number>> {
+  const ids = Array.from(new Set(
+    (Array.isArray(taskIds) ? taskIds : [])
+      .filter((id) => typeof id === 'string' && safeId(id))
+      .slice(0, 500),
+  ));
+  const counts: Record<string, number> = Object.fromEntries(ids.map((id) => [id, 0]));
+  if (!ids.length) return counts;
+  const wanted = new Set(ids);
+  const tasksByRunConversation = new Map<string, string[]>();
+  for (const id of ids) {
+    const cid = runConversationIds[id];
+    if (typeof cid === 'string' && safeId(cid)) {
+      const tasks = tasksByRunConversation.get(cid) || [];
+      tasks.push(id);
+      tasksByRunConversation.set(cid, tasks);
+    }
+  }
+  const rows = await _readRawConversations(userId, { discoverUnindexedMetas: false });
+  for (const row of rows) {
+    if (isDeletedConversation(row)) continue;
+    const taskId = row.origin_auto_task_id || '';
+    if (wanted.has(taskId)) counts[taskId] += 1;
+    for (const runTaskId of tasksByRunConversation.get(row.conversation_id) || []) {
+      if (runTaskId !== taskId) counts[runTaskId] += 1;
+    }
+  }
+  return counts;
+}
+
+/** Load one expanded project's rows without touching other collapsed projects. */
+export async function listProjectConversations(userId: string, projectId: string): Promise<Conversation[]> {
+  if (!safeId(projectId)) return [];
+  return _listConversationsUncached(
+    userId,
+    () => false,
+    undefined,
+    () => _readScopedRawConversations(userId, projectId),
+  );
+}
+
+function _conversationRootKey(projectId?: string | null): string {
+  return typeof projectId === 'string' && safeId(projectId) ? projectId : '';
+}
+
+function _conversationMetaFileForRoot(userId: string, cid: string, rootKey: string): string {
+  const dir = rootKey ? projectChatsDir(userId, rootKey) : userChatsDir(userId);
+  return path.join(dir, cid, conversationMetaName());
+}
+
+interface ConversationIndexTarget {
+  rootKey: string;
+  rows: Conversation[];
+  index: number;
+  conversation: Conversation;
+}
+
+/** Internal source-of-truth adapter for normal one-conversation mutations.
+ * It owns physical-root reads, target legacy-meta merge, root selection and
+ * atomic root commits. Full collection persistence below remains reserved for
+ * repair/migration. Instances live only inside the per-user write queue. */
+class ConversationIndexStore {
+  private readonly roots = new Map<string, Conversation[]>();
+
+  constructor(private readonly userId: string) {}
+
+  async readRoot(rootKey: string): Promise<Conversation[]> {
+    const key = _conversationRootKey(rootKey);
+    const cached = this.roots.get(key);
+    if (cached) return cached;
+    const raw = await _readConversationIndexRoot(this.userId, key || null);
+    const rows = _mergeNormalizedConversationRows(raw).items;
+    this.roots.set(key, rows);
+    return rows;
+  }
+
+  private async targetInRoot(rootKey: string, cid: string): Promise<ConversationIndexTarget | null> {
+    assertConversationRelocationReady(this.userId, cid);
+    const rows = await this.readRoot(rootKey);
+    const index = rows.findIndex((row) => row.conversation_id === cid);
+    if (index < 0) return null;
+    let conversation = rows[index];
+    // Current sync-stamped rows are complete. Only a legacy target needs its
+    // recovery copy; unrelated legacy rows in the same root stay unopened.
+    if (recordSyncRev(conversation) <= 0) {
+      try {
+        const raw = JSON.parse(await fsp.readFile(
+          _conversationMetaFileForRoot(this.userId, cid, rootKey), 'utf8'));
+        const meta = _normaliseConversation(raw, cid);
+        if (meta) {
+          if (rootKey && !meta.project_id) meta.project_id = rootKey;
+          conversation = _mergeConversationRecord(conversation, meta);
+          rows[index] = conversation;
+        }
+      } catch { /* index row remains authoritative enough for mutation */ }
+    }
+    return { rootKey, rows, index, conversation };
+  }
+
+  async findTarget(
+    cid: string,
+    projectIdHint?: string | null,
+    fallbackAcrossRoots = true,
+  ): Promise<ConversationIndexTarget | null> {
+    if (appConversationRoot(this.userId, cid)) {
+      const rows = await _readTargetRawConversation(this.userId, cid);
+      return rows[0] ? { rootKey: '', rows, index: 0, conversation: rows[0] } : null;
+    }
+    if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
+      const hinted = await this.targetInRoot(_conversationRootKey(projectIdHint), cid);
+      if (hinted) return hinted;
+      if (projectIdHint) {
+        const legacy = await this.targetInRoot('', cid);
+        if (legacy?.conversation.project_id === projectIdHint) return legacy;
+      }
+      if (!fallbackAcrossRoots) return null;
+    }
+
+    // Hintless and stale-hint calls retain correctness by locating the record
+    // across compact indexes. Normal UI and message-write paths provide a
+    // validated hint, so they never enter this fallback.
+    const rootKeys = ['', ...listProjectIds(this.userId)];
+    await _runBounded(rootKeys, 8, async (rootKey) => { await this.readRoot(rootKey); });
+    const candidates: Conversation[] = [];
+    for (const rows of this.roots.values()) {
+      const row = rows.find((item) => item.conversation_id === cid);
+      if (row) candidates.push(row);
+    }
+    const winner = _mergeNormalizedConversationRows(candidates).items[0];
+    if (!winner) return null;
+    const winnerRoot = _conversationRootKey(winner.project_id);
+    const canonical = await this.targetInRoot(winnerRoot, cid);
+    if (canonical) return canonical;
+    // Pre-v4 project rows can still be physically in the global index. Their
+    // declared membership, not an assumed index location, owns the mutation.
+    const legacy = winnerRoot ? await this.targetInRoot('', cid) : null;
+    return legacy?.conversation.project_id === winner.project_id ? legacy : null;
+  }
+
+  async persistTarget(target: ConversationIndexTarget, next: Conversation): Promise<void> {
+    if (appConversationRoot(this.userId, next.conversation_id)) {
+      delete next.project_id;
+      next.kind = 'app_task';
+      await writeJson(conversationLayout(this.userId, next.conversation_id).metaFile, next);
+      return;
+    }
+    const oldRoot = target.rootKey;
+    // Project deletion retains its child tombstones in the existing global
+    // catalog. Acknowledging them must not recreate a removed project tree.
+    const newRoot = isDeletedConversation(next) && !oldRoot
+      && next.project_id && !fs.existsSync(projectMetaFile(this.userId, next.project_id))
+      ? '' : _conversationRootKey(next.project_id);
+    const changedRoots = new Set<string>([oldRoot, newRoot]);
+    const oldRows = await this.readRoot(oldRoot);
+    // A project move spans two atomic files. Keep their rows until both writes
+    // and the recovery meta commit succeed; restoring bytes alone loses ownership.
+    const rollbackRoots = oldRoot !== newRoot
+      ? new Map([[oldRoot, [...oldRows]], [newRoot, [...await this.readRoot(newRoot)]]])
+      : null;
+    const oldIndex = oldRows.findIndex((row) => row.conversation_id === next.conversation_id);
+    if (oldRoot === newRoot) {
+      if (oldIndex >= 0) oldRows[oldIndex] = next;
+      else oldRows.unshift(next);
+      if (newRoot && isDeletedConversation(next)) {
+        const legacy = await this.readRoot('');
+        const at = legacy.findIndex(row => row.conversation_id === next.conversation_id && row.project_id === next.project_id);
+        if (at >= 0) { legacy.splice(at, 1); changedRoots.add(''); }
+      }
+    } else {
+      for (let i = oldRows.length - 1; i >= 0; i -= 1) {
+        if (oldRows[i].conversation_id === next.conversation_id) oldRows.splice(i, 1);
+      }
+      const newRows = await this.readRoot(newRoot);
+      for (let i = newRows.length - 1; i >= 0; i -= 1) {
+        if (newRows[i].conversation_id === next.conversation_id) newRows.splice(i, 1);
+      }
+      newRows.unshift(next);
+    }
+    try {
+      await this.commitRoots(changedRoots);
+      if (isDeletedConversation(next)) {
+        try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot)); }
+        catch { /* missing is fine */ }
+      } else {
+        await _writeJsonIfChanged(
+          _conversationMetaFileForRoot(this.userId, next.conversation_id, newRoot),
+          _cleanConversationMeta(next),
+        );
+      }
+      if (oldRoot !== newRoot) {
+        try { await fsp.unlink(_conversationMetaFileForRoot(this.userId, next.conversation_id, oldRoot)); }
+        catch { /* missing is fine */ }
+      }
+    } catch (error) {
+      if (rollbackRoots) {
+        for (const [key, rows] of rollbackRoots) this.roots.set(key, rows);
+        await this.commitRoots(changedRoots);
+      }
+      throw error;
+    }
+  }
+
+  async insert(rootKey: string, conversation: Conversation): Promise<void> {
+    const key = _conversationRootKey(rootKey);
+    const rows = await this.readRoot(key);
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      if (rows[i].conversation_id === conversation.conversation_id) rows.splice(i, 1);
+    }
+    rows.unshift(conversation);
+    await this.commitRoots(new Set([key]));
+    await _writeJsonIfChanged(
+      _conversationMetaFileForRoot(this.userId, conversation.conversation_id, key),
+      _cleanConversationMeta(conversation),
+    );
+  }
+
+  async retainProjectDeletes(projectId: string): Promise<void> {
+    const rows = await this.readRoot(projectId);
+    const global = await this.readRoot('');
+    for (const row of rows) {
+      if (!isDeletedConversation(row)) throw new Error('project deletion incomplete');
+      const at = global.findIndex(item => item.conversation_id === row.conversation_id);
+      if (at >= 0 && global[at].project_id !== projectId) throw new Error('conversation ownership conflict');
+      if (at >= 0) global[at] = row;
+      else global.push(row);
+    }
+    if (rows.length) await this.commitRoots(new Set(['']));
+  }
+
+  private async commitRoots(rootKeys: ReadonlySet<string>): Promise<void> {
+    const results = await Promise.allSettled(Array.from(rootKeys, async (rootKey) => {
+      const rows = await this.readRoot(rootKey);
+      const cleaned = pruneExpiredDeletedRecords(rows.map(_cleanConversation)) as Conversation[];
+      await writeJson(conversationIndexFile(this.userId, rootKey || null), cleaned);
+    }));
+    // A rejected sibling must not keep writing after rollback has begun.
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
+  }
+}
+
+async function _withConversationIndexStore<T>(
+  userId: string,
+  fn: (store: ConversationIndexStore) => Promise<T>,
+): Promise<T> {
+  _invalidateConversationListCache(userId);
+  try {
+    return await _withConversationWrite(userId, () => fn(new ConversationIndexStore(userId)));
+  } finally {
+    // Readers may race the multi-file commit; never retain a partial view.
+    _invalidateConversationListCache(userId);
+  }
+}
+
+async function _writeConversationIndexes(
+  userId: string,
+  cleaned: Conversation[],
+  affectedRoots?: ReadonlySet<string>,
+): Promise<Set<string>> {
+  _invalidateConversationIndexCache(userId);
+  const globalRows: Conversation[] = [];
+  const projectRows = new Map<string, Conversation[]>();
+  for (const c of cleaned) {
+    const pid = _conversationRootKey(c.project_id);
+    if (affectedRoots && !affectedRoots.has(pid)) continue;
+    if (pid) {
+      if (!projectRows.has(pid)) projectRows.set(pid, []);
+      projectRows.get(pid)!.push(c);
+    } else {
+      globalRows.push(c);
+    }
+  }
+  const roots = affectedRoots
+    ? new Set(Array.from(affectedRoots, (root) => _conversationRootKey(root)))
+    : new Set(['', ...listProjectIds(userId), ...projectRows.keys()]);
+  try {
+    await Promise.all(Array.from(roots, async (root) => {
+      await writeJson(
+        conversationIndexFile(userId, root || undefined),
+        root ? (projectRows.get(root) || []) : globalRows,
+      );
+    }));
+  } finally {
+    // A reader could have started while multiple roots were being committed;
+    // never retain that partial snapshot.
+    _invalidateConversationIndexCache(userId);
+  }
+  return roots;
+}
+
+async function _saveConversationsUnlocked(userId: string, items: Conversation[]): Promise<void> {
+  const rawCleaned = items.map(_cleanConversation);
+  const cleaned = pruneExpiredDeletedRecords(rawCleaned) as Conversation[];
+  await _writeConversationIndexes(userId, cleaned);
+  await _saveConversationMetas(userId, rawCleaned);
+
+}
+
+async function _saveConversations(
+  userId: string,
+  items: Conversation[],
+): Promise<void> {
+  _invalidateConversationListCache(userId);
+  try {
+    await _withConversationWrite(userId, async () => {
+      await _saveConversationsUnlocked(userId, items);
+    });
+  } finally {
+    // A list can start while the index/meta writes above are in flight. Bump
+    // the generation again after commit so that partial snapshot cannot land
+    // in the short-lived cache after this save returns.
+    _invalidateConversationListCache(userId);
+  }
+}
+
+/** Full-snapshot persistence for repair/migration callers. Routine CRUD uses
+ * `ConversationIndexStore` so it never enters this all-root path. */
+export async function saveConversations(userId: string, items: Conversation[]): Promise<void> {
+  await _saveConversations(userId, items);
+}
+
+export interface ConversationParticipantActivity {
+  senderKind: ActorKind;
+  senderId: string;
+  agentIds?: string[];
+}
+
+/** Stamp `updated_at` on the cid's index row to the timestamp of the message
+ *  just written. Called by `group_chat/bus.ts::appendMain` after every
+ *  `<cid>.jsonl` append. listConversations sorts by `updated_at` (rather than
+ *  file mtime) so cross-device sync is well-behaved — manifest-merge of the
+ *  index array is a union-by-id with `updated_at` tiebreak, so both devices
+ *  converge on the actual last-activity time. No-op when the row doesn't
+ *  exist (the conv may have been deleted between message-write and bump). */
+export async function bumpConversationActivity(
+  userId: string,
+  cid: string,
+  tsIso: string,
+  participantActivity?: ConversationParticipantActivity,
+  projectIdHint?: string | null,
+): Promise<void> {
+  if (!cid || !tsIso) return;
+  await _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, projectIdHint);
+    if (!target || isDeletedConversation(target.conversation)) return;
+    const c = { ...target.conversation };
+    let changed = false;
+    const summaryWasFresh = _hasFreshParticipantSummary(c);
+    if (c.updated_at !== tsIso) {
+      c.updated_at = tsIso;
+      changed = true;
+    }
+    if (summaryWasFresh && participantActivity) {
+      const nextAgentIds = _normaliseAgentIds([
+        ...(c.agent_ids || []),
+        ...(c.agent_id ? [c.agent_id] : []),
+        ...(participantActivity.agentIds || []),
+        ...(participantActivity.senderKind === 'agent' ? [participantActivity.senderId] : []),
+      ]);
+      const commanderInChat = c.commander_in_chat === true
+        || participantActivity.senderKind === 'commander';
+      if (JSON.stringify(nextAgentIds) !== JSON.stringify(c.agent_ids || [])) {
+        c.agent_ids = nextAgentIds;
+        changed = true;
+      }
+      if (commanderInChat !== c.commander_in_chat) {
+        c.commander_in_chat = commanderInChat;
+        changed = true;
+      }
+      if (c.participant_summary_updated_at !== tsIso) {
+        c.participant_summary_updated_at = tsIso;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    _stampConversationSync(userId, c);
+    await store.persistTarget(target, c);
+  });
+}
+
+export async function getConversation(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  if (appConversationRoot(userId, cid)) return getConversationMetadata(userId, cid);
+  // Preserve the short-lived enriched-list fast path when the sidebar just
+  // loaded, but never construct that full list merely to resolve one cid.
+  const cached = _conversationListCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    const found = cached.items.find((c) => c.conversation_id === cid);
+    const hintMatches = projectIdHint === undefined
+      || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
+    if (found && hintMatches) return _cloneConversationList([found])[0];
+  }
+  const metadata = await getConversationMetadata(userId, cid, projectIdHint);
+  if (!metadata) return null;
+  const target = await _listConversationsUncached(
+    userId,
+    () => false,
+    undefined,
+    () => Promise.resolve([metadata]),
+    true,
+  );
+  return target.find((c) => c.conversation_id === cid) || null;
+}
+
+/** Targeted conversation metadata without performing sidebar runtime/
+ * participant enrichment. Detail IPC handlers combine this record with their
+ * own runtime snapshot, so enriching it first only repeats state/member reads. */
+export async function getConversationMetadata(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  const cached = _conversationListCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    const found = cached.items.find((c) => c.conversation_id === cid);
+    const hintMatches = projectIdHint === undefined
+      || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
+    if (found && hintMatches) return _cloneConversationList([found])[0];
+  }
+  const target = await _readTargetRawConversation(userId, cid, projectIdHint);
+  const found = target.find((c) => (
+    c.conversation_id === cid && !isDeletedConversation(c)
+  ));
+  return found ? _cloneConversationList([found])[0] : null;
+}
+
+export interface CreateConversationOptions {
+  /** Validated by the owning task entry boundary; persisted without private values. */
+  assistance?: ConversationAssistance;
+  kind?: ConversationKind;
+  agentId?: string;
+  skillId?: string;
+  title?: string;
+  /** Optional project membership. Caller (IPC layer) is responsible for
+   *  validating the projectId exists for this user — chats.ts persists it
+   *  verbatim. */
+  projectId?: string;
+  /** Optional explicit conversation id. Used when an external source already
+   *  minted the id. Must be a `safeId`; if it collides with an existing conv,
+   *  that conv is returned unchanged. Defaults to a fresh generated id. */
+  conversationId?: string;
+  /** Set by `features/auto_tasks.ts::_fireTask` so the conversation carries
+   *  a back-link to the task that spawned it. Used by the renderer for the
+   *  clock-icon prefix and the auto-tab expand-panel grouping. */
+  originAutoTaskId?: string;
+}
+
+function normaliseConversationTitle(raw: unknown): string {
+  let title = typeof raw === 'string' ? raw.trim() : '';
+  title = limitNameDisplayText(title, CONVERSATION_TITLE_MAX_UNITS);
+  return title || t('chat.default_title');
+}
+
+/** Internal canonical conversation facade, deliberately absent from every
+ * ordinary index. Only the SDK task host admits this owner namespace. */
+export async function createAppConversation(userId: string, key: string, title: string, keepSession = false, reservedCid?: string): Promise<Conversation> {
+  const cid = reservedCid || `app_${key}_${keepSession ? 'retain' : 'once'}_${randomUUID().replace(/-/g, '')}`;
+  const owner = appConversationOwner(cid);
+  if (!safeId(userId) || !owner || owner.key !== key || owner.keepSession !== keepSession) throw new Error('invalid app execution owner');
+  const now = nowIso();
+  const conv: Conversation = { conversation_id: cid, title: normaliseConversationTitle(title), kind: 'app_task',
+    agent_id: '', skill_id: '', session_id: buildConversationSessionId(cid), created_at: now, updated_at: now };
+  const layout = conversationLayout(userId, cid);
+  await writeJson(layout.metaFile, conv);
+  await fsp.writeFile(layout.messageFile, '', { flag: 'wx' });
+  return conv;
+}
+
+export async function createConversation(userId: string, {
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '', originAutoTaskId = '', assistance: rawAssistance,
+}: CreateConversationOptions = {}): Promise<Conversation> {
+  const assistance = normalizeConversationAssistance(rawAssistance);
+  if (conversationId.startsWith('app_')) throw new Error('reserved conversation identity');
+  const explicitCid = conversationId && safeId(conversationId) ? conversationId : '';
+  const outcome = await _withConversationIndexStore(userId, async (store) => {
+    if (explicitCid) {
+      // Externally supplied ids must retain global collision semantics. This
+      // rare path may inspect all compact roots; generated ids below do not.
+      const existing = await store.findTarget(explicitCid);
+      if (existing && !isDeletedConversation(existing.conversation)) {
+        return { conversation: existing.conversation, action: 'existing' as const };
+      }
+      if (existing) {
+        const current = existing.conversation;
+        const previousProjectId = current.project_id;
+        const now = nowIso();
+        const revived: Conversation = _stampConversationSync(userId, {
+          ...current,
+          title: title ? normaliseConversationTitle(title) : (current.title || t('chat.default_title')),
+          kind,
+          agent_id: agentId || current.agent_id || '',
+          skill_id: skillId || current.skill_id || '',
+          session_id: current.session_id || buildConversationSessionId(explicitCid),
+          ...(projectId ? { project_id: projectId } : {}),
+          ...(originAutoTaskId ? { origin_auto_task_id: originAutoTaskId } : {}),
+          ...(assistance ? { assistance } : {}),
+          updated_at: now,
+        });
+        delete revived.deleted_at;
+        await store.persistTarget(existing, revived);
+        return {
+          conversation: revived,
+          action: 'revived' as const,
+          previousProjectId,
+        };
+      }
+    }
+
+    let cid = explicitCid || genConversationId();
+    const destinationHint = projectId ? projectId : null;
+    // Collision avoidance stays root-local for random ids. Cross-root random
+    // collisions are cryptographically negligible; explicit ids above keep
+    // the stronger all-root contract needed by future migrations.
+    while (!explicitCid && await store.findTarget(cid, destinationHint, false)) {
+      cid = genConversationId();
+    }
+    const now = nowIso();
+    const created: Conversation = _stampConversationSync(userId, {
+      conversation_id: cid,
+      title: normaliseConversationTitle(title),
+      kind,
+      agent_id: agentId || '',
+      skill_id: skillId || '',
+      session_id: buildConversationSessionId(cid),
+      ...(projectId ? { project_id: projectId } : {}),
+      ...(originAutoTaskId ? { origin_auto_task_id: originAutoTaskId } : {}),
+      ...(assistance ? { assistance } : {}),
+      created_at: now,
+      updated_at: now,
+      agent_ids: _normaliseAgentIds(agentId ? [agentId] : []),
+      commander_in_chat: false,
+      participant_summary_updated_at: now,
+    });
+    await store.insert(_conversationRootKey(created.project_id), created);
+    return { conversation: created, action: 'created' as const };
+  });
+
+  const conv = outcome.conversation;
+  if (outcome.action === 'existing') return conv;
+
+  // Touch jsonl so subsequent reads don't 404.
+  const msgFile = conversationMessageFile(userId, conv.conversation_id, conv.project_id ?? null);
+  await fsp.mkdir(path.dirname(msgFile), { recursive: true });
+  await fsp.writeFile(msgFile, '', { flag: 'a' });
+  if (outcome.action === 'revived') {
+    log.info(`revived user=${userId} cid=${conv.conversation_id} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || outcome.previousProjectId || '-'}`);
+  } else {
+    log.info(`created user=${userId} cid=${conv.conversation_id} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || '-'}`);
+  }
+  return conv;
+}
+
+export async function updateConversation(
+  userId: string,
+  cid: string,
+  updates: Partial<Conversation>,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, projectIdHint);
+    if (!target || isDeletedConversation(target.conversation)) return null;
+    const previous = target.conversation;
+    const updatedAt = nowIso();
+    const summaryWasFresh = _hasFreshParticipantSummary(previous);
+    const next = _stampConversationSync(userId, {
+      ...previous,
+      ...updates,
+      updated_at: updatedAt,
+      ...(summaryWasFresh ? { participant_summary_updated_at: updatedAt } : {}),
+    });
+    const assistance = normalizeConversationAssistance(next.assistance);
+    if (assistance) next.assistance = assistance;
+    else delete next.assistance;
+    delete next.deleted_at;
+    await store.persistTarget(target, next);
+    return next;
+  });
+}
+
+export async function renameConversation(
+  userId: string,
+  cid: string,
+  title: unknown,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  return updateConversation(userId, cid, {
+    title: normaliseConversationTitle(title),
+    title_manually_set: true,
+  }, projectIdHint);
+}
+
+export async function setConversationPinned(
+  userId: string,
+  cid: string,
+  pinned: boolean,
+  projectIdHint?: string | null,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, projectIdHint);
+    if (!target || isDeletedConversation(target.conversation)) return null;
+    const next = { ...target.conversation };
+    const pinStateUpdatedAt = nowIso();
+    let changed = false;
+    if (pinned && !next.pinned_at) {
+      next.pinned_at = pinStateUpdatedAt;
+      next.pin_state_updated_at = pinStateUpdatedAt;
+      changed = true;
+    } else if (!pinned && next.pinned_at) {
+      delete next.pinned_at;
+      next.pin_state_updated_at = pinStateUpdatedAt;
+      changed = true;
+    }
+    if (changed) {
+      _stampConversationSync(userId, next);
+      await store.persistTarget(target, next);
+    }
+    return next;
+  });
+}
+
+export type ConversationMoveResult =
+  | { ok: true; conversation: Conversation }
+  | { ok: false; error: 'not_found' | 'already_in_project' | 'not_in_project'
+    | 'has_running_conv' | 'move_failed' };
+
+/**
+ * Move an unprojected conversation into `projectId`.
+ *
+ * Membership is a storage location rather than a field, so this relocates the
+ * messages, group dir, commander and per-agent sessions, attachments and
+ * artifacts before it touches the index row. A durable journal restores the
+ * original ownership on activation unless the commit marker was published.
+ *
+ * The caller validates that the project exists: `projects.ts` imports this
+ * module, so the check cannot live here without a cycle.
+ */
+export async function moveConversationToProject(
+  userId: string,
+  cid: string,
+  projectId: string,
+): Promise<ConversationMoveResult> {
+  if (!safeId(cid) || !safeId(projectId)) return { ok: false, error: 'not_found' };
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, null);
+    if (!target || isDeletedConversation(target.conversation)) return { ok: false, error: 'not_found' };
+    if (target.conversation.project_id) return { ok: false, error: 'already_in_project' };
+
+    // A live turn holds its session files open and has already resolved a
+    // workspace root from the conversation's current project. Moving either
+    // out from under it corrupts the run, so refuse the way project deletion
+    // refuses rather than racing it.
+    try {
+      const state = await readState(userId, cid, null);
+      const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+      if (state.status === 'running' || state.in_flight.length > 0 || !bus.isQuiescent(userId, cid)) {
+        return { ok: false, error: 'has_running_conv' };
+      }
+    } catch { return { ok: false, error: 'move_failed' }; }
+
+    // Caches keyed by the old absolute message path have to be dropped with
+    // that path, before it stops existing.
+    const oldMessageFile = conversationMessageFile(userId, cid, null);
+
+    // Reuse the recovery guard during the live transaction too: index writes
+    // yield after rename, while concurrent senders still know the old root.
+    setConversationRelocationBlocked(userId, cid, true);
+    let moved: RelocatedPaths[];
+    try {
+      moved = relocateConversationIntoProject(userId, cid, projectId, { ..._cleanConversation(target.conversation) });
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        // The journal and both copies stay for activation-time recovery.
+        log.warn('conversation move recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation move relocate failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    const next = _stampConversationSync(userId, { ...target.conversation, project_id: projectId });
+    try {
+      await store.persistTarget(target, next);
+      commitConversationRelocation(userId, cid);
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        // Recovery retries on activation.
+        log.warn('conversation move recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation move commit failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    invalidateConversationProjectCache(userId, cid);
+    setConversationRelocationBlocked(userId, cid, false);
+    await purgeConversationHistoryCache(userId, oldMessageFile);
+    invalidateLineCount(oldMessageFile);
+    // A move rewrites both chat roots and can add the first conversation to a
+    // brand-new project, which is exactly the source-layout change the chat
+    // search index fingerprints. Without this the index stays technically
+    // complete but is no longer trusted, so search shows "still preparing"
+    // until something else happens to schedule a catch-up pass.
+    search.invalidateChatsIndex(userId);
+    log.info(`conversation moved user=${maskId(userId)} cid=${maskId(cid)} pid=${maskId(projectId)} paths=${moved.length}`);
+    return { ok: true, conversation: next };
+  });
+}
+
+/**
+ * Return a conversation to the unprojected root.
+ *
+ * Filing a conversation under a project can be automatic, so it has to be
+ * undoable; without this the only way back is deleting the project, which
+ * cascades the conversation with it. The guards mirror the filing direction:
+ * relocation moves the same bytes, so a live turn still refuses.
+ */
+export async function moveConversationOutOfProject(
+  userId: string,
+  cid: string,
+): Promise<ConversationMoveResult> {
+  if (!safeId(cid)) return { ok: false, error: 'not_found' };
+  return _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid);
+    if (!target || isDeletedConversation(target.conversation)) return { ok: false, error: 'not_found' };
+    const projectId = target.conversation.project_id;
+    if (!projectId) return { ok: false, error: 'not_in_project' };
+
+    try {
+      const state = await readState(userId, cid, projectId);
+      const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+      if (state.status === 'running' || state.in_flight.length > 0 || !bus.isQuiescent(userId, cid)) {
+        return { ok: false, error: 'has_running_conv' };
+      }
+    } catch { return { ok: false, error: 'move_failed' }; }
+
+    const oldMessageFile = conversationMessageFile(userId, cid, projectId);
+
+    setConversationRelocationBlocked(userId, cid, true);
+    let moved: RelocatedPaths[];
+    try {
+      moved = relocateConversationOutOfProject(userId, cid, projectId, { ..._cleanConversation(target.conversation) });
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        log.warn('conversation unfile recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation unfile relocate failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    const next = _stampConversationSync(userId, { ...target.conversation, project_id: '' });
+    try {
+      await store.persistTarget(target, next);
+      commitConversationRelocation(userId, cid);
+    } catch (err) {
+      try { recoverConversationRelocation(userId, cid); }
+      catch (recoveryErr) {
+        log.warn('conversation unfile recovery failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(recoveryErr) });
+      }
+      log.warn('conversation unfile commit failed', { user: maskId(userId), cid: maskId(cid), ...logErrorSummary(err) });
+      return { ok: false, error: 'move_failed' };
+    }
+
+    invalidateConversationProjectCache(userId, cid);
+    setConversationRelocationBlocked(userId, cid, false);
+    await purgeConversationHistoryCache(userId, oldMessageFile);
+    invalidateLineCount(oldMessageFile);
+    search.invalidateChatsIndex(userId);
+    log.info(`conversation unfiled user=${maskId(userId)} cid=${maskId(cid)} pid=${maskId(projectId)} paths=${moved.length}`);
+    return { ok: true, conversation: next };
+  });
+}
+
+/** Drop a session jsonl + its in-memory cache entry. Routes through
+ *  resolveSessionPath so kind (cloud vs local) is respected. */
+function purgeSession(userId: string, sessionId: string): void {
+  if (!sessionId) return;
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  deleteSessionFileForUser(userId, sessionId);
+}
+
+async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, physicalRoots: string[], removed?: Conversation): Promise<void> {
+  // A completed turn may still be materializing remote image/video output in
+  // the background. Abort it before removing the message file; attachment
+  // purge also holds the writer lock so a response already past abort cannot
+  // recreate the deleted conversation's media directory.
+  try {
+    const runner = require('./local_agents/runner') as typeof import('./local_agents/runner');
+    runner.cancelBackgroundMediaForConversation(userId, cid);
+  } catch (err) {
+    log.warn(`background media cancel failed user=${userId} cid=${cid}: ${(err as Error).message}`);
+  }
+
+  // Purge group companion dir (members/state/plan) + bus state.
+  // CJS require (same reason as listConversations above) — dynamic `import()`
+  // would load bus.ts as a second ESM module and dropConv would clear the
+  // wrong _cids.
+  try {
+    const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+    await bus.dropConv(userId, cid);
+    await purgeGroupDir(userId, cid);
+  }
+  catch (err) { log.warn(`group_chat dropConv failed user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
+  // Purge main jsonl.
+  const msgFile = conversationMessageFile(userId, cid, removed?.project_id ?? null);
+  await purgeConversationHistoryCache(userId, msgFile);
+  try { await fsp.unlink(msgFile); } catch { /* ignore missing */ }
+  invalidateLineCount(msgFile);
+  await search.dropChatConversation(userId, cid);
+  await purgeConversationTurnIndex(userId, cid);
+
+  // Purge commander session + every per-agent member session.
+  purgeSession(userId, removed?.session_id || buildConversationSessionId(cid));
+  // gmember sessions: glob the sessions dir for `<uid>-gmember-<cid>-*` —
+  // we can't rely on readMembers() because `groupChat.dropConv` above has
+  // already removed members.json (the historical cause of the 50+ orphan
+  // gmember files we found on the dev box: readMembers returns {actors:[]}
+  // → the for-loop never ran → every per-agent worker session leaked).
+  // Scanning the actual filesystem is the truth source.
+  const gmemberPrefix = `gmember-${cid}-`;
+  for (const sessionsDir of projectSessionRoots(userId, cid)) {
+    try {
+      const names = await fsp.readdir(sessionsDir);
+      const sessionIds = new Set<string>();
+      for (const name of names) {
+        if (!name.startsWith(gmemberPrefix)) continue;
+        if (taskForPath(ownership, cloudRelForAbs(userId, path.join(sessionsDir, name)))?.cid !== cid) continue;
+        // A model-state reset can leave only retained historical outputs.
+        const suffix = ['.jsonl', '.tool-results'].find((ext) => name.endsWith(ext));
+        if (suffix) sessionIds.add(name.slice(0, -suffix.length));
+      }
+      for (const sessionId of sessionIds) purgeSession(userId, sessionId);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn(`gmember sweep user=${userId} cid=${cid}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  // Purge attachments + their extract caches.
+  try {
+    const att = require('./chat_attachments');
+    if (typeof att?.purgeByCid === 'function') await att.purgeByCid(userId, cid);
+  } catch (err) { log.warn(`purge attachments user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
+  // Purge interactive web-app artifacts (chat_artifacts/<cid>/).
+  try {
+    const art = require('./chat_artifacts');
+    if (typeof art?.purgeByCid === 'function') await art.purgeByCid(userId, cid);
+  } catch (err) { log.warn(`purge artifacts user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
+  // Drop CLI session bindings — the next time this cid is reused (or
+  // a same-id collision, defensive), CLI agents start fresh. Their
+  // own machine-local session files (~/.claude/...) are left alone;
+  // claude self-GCs.
+  try {
+    const cliSessions = require('./local_agents/sessions');
+    if (typeof cliSessions?.clearForConversation === 'function') {
+      await cliSessions.clearForConversation(userId, cid);
+    }
+  } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
+  // Feature purgers clear caches/locks but older implementations were best
+  // effort and resolved only the current write location. Verify the physical
+  // inventory strictly before claiming durable deletion, including old copies.
+  try {
+    for (const rel of physicalRoots) await fsp.rm(resolveCloudRelPath(userCloudRoot(userId), rel), { recursive: true, force: true });
+  } catch (error) {
+    log.warn('conversation physical deletion incomplete', { ...logErrorSummary(error) });
+    throw new Error('delete_failed');
+  }
+  removeCodingDirectory(userId, cid);
+  log.info(`deleted user=${userId} cid=${cid}`);
+}
+
+export async function deleteConversation(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+  beforeDelete?: (current: Conversation) => Promise<boolean>,
+): Promise<boolean> {
+  let removed: Conversation | null = null;
+  let ownership: TaskOwnership = new Map();
+  let physicalRoots: string[] = [];
+  const found = await _withConversationIndexStore(userId, async (store) => {
+    const target = await store.findTarget(cid, projectIdHint);
+    if (!target) return false;
+    if (beforeDelete && !await beforeDelete(target.conversation)) return false;
+    removed = target.conversation;
+    // Reuse the already loaded root; bulk cleanup must not scan every project's
+    // index twice per task just to disambiguate member-session prefixes.
+    ownership = new Map((await store.readRoot(target.rootKey)).map(row => [
+      `${target.rootKey}/${row.conversation_id}`,
+      { cid: row.conversation_id, projectId: target.rootKey || null, deletedAt: row.deleted_at || '' },
+    ]));
+    const inventory = await conversationFileInventory(userId, cid, target.conversation.project_id || null, ownership);
+    physicalRoots = inventory.roots;
+    if (!isDeletedConversation(target.conversation)) {
+      const deletedAt = nowIso();
+      const tombstone = _stampConversationSync(userId, {
+        ...target.conversation,
+        deleted_at: deletedAt,
+        updated_at: deletedAt,
+      });
+      // Capture can yield; revalidate the cleanup receipt before committing it.
+      if (beforeDelete && !await beforeDelete(target.conversation)) return false;
+      await store.persistTarget(target, tombstone);
+    } else {
+      try {
+        await fsp.unlink(_conversationMetaFileForRoot(userId, cid, target.rootKey));
+      } catch { /* missing is fine */ }
+    }
+    return true;
+  });
+  if (!found || !removed) return false;
+  await _purgeDeletedConversationFiles(userId, cid, ownership, physicalRoots, removed);
+  await (await import('./saved_apps')).cleanupEditSnapshots(userId, false, cid);
+  return true;
+}
+
+/** Read raw group messages from `<cid>.jsonl`. UI uses this for initial
+ *  history load; subsequent updates flow through group_chat.streamEvents. */
+export async function getMessages(userId: string, cid: string, limit = 200): Promise<MessageRecord[]> {
+  return (await getMessagesPage(userId, cid, limit)).history;
+}
+
+/** Produced-file paths from the newest `limit` visible messages, resolved the
+ *  way `getMessages` presents them but read raw. The file panel and
+ *  file-action authorization consume only these strings; `getMessages` would
+ *  first run the renderer projection, which spills every large process output
+ *  to a lazy cache file, hashes it, and rewrites each text for display. */
+export async function listProducedPaths(userId: string, cid: string, limit = 200): Promise<string[]> {
+  const sourceFile = conversationMessageReadFile(userId, cid);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let records: MessageRecord[] = [];
+  let cursor: number | null | undefined;
+  while (records.length < wanted) {
+    const page = await readJsonlPage<MessageRecord>(sourceFile, wanted - records.length, cursor);
+    records = page.records.filter((message) => !message.deleted_at).concat(records);
+    if (page.nextCursor === null) break;
+    cursor = page.nextCursor;
+  }
+  if (!records.length) return [];
+  const context = await _messageDisplayContext(userId, cid);
+  const out: string[] = [];
+  for (const message of records) out.push(..._producedPathsForDisplay(message, context).display);
+  return out;
+}
+
+/** Resolve process disclosure through the same account/project layout as history. */
+export async function getConversationProcessPage(
+  userId: string, cid: string, ref: string, cursor: number, messageId: string, projectIdHint?: string | null,
+) {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  return readConversationProcessPage(userId, sourceFile, ref, cursor, messageId);
+}
+
+/** Bounded, cursor-paged message reads for the conversation detail view.
+ *  The cursor is an opaque JSONL byte offset returned by the previous page. */
+export async function getMessagesPage(
+  userId: string,
+  cid: string,
+  limit = 10,
+  before?: number | null,
+  projectIdHint?: string | null,
+): Promise<{ history: MessageRecord[]; nextCursor: number | null }> {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let cursor = before;
+  let nextCursor: number | null = before ?? null;
+  let history: MessageRecord[] = [];
+  while (history.length < wanted) {
+    const page = await readConversationHistoryPage(
+      userId,
+      sourceFile,
+      wanted - history.length,
+      cursor,
+    );
+    const visible = page.records.filter((message) => !message.deleted_at);
+    history = visible.concat(history);
+    nextCursor = page.nextCursor;
+    if (page.nextCursor === null) break;
+    cursor = page.nextCursor;
+  }
+  const displayContext = await _messageDisplayContext(userId, cid, projectIdHint);
+  return { history: history.map((message) => _messageForDisplay(message, displayContext)), nextCursor };
+}
+
+/** Load only the page containing a search hit, with cursors in both directions. */
+export async function getMessagesPageAtIndex(
+  userId: string,
+  cid: string,
+  messageIndex: number,
+  limit = 10,
+  projectIdHint?: string | null,
+  opts?: {
+    /** Renderer projection (process-output spill to lazy files + display
+     *  citation sanitizing). Model-facing readers that consume only text/ids
+     *  pass `false`: the spill writes cache files and hashes every large
+     *  output for a view nothing reads. */
+    project?: boolean;
+  },
+): Promise<{
+  history: MessageRecord[];
+  historyIndexes: number[];
+  nextCursor: number | null;
+  followingCursor: number | null;
+  pageStart: number;
+}> {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const index = Math.max(0, Math.floor(Number(messageIndex) || 0));
+  const pageStart = Math.floor(index / wanted) * wanted;
+  const project = opts?.project !== false;
+  const page = project
+    ? await readConversationHistoryWindow(userId, sourceFile, pageStart, wanted)
+    : await readJsonlWindow<MessageRecord>(sourceFile, pageStart, wanted);
+  return _indexedHistoryPage(userId, cid, projectIdHint, page, pageStart, project);
+}
+
+/** Load the page holding a quoted message known only by its stable id, or
+ * null when it no longer exists. One worker pass finds and reads the page;
+ * the source index is the same one getMessagesPageAtIndex pages by. */
+export async function getMessagesPageAtMessageId(
+  userId: string,
+  cid: string,
+  messageId: string,
+  limit = 10,
+  projectIdHint?: string | null,
+): Promise<(Awaited<ReturnType<typeof getMessagesPageAtIndex>> & { messageIndex: number }) | null> {
+  if (!messageId) return null;
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const page = await readConversationHistoryWindowAtMessage(userId, sourceFile, messageId, wanted);
+  if (!page) return null;
+  return {
+    ...await _indexedHistoryPage(userId, cid, projectIdHint, page, page.start, true),
+    messageIndex: page.index,
+  };
+}
+
+async function _indexedHistoryPage(
+  userId: string,
+  cid: string,
+  projectIdHint: string | null | undefined,
+  page: { records: MessageRecord[]; previousCursor: number | null; followingCursor: number | null },
+  pageStart: number,
+  project: boolean,
+): Promise<{
+  history: MessageRecord[];
+  historyIndexes: number[];
+  nextCursor: number | null;
+  followingCursor: number | null;
+  pageStart: number;
+}> {
+  const visible = page.records
+    .map((message, offset) => ({ message, index: pageStart + offset }))
+    .filter(({ message }) => !message.deleted_at);
+  const displayContext = project ? await _messageDisplayContext(userId, cid, projectIdHint) : null;
+  return {
+    history: visible.map(({ message }) => (
+      displayContext ? _messageForDisplay(message, displayContext) : message
+    )),
+    // Keep the source JSONL indexes aligned with `history`. The renderer uses
+    // this as the final navigation identity for old records that predate
+    // stable message ids/timestamps; filtering a tombstone must not shift the
+    // remaining page-relative offsets.
+    historyIndexes: visible.map(({ index: recordIndex }) => recordIndex),
+    nextCursor: page.previousCursor,
+    followingCursor: page.followingCursor,
+    pageStart,
+  };
+}
+
+/** Continue a search window without rescanning the prefix on each page. */
+export async function getMessagesPageAfter(
+  userId: string, cid: string, after: number, limit = 10, projectIdHint?: string | null,
+): Promise<{ history: MessageRecord[]; nextCursor: number | null; followingCursor: number | null }> {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let cursor: number | null = after;
+  let previousCursor: number | null = null;
+  const records: MessageRecord[] = [];
+  do {
+    const page = await readConversationHistoryWindow(userId, sourceFile, 0, wanted - records.length, cursor);
+    if (previousCursor === null) previousCursor = page.previousCursor;
+    records.push(...page.records.filter(message => !message.deleted_at));
+    if (page.followingCursor === cursor) throw new Error('History cursor did not advance');
+    cursor = page.followingCursor;
+  } while (cursor !== null && records.length < wanted);
+  const context = await _messageDisplayContext(userId, cid, projectIdHint);
+  return { history: records.map(message => _messageForDisplay(message, context)),
+    nextCursor: previousCursor, followingCursor: cursor };
+}
+
+// Navigation work owns a separate lazy worker lane: a cold index must not
+// block main or delay the ordinary ten-message history page behind its scan.
+export { CONVERSATION_TURN_PAGE_SIZE, CONVERSATION_TURN_USER_PREVIEW_CHARS,
+  CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS } from './conversation-turn-types';
+export type { ConversationTurnIndexEntry, ConversationTurnPageEntry,
+  ConversationTurnPage } from './conversation-turn-types';
+
+export async function getConversationTurnPage(
+  userId: string, cid: string, before?: number | null, projectIdHint?: string | null,
+): Promise<import('./conversation-turn-types').ConversationTurnPage> {
+  return turnIndexRequest({ kind: 'turns', userId, cid, before, projectIdHint,
+    sourceFile: conversationMessageReadFile(userId, cid, projectIdHint) });
+}
+
+export async function purgeConversationTurnIndex(userId: string, cid: string): Promise<void> {
+  await turnIndexRequest({ kind: 'turn-purge', userId, cid, sourceFile: '' });
+}
+
+/** Drop every conversation belonging to `userId`. Loops `deleteConversation`
+ *  so the full cascade (group dir / main jsonl / sessions / attachments / CLI
+ *  / search index) runs per cid; one cid's failure doesn't abort the rest.
+ *  Returns the number actually removed. Used by Settings → "Clear all
+ *  conversations". */
+export async function deleteAllConversations(userId: string): Promise<number> {
+  const items = await listConversations(userId);
+  if (!items.length) return 0;
+  let deleted = 0;
+  for (const c of items) {
+    try {
+      if (await deleteConversation(userId, c.conversation_id, c.project_id || null)) deleted++;
+    } catch (err) {
+      log.warn(`bulk-delete failed user=${userId} cid=${c.conversation_id}: ${(err as Error).message}`);
+    }
+  }
+  log.info(`deleted-all user=${userId} count=${deleted}`);
+  return deleted;
+}
+
+/** Drop every conversation tied to `agentId` across every user. Called when
+ *  a custom agent is deleted. */
+export async function deleteConversationsByAgent(agentId: string): Promise<number> {
+  let total = 0;
+  if (!fs.existsSync(WS_ROOT)) return 0;
+
+  for (const entry of await fsp.readdir(WS_ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const uid = entry.name;
+    const chatsDir = userChatsDir(uid);
+    if (!fs.existsSync(chatsDir)) continue;
+
+    const items = await listConversations(uid);
+    if (!items.length) continue;
+    const removed = items.filter((c) => (c.agent_id || '') === agentId);
+    if (!removed.length) continue;
+    for (const c of removed) {
+      await deleteConversation(uid, c.conversation_id, c.project_id || null);
+    }
+    log.info(`deleted ${removed.length} conversation(s) for user=${uid} agent=${agentId}`);
+    total += removed.length;
+  }
+  return total;
+}
+
+// Filler-word prefixes commonly written before the actual ask. Ordered
+// longest-first within each regex so JS regex alternation (left-biased)
+// doesn't match a shorter prefix when a longer one is also valid. Single-
+// character fillers (e.g. bare `请`) are intentionally NOT listed — too
+// likely to clip real content like `请教...`.
+// Heuristic auto-title regex/constants — see top-of-file import.
+
+export function autoTitle(content: string): string {
+  const raw = (content || '').trim().replace(/\s+/g, ' ');
+  if (!raw) return t('chat.default_title');
+  let text = raw;
+  // Strip stacked fillers ("请帮我看下..." → "请帮我" first, then "看下");
+  // cap iterations so a pathological self-similar prefix can't loop.
+  for (let i = 0; i < 5; i++) {
+    const before = text;
+    text = text.replace(ZH_FILLER_RE, '').replace(EN_FILLER_RE, '');
+    if (text === before) break;
+  }
+  text = text.trim();
+  // If stripping killed everything (input was pure filler), fall back to
+  // the original trimmed input so the sidebar still shows what the user
+  // actually typed.
+  if (!text) text = raw;
+  text = truncateTitleToWidth(text);
+  return text || t('chat.default_title');
+}
+
+// ── Boot-time stale state sweep ──────────────────────────────────────────
+
+interface ConversationStateCandidate {
+  uid: string;
+  cid: string;
+  file: string;
+  /** This candidate came from this machine's local running journal. Synced
+   * state alone is not proof that this process/device owned the run. */
+  journalTracked?: boolean;
+}
+
+// The active-user startup pass and deferred maintenance may overlap. Serialize
+// the same conversation's reconciliation, including partial-write recovery.
+type StaleRecovery = Promise<void> & { recovery: { pendingFor?: string } };
+const _staleRecoveryTails = new Map<string, StaleRecovery>();
+
+function staleRecoveryIdentity(state: Pick<StateFile, 'in_flight' | 'in_flight_turns'>): string {
+  return JSON.stringify([state.in_flight, state.in_flight_turns]);
+}
+
+/** Status polling must not discard a startup receipt whose write is pending
+ * or failed. A newer state generation no longer belongs to that recovery. */
+export function isInterruptionRecoveryPending(uid: string, cid: string, state: StateFile): boolean {
+  return _staleRecoveryTails.get(`${uid}:${cid}`)?.recovery.pendingFor === staleRecoveryIdentity(state);
+}
+
+/** A conversation blocked by pending move recovery has no resolvable layout.
+ * Skip it so one blocked cid cannot abort the sweep for every other run. */
+function _stateCandidateFile(uid: string, cid: string, projectId: string | null | undefined): string | null {
+  try { return conversationLayout(uid, cid, projectId ?? null).stateFile; }
+  catch (err) {
+    log.warn('stale sweep skipped a blocked conversation', { user: maskId(uid), cid: maskId(cid), ...logErrorSummary(err) });
+    return null;
+  }
+}
+
+async function _conversationStateCandidates(uid: string): Promise<ConversationStateCandidate[]> {
+  const out: ConversationStateCandidate[] = [];
+  for (const root of conversationRoots(uid)) {
+    let entries: fs.Dirent[] = [];
+    try { entries = await fsp.readdir(root.dir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isConversationMetaDirName(entry.name)) continue;
+      const file = _stateCandidateFile(uid, entry.name, root.projectId);
+      if (!file) continue;
+      out.push({ uid, cid: entry.name, file });
+    }
+  }
+  return out;
+}
+
+async function _indexedConversationStateCandidates(uid: string): Promise<ConversationStateCandidate[]> {
+  const rows = await _readIndexConversations(uid);
+  const seen = new Set<string>();
+  const out: ConversationStateCandidate[] = [];
+  for (const row of rows) {
+    if (!safeId(row.conversation_id) || seen.has(row.conversation_id)) continue;
+    seen.add(row.conversation_id);
+    const file = _stateCandidateFile(uid, row.conversation_id, row.project_id);
+    if (!file) continue;
+    out.push({ uid, cid: row.conversation_id, file });
+  }
+  return out;
+}
+
+function _isStaleTurnTerminal(record: GroupMessage): boolean {
+  if (record.deleted_at || record.from === 'user' || record.dispatch || record.cli_question) return false;
+  if (record.system_kind === 'reply_interrupted') return true;
+  if (!record.source_message_id?.trim()) return false;
+  // Public native segments retain the source too, but only the terminal
+  // segment settles the execution. Never mistake a saved commentary segment
+  // for a completed actor merely because it carries its causal input.
+  const phases = (record.process || []).filter(item => item.event?.stream === 'runtime')
+    .map(item => (item.event?.data as { phase?: string })?.phase);
+  return !phases.includes('segment_end') || phases.includes('end');
+}
+
+function _latestHistorySettlesStaleRun(records: GroupMessage[]): boolean {
+  let latest: GroupMessage | undefined;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record && !record.deleted_at) {
+      latest = record;
+      break;
+    }
+  }
+  if (!latest) return false;
+  return _isStaleTurnTerminal(latest);
+}
+
+async function _unsettledStaleActors(uid: string, cid: string, state: StateFile): Promise<string[]> {
+  const file = conversationMessageReadFile(uid, cid);
+  const actors = [...new Set(state.in_flight.filter(actor => safeId(actor) && actor !== 'user'))];
+  const readPage = async (cursor: number | null) => {
+    // A partial row is the residue this recovery exists for, so it is skipped
+    // and never settles an actor. Only an unreadable source stays retryable.
+    try { return await readJsonlPageWithOffsets<GroupMessage>(file, 8, cursor, { strict: true, skipInvalidRecords: true }); }
+    catch (error) {
+      // A locally journaled run can outlive its missing canonical file. Its
+      // interruption notice recreates that file; other I/O failures retry.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { entries: [], nextCursor: null };
+      throw error;
+    }
+  };
+  if (!actors.length) {
+    const tail = await readPage(null);
+    return _latestHistorySettlesStaleRun(tail.entries.map(entry => entry.record)) ? [] : ['commander'];
+  }
+  const searching = new Set(actors), settled = new Set<string>();
+  let cursor: number | null = null;
+  do {
+    const page = await readPage(cursor);
+    for (let index = page.entries.length - 1; index >= 0 && searching.size; index--) {
+      const record = page.entries[index].record;
+      if (record.deleted_at) continue;
+      for (const actor of searching) {
+        const identity = state.in_flight_turns?.[actor];
+        if (record.from === actor && (!identity || record.turn_id === identity.turn_id) && _isStaleTurnTerminal(record)) {
+          settled.add(actor); searching.delete(actor);
+        } else if (identity ? record.id === identity.source_message_id : record.from === 'user') {
+          // This execution's input is a hard lower boundary. Legacy rosters
+          // have only the latest user turn as evidence; older replies cannot
+          // certify completion of newer work.
+          searching.delete(actor);
+        }
+      }
+    }
+    if (page.nextCursor === cursor) break;
+    cursor = page.nextCursor;
+  } while (cursor !== null && searching.size);
+  return actors.filter(actor => !settled.has(actor));
+}
+
+/**
+ * Reconcile groups whose state.json still says `running` at startup. A
+ * durable terminal history tail proves the status write merely lagged and is
+ * cleared silently. Otherwise the app stopped mid-run: flip to `idle` (not
+ * aborted — abort is a deliberate user action) and persist one actor-owned
+ * interruption bubble per unfinished actor so a reload cannot erase a live
+ * placeholder. The next user message starts a fresh worker from durable state.
+ */
+export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swept: number }> {
+  if (!fs.existsSync(WS_ROOT)) return { swept: 0 };
+  let swept = 0;
+  const candidates: ConversationStateCandidate[] = [];
+  if (activeUserId) {
+    const tracked = await readRunningConversationRegistry(activeUserId);
+    if (tracked.valid) {
+      // Normal pre-window path: one compact read, then only the handful of
+      // conversations that were actually running when the process stopped.
+      for (const item of tracked.items) {
+        const file = _stateCandidateFile(activeUserId, item.conversation_id, item.project_id);
+        if (!file) continue;
+        candidates.push({ uid: activeUserId, cid: item.conversation_id, file, journalTracked: true });
+      }
+    } else {
+      // One-time upgrade/corruption fallback. Establish the marker first so
+      // future boots stay O(running), without overwriting a concurrent start.
+      await ensureRunningConversationRegistry(activeUserId);
+      candidates.push(...await _indexedConversationStateCandidates(activeUserId));
+    }
+  } else {
+    // Maintenance/recovery path: every user has a machine-local running
+    // journal. Do not scan valid journals' synced state directories: another
+    // process/device may legitimately own a live run there, and this process
+    // has no in-memory worker with which to prove liveness. Full discovery is
+    // retained only as a one-time migration/corruption fallback.
+    for (const entry of await fsp.readdir(WS_ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const uid = entry.name;
+      const chatsDir = userChatsDir(uid);
+      if (!fs.existsSync(chatsDir)) continue;
+      const tracked = await readRunningConversationRegistry(uid);
+      if (tracked.valid) {
+        for (const item of tracked.items) {
+          const file = _stateCandidateFile(uid, item.conversation_id, item.project_id);
+          if (!file) continue;
+          candidates.push({ uid, cid: item.conversation_id, file, journalTracked: true });
+        }
+        continue;
+      }
+      await ensureRunningConversationRegistry(uid);
+      candidates.push(...await _conversationStateCandidates(uid));
+    }
+  }
+  // The common clean-start path has no running conversations. Loading bus.ts
+  // here would eagerly pull Group Chat, prompts, skills, marketplace, and
+  // model-runtime dependencies before the first BrowserWindow even though
+  // there is no stale state to inspect.
+  if (candidates.length === 0) return { swept: 0 };
+  // Loaded lazily to avoid the chats ↔ bus module cycle during startup. The
+  // CJS path deliberately shares the same in-memory runtime map as send().
+  const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
+  await _runBounded(candidates, 32, async ({
+    uid, cid, file, journalTracked,
+  }) => {
+    const key = `${uid}:${cid}`;
+    const previous = _staleRecoveryTails.get(key);
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    // Queue replacement must retain an earlier pending or failed receipt while
+    // the next sweep waits or reloads state and UI status polling continues.
+    const tail: StaleRecovery = Object.assign((previous || Promise.resolve()).then(() => pending), {
+      recovery: previous?.recovery || {},
+    });
+    _staleRecoveryTails.set(key, tail);
+    await previous;
+    let stateLoaded = false;
+    let recoveryFailed = false;
+    try {
+      const raw = JSON.parse(await fsp.readFile(file, 'utf8')) as StateFile;
+      stateLoaded = true;
+      if (raw?.status !== 'running') {
+        if (journalTracked) await untrackRunningConversation(uid, cid);
+        return;
+      }
+      raw.in_flight = Array.isArray(raw.in_flight) ? raw.in_flight.filter(actor => typeof actor === 'string') : [];
+      raw.in_flight_turns = parseInFlightTurns(raw.in_flight, raw.in_flight_turns);
+      const lastActiveMs = Date.parse(String(raw.last_active_at || ''));
+      if (Number.isFinite(lastActiveMs) && lastActiveMs >= PROCESS_BOOT_CUTOFF_MS) {
+        // This state was created or refreshed by the current process. It is
+        // never stale startup residue, even if this deferred sweep was queued
+        // before the user started the turn.
+        return;
+      }
+      if (!bus.isQuiescent(uid, cid)) {
+        // Belt-and-braces for legacy/malformed timestamps and turn-start races:
+        // live in-memory work always wins over disk maintenance.
+        return;
+      }
+      if (journalTracked) tail.recovery.pendingFor = staleRecoveryIdentity(raw);
+      const interruptedActors = await _unsettledStaleActors(uid, cid, raw);
+      if (!journalTracked && interruptedActors.length) {
+        // A missing/corrupt local journal provides no ownership proof. This
+        // may be a live run synced from another device, so the migration scan
+        // may reconcile a durable terminal tail but must never manufacture an
+        // interruption from `state.json: running` alone.
+        return;
+      }
+      if (!interruptedActors.length) {
+        // The terminal reply (or a prior recovery notice) is already durable.
+        // Reconcile only the stale status/journal; adding an interruption row
+        // here would turn a successfully completed task into a false failure.
+        await recoverOrphanRunningState(uid, cid, () => bus.isQuiescent(uid, cid));
+        return;
+      }
+      const members = await readMembers(uid, cid);
+      const publicActors = new Set(raw.in_flight.filter(actor => raw.in_flight_turns?.[actor]
+        || members.actors.some(member => member.id === actor && member.kind !== 'worker')));
+      // Anonymous helpers have no public roster/turn receipt. Legacy retries
+      // could leave their ids in the roster; retain their public owner instead.
+      // A wholly legacy/missing roster still keeps the original actor fallback.
+      const senders = publicActors.size ? interruptedActors.filter(actor => publicActors.has(actor)) : interruptedActors;
+      const ts = new Date().toISOString();
+      const layout = conversationLayout(uid, cid);
+      for (const senderId of senders) {
+        const interruptedMessage: GroupMessage = {
+          id: genId12(),
+          ts,
+          from: senderId,
+          to: ['user'],
+          system_kind: 'reply_interrupted',
+          text: t('chat.reply_interrupted'),
+          model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
+          ...raw.in_flight_turns?.[senderId],
+        };
+        const { msgIndex, source } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage, true);
+        await search.indexChatMessage(uid, cid, msgIndex, source ?? interruptedMessage);
+        const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
+          || (senderId === 'commander' ? 'commander' : 'agent');
+        await bumpConversationActivity(uid, cid, ts, {
+          senderKind,
+          senderId,
+          ...(senderKind === 'agent' ? { agentIds: [senderId] } : {}),
+        }, layout.projectId);
+      }
+      // Clear ownership only after every receipt is durable. A failed append
+      // keeps the journal retryable; already-written actor notices dedupe by
+      // their retained turn identity on the next sweep.
+      await recoverOrphanRunningState(uid, cid, () => bus.isQuiescent(uid, cid));
+      swept += 1;
+    } catch (error) {
+      recoveryFailed = true;
+      if (!stateLoaded && ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError)) {
+        if (journalTracked) await untrackRunningConversation(uid, cid);
+      } else {
+        log.warn('stale sweep recovery remains pending', { user: maskId(uid), cid: maskId(cid), ...logErrorSummary(error) });
+      }
+    } finally {
+      if (!recoveryFailed) delete tail.recovery.pendingFor;
+      release();
+      if (_staleRecoveryTails.get(key) === tail && !tail.recovery.pendingFor) _staleRecoveryTails.delete(key);
+    }
+  });
+  if (swept) log.info(`cleared ${swept} stale running conversations`);
+  return { swept };
+}
+
+/** Preserve deletion generations before their parent directory is removed. */
+export async function retainProjectConversationDeletes(userId: string, projectId: string): Promise<void> {
+  await _withConversationIndexStore(userId, store => store.retainProjectDeletes(projectId));
+}
+
+/** Serialize explicit recycle restoration with ordinary task lifecycle writes. */
+export async function withConversationLifecycleWrite<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  _invalidateConversationListCache(userId);
+  try { return await _withConversationWrite(userId, fn); }
+  finally { _invalidateConversationListCache(userId); }
+}

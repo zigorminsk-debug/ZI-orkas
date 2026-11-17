@@ -1,0 +1,874 @@
+import fs from "node:fs";
+import path from "node:path";
+import type {
+  Message,
+  MessageContent,
+  ToolResultContent,
+  ToolUseContent,
+} from "../shared/types.js";
+import type { ToolObservations } from "../tools/base.js";
+import { createLogger } from "../shared/logger.js";
+import {
+  Session,
+  type CompletedWorkEntry,
+  type CompletedWorkInput,
+  type ConversationHistoryReplaceOptions,
+  type ExecutionPlanState,
+  type ExecutionPlanUpdate,
+  type HistoryResource,
+  type SerializedSessionContextState,
+  type ToolSurfaceState,
+} from "./session.js";
+import type { WorkspaceObservationEntry } from "./workspace-state.js";
+import { SessionPersistenceError, errorCodeForLog } from "../shared/errors.js";
+
+const log = createLogger("persistent-session");
+
+// Disposable serialized recovery snapshots, never another state source. Keys
+// do not reference Session instances, so eviction/GC cannot retain their graphs.
+const CONTEXT_CACHE_ITEM_BYTES = 4 * 1024 * 1024;
+const CONTEXT_CACHE_TOTAL_BYTES = 32 * 1024 * 1024;
+const CONTEXT_CACHE_ENTRIES = 64;
+const contextSnapshots = new Map<object, { token: object; bytes: Buffer }>();
+let contextSnapshotBytes = 0;
+function forgetContextSnapshot(key: object): void {
+  const prior = contextSnapshots.get(key);
+  if (prior) contextSnapshotBytes -= prior.bytes.length;
+  contextSnapshots.delete(key);
+}
+function rememberContextSnapshot(key: object, token: object, bytes: Buffer | undefined): void {
+  forgetContextSnapshot(key);
+  if (!bytes || bytes.length > CONTEXT_CACHE_ITEM_BYTES) return;
+  const size = bytes.length;
+  while (contextSnapshots.size >= CONTEXT_CACHE_ENTRIES || contextSnapshotBytes + size > CONTEXT_CACHE_TOTAL_BYTES) {
+    forgetContextSnapshot(contextSnapshots.keys().next().value!);
+  }
+  contextSnapshots.set(key, { token, bytes });
+  contextSnapshotBytes += bytes.length;
+}
+
+/** Exact bounded verification before omitting the old overwrite. Metadata alone
+ * cannot detect same-length replacements; an enlarged external file must not
+ * turn this optimization into an unbounded allocation/read. */
+function contextFileMatches(file: string, expected: Buffer): boolean {
+  let fd: number | undefined;
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size !== expected.length) return false;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expected.length));
+    for (let offset = 0; offset < expected.length;) {
+      const size = Math.min(chunk.length, expected.length - offset);
+      const read = fs.readSync(fd, chunk, 0, size, offset);
+      if (read === 0 || !chunk.subarray(0, read).equals(expected.subarray(offset, offset + read))) return false;
+      offset += read;
+    }
+    const current = fs.lstatSync(file);
+    return current.isFile() && current.dev === stat.dev && current.ino === stat.ino
+      && current.size === stat.size && current.mtimeMs === stat.mtimeMs && current.ctimeMs === stat.ctimeMs;
+  } catch {
+    return false; // Verification failure falls back to the original authoritative save.
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** Synthetic content written when a prior run aborted after the model
+ * issued a tool_use but before the tool produced a tool_result. Both
+ * OpenAI and Anthropic chat-completion contracts require tool_use to be
+ * immediately followed by tool_result for the same id; history that
+ * violates this rule silently hangs the provider stream on the next
+ * turn. We heal the history at load time so those runs can recover
+ * instead of looping in "thinking…" forever. */
+const INTERRUPTED_TOOL_RESULT =
+  "[interrupted: previous run aborted before this tool produced a result]";
+
+export type ToolProtocolRepairReport = {
+  changed: boolean;
+  synthesizedOrphanResults: number;
+  droppedUnmatchedResults: number;
+  mergedParallelResultMessages: number;
+  deduplicatedResults: number;
+};
+
+function emptyToolProtocolRepairReport(): ToolProtocolRepairReport {
+  return {
+    changed: false,
+    synthesizedOrphanResults: 0,
+    droppedUnmatchedResults: 0,
+    mergedParallelResultMessages: 0,
+    deduplicatedResults: 0,
+  };
+}
+
+/**
+ * PersistentSession — a `Session` that mirrors every message to a JSONL file
+ * and can reload prior messages on construction.
+ *
+ * This is the standalone equivalent of OpenClaw's per-session JSONL history:
+ * each session_id maps 1:1 to a file path, and opening the same session_id
+ * again on a later run resumes the conversation.
+ *
+ * Format (one JSON object per line):
+ *   { "role": "user", "content": [...], "ts": 1728000000000 }
+ *
+ * Unknown / malformed lines are skipped with a warning, not thrown — a
+ * partially corrupted file on disk still recovers as much history as
+ * possible rather than losing the entire session.
+ */
+export class PersistentSession extends Session {
+  private readonly sessionFile: string;
+  private readonly contextFile: string;
+  private readonly contextSnapshotKey = {};
+  private lastToolProtocolRepairReport = emptyToolProtocolRepairReport();
+  private contextMutationDepth = 0;
+  private contextWriteDirty = false;
+  /** Byte position of each in-memory message's JSONL line. This makes a
+   * canonical history tail replacement proportional to the changed tail
+   * instead of rewriting every retained turn. */
+  private messageStartOffsets: number[] = [];
+  private sessionFileSize = 0;
+  // Logical queued tail state, captured with each ordered write for retry.
+  private needsAppendSeparator = false;
+  // Capture ordered disk operations, not the trimmed model/history window.
+  // Runtime barriers stop new work while this queue cannot be drained.
+  private pendingWrites: Array<() => void> = [];
+  private persistenceFailure: string | undefined;
+  private pendingFlush: Promise<void> | undefined;
+
+  override hasPendingPersistence(): boolean {
+    return this.pendingWrites.length > 0 || this.contextWriteDirty;
+  }
+
+  override async flushPending(signal?: AbortSignal): Promise<void> {
+    if (!this.hasPendingPersistence()) return;
+    if (this.pendingFlush) return this.pendingFlush;
+    const flush = async () => {
+      for (const waitMs of [200, 1_000, 3_000]) {
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            reject(Object.assign(new Error("Run aborted"), { code: "ABORT_ERR" }));
+          };
+          const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+          }, waitMs);
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+        });
+        this.persistenceFailure = undefined;
+        this.attemptPersistence();
+        if (!this.hasPendingPersistence()) return;
+      }
+      throw new SessionPersistenceError(this.persistenceFailure);
+    };
+    this.pendingFlush = flush();
+    try { await this.pendingFlush; }
+    finally { this.pendingFlush = undefined; }
+  }
+
+  private enqueueWrite(write: () => void): void {
+    this.pendingWrites.push(write);
+    this.attemptPersistence();
+  }
+
+  private attemptPersistence(): void {
+    // Mutations during a failure retain data without restarting the retry budget.
+    if (this.persistenceFailure) return;
+    try {
+      let written = 0;
+      try {
+        while (written < this.pendingWrites.length) {
+          this.pendingWrites[written]();
+          written++;
+        }
+      } finally {
+        if (written) this.pendingWrites.splice(0, written);
+      }
+      if (this.contextWriteDirty && this.contextMutationDepth === 0) {
+        this.persistContext();
+        this.contextWriteDirty = false;
+      }
+    } catch (err) {
+      this.persistenceFailure = errorCodeForLog(err);
+      log.warn("session save pending", { code: this.persistenceFailure });
+    }
+  }
+
+  constructor(opts: {
+    /** Absolute path to the jsonl file that backs this session. */
+    sessionFile: string;
+    /** Per-parent-class option: cap on how many turns stay in memory. */
+    maxHistoryTurns?: number;
+  }) {
+    super({
+      maxHistoryTurns: opts.maxHistoryTurns,
+    });
+    this.sessionFile = opts.sessionFile;
+    this.contextFile = `${opts.sessionFile}.context.json`;
+    this.loadFromDisk();
+  }
+
+  /** Path to the backing jsonl file. */
+  getSessionFile(): string {
+    return this.sessionFile;
+  }
+
+  /** Session id derived from the jsonl basename (file stem). Used as
+   * `prompt_cache_key` for providers that route cache by opaque string. */
+  override getSessionId(): string {
+    const base = path.basename(this.sessionFile);
+    return base.endsWith(".jsonl") ? base.slice(0, -".jsonl".length) : base;
+  }
+
+  /**
+   * Load prior messages from disk into memory. Called automatically by the
+   * constructor; exposed so callers can force a reload (rare — mostly tests).
+   */
+  loadFromDisk(): void {
+    if (this.hasPendingPersistence()) throw new SessionPersistenceError(this.persistenceFailure);
+    super.clear();
+    this.messageStartOffsets = [];
+    this.sessionFileSize = 0;
+    this.needsAppendSeparator = false;
+    if (!fs.existsSync(this.sessionFile)) {
+      // Context can legitimately exist before the first transcript row (for
+      // example, a scoped tool surface is established while building the
+      // runner). Restore that sidecar independently of JSONL existence.
+      this.loadContextFromDisk();
+      return;
+    }
+
+    let raw: Buffer;
+    try {
+      raw = fs.readFileSync(this.sessionFile);
+      this.sessionFileSize = raw.length;
+      this.needsAppendSeparator = raw.length > 0 && raw[raw.length - 1] !== 0x0a;
+    } catch (err) {
+      log.warn("session read failed", { code: errorCodeForLog(err) });
+      this.loadContextFromDisk();
+      return;
+    }
+
+    let lineStart = 0;
+    const loadLine = (lineEnd: number) => {
+      const trimmed = raw.subarray(lineStart, lineEnd).toString("utf-8").trim();
+      const recordStart = lineStart;
+      lineStart = lineEnd + 1;
+      if (!trimmed) return;
+      try {
+        const obj = JSON.parse(trimmed) as { role?: string; content?: unknown; turnId?: unknown };
+        if (
+          (obj.role === "user" || obj.role === "assistant" || obj.role === "system" || obj.role === "developer") &&
+          Array.isArray(obj.content)
+        ) {
+          super.addMessage(
+            obj.role as Message["role"],
+            obj.content as MessageContent[],
+            Number.isInteger(obj.turnId) && (obj.turnId as number) > 0
+              ? obj.turnId as number
+              : undefined,
+          );
+          const dropped = Math.max(0, this.messageStartOffsets.length + 1 - this.length);
+          if (dropped) this.messageStartOffsets.splice(0, dropped);
+          this.messageStartOffsets.push(recordStart);
+        }
+      } catch {
+        // Skip corrupt line — keep going rather than throwing away everything.
+      }
+    };
+    for (let lineEnd = raw.indexOf(0x0a); lineEnd !== -1; lineEnd = raw.indexOf(0x0a, lineStart)) {
+      loadLine(lineEnd);
+    }
+    if (lineStart < raw.length) loadLine(raw.length);
+
+    // Heal orphan `tool_use` entries — see `healOrphanToolUses` for why.
+    // Runs after all lines parse so it operates on the full, loaded history
+    // rather than one line at a time.
+    if (this.healOrphanToolUses()) {
+      this.flushToDisk();
+      const report = this.lastToolProtocolRepairReport;
+      if (report.synthesizedOrphanResults || report.droppedUnmatchedResults) {
+        log.warn("repaired invalid tool protocol", report);
+      } else {
+        log.info("normalized parallel tool results", report);
+      }
+    }
+    this.loadContextFromDisk();
+  }
+
+  /**
+   * Heal **and persist** orphan tool_use entries in one call. Returns true
+   * when the session needed repair (both in-memory and on disk). Safe to
+   * call repeatedly; no-op on a clean session.
+   *
+   * This is the entry point callers should use *after* a turn ends
+   * (successfully, aborted, or errored) to make sure the next turn sees
+   * a provider-valid message array — the constructor's load-time heal
+   * isn't enough when the session instance is cached across turns (see
+   * `model/core-agent/session-store.ts`).
+   */
+  healAndPersist(): boolean {
+    // Heal the cached in-memory session only. We deliberately do NOT flushToDisk:
+    // by this point memory has been trimmed to the rolling window, and flushToDisk
+    // rewrites the whole jsonl from that window — which would drop history older
+    // than the window from the append-only log. The append log stays intact and
+    // the constructor's load-time heal re-applies the same (idempotent) fix on the
+    // next reload, where memory holds the full history so a flush is lossless.
+    return this.healOrphanToolUses();
+  }
+
+  getLastToolProtocolRepairReport(): ToolProtocolRepairReport {
+    return { ...this.lastToolProtocolRepairReport };
+  }
+
+  /**
+   * Walk the in-memory history and insert a synthetic `tool_result` for
+   * every assistant `tool_use` that isn't followed (in the very next
+   * message) by a matching `tool_result`. Those orphans happen when a
+   * tool execution was aborted (app kill, user stop, watchdog) after the
+   * provider's stream emitted the tool_use but before the runner
+   * persisted the result. The next provider call would then send an
+   * API-invalid message array and silently hang waiting for a response
+   * the server never produces.
+   *
+   * Returns true if the in-memory state was modified. Callers usually
+   * want `healAndPersist()` so disk and memory stay in sync; exposed
+   * separately for callers that manage flushing on their own.
+   *
+   * Heal policy: synthesize `tool_result(isError=true, content="[interrupted: …]")`
+   * for each orphan id. If the next message is already a user message
+   * carrying other tool_result blocks, append the synthetic ones to that
+   * message (one turn = one user response); otherwise insert a new user
+   * message before whatever comes next. Idempotent — re-running on an
+   * already-healed history is a no-op.
+   */
+  healOrphanToolUses(): boolean {
+    const original = super.getMessages();
+    let changed = false;
+    const report = emptyToolProtocolRepairReport();
+
+    // Pre-pass — drop orphan tool_results whose toolUseId never appears as
+    // a tool_use in any assistant message. Provider APIs reject these with
+    // "No tool call found for function call output with call_id ...".
+    // Common shape that triggered it: assistant message with only text
+    // (the tool_use was lost / never persisted), followed by user messages
+    // carrying tool_result blocks — the cluster scan in pass 2 only walks
+    // assistant→tool_result clusters, so it won't even visit these orphans.
+    const validToolUseIds = new Set<string>();
+    for (const m of original) {
+      if (m.role !== 'assistant') continue;
+      for (const c of m.content) {
+        if ((c as { type?: string }).type === 'tool_use') {
+          const id = (c as ToolUseContent).id;
+          if (id) validToolUseIds.add(id);
+        }
+      }
+    }
+    const messages: Message[] = [];
+    for (const m of original) {
+      if (m.role !== 'user') {
+        messages.push(m);
+        continue;
+      }
+      const hasToolResult = m.content.some(
+        (c) => (c as { type?: string }).type === 'tool_result',
+      );
+      if (!hasToolResult) {
+        messages.push(m);
+        continue;
+      }
+      const kept = m.content.filter((c) => {
+        if ((c as { type?: string }).type !== 'tool_result') return true;
+        const id = (c as ToolResultContent).toolUseId;
+        return validToolUseIds.has(id);
+      });
+      if (kept.length === m.content.length) {
+        messages.push(m);
+      } else {
+        changed = true;
+        report.droppedUnmatchedResults += m.content.length - kept.length;
+        if (kept.length > 0) messages.push({ ...m, content: kept });
+        // else: message had ONLY orphan tool_results — drop it entirely
+      }
+    }
+
+    const fixed: Message[] = [];
+
+    let i = 0;
+    while (i < messages.length) {
+      const m = messages[i];
+
+      if (m.role !== "assistant") {
+        if (m.role === "user" && m.content.some((c) => (c as { type?: string }).type === "tool_result")) {
+          const kept = m.content.filter((c) => (c as { type?: string }).type !== "tool_result");
+          changed = true;
+          report.droppedUnmatchedResults += m.content.length - kept.length;
+          if (kept.length > 0) fixed.push({ ...m, content: kept });
+        } else {
+          fixed.push(m);
+        }
+        i++;
+        continue;
+      }
+
+      const toolUses = m.content.filter(
+        (c): c is ToolUseContent => (c as { type?: string }).type === "tool_use",
+      );
+      if (!toolUses.length) {
+        fixed.push(m);
+        i++;
+        continue;
+      }
+
+      // Walk the cluster of consecutive *pure* tool_result user messages that
+      // follow this assistant turn. The runner's `addToolResult` writes one
+      // user message per tool_use_id, so parallel tool_calls expand to N
+      // adjacent user messages — we must scan all of them, not just `i+1`.
+      // Stops at: next assistant, end of history, or a user message that
+      // carries any non-tool_result content (real user text shouldn't be
+      // collapsed into the cluster).
+      const resultsByCallId = new Map<string, ToolResultContent>();
+      let trailingImageMsgs: Message[] = [];
+      let lastResultId: string | undefined;
+      let j = i + 1;
+      while (j < messages.length) {
+        const nx = messages[j];
+        if (nx.role !== "user") break;
+        if (nx.turnId && m.turnId && nx.turnId !== m.turnId) break;
+        const onlyToolResults = nx.content.every(
+          (c) => (c as { type?: string }).type === "tool_result",
+        );
+        const onlyImages = nx.content.every(
+          (c) => (c as { type?: string }).type === "image",
+        );
+        if (onlyToolResults) {
+          for (const c of nx.content) {
+            const tr = c as ToolResultContent;
+            lastResultId = tr.toolUseId;
+            // First non-interrupted result wins; otherwise first-seen wins.
+            // This drops duplicates (e.g. real result + later synthetic
+            // interrupted, or two synthetic markers from repeated heals).
+            const existing = resultsByCallId.get(tr.toolUseId);
+            const isInterrupted =
+              tr.isError === true && tr.content === INTERRUPTED_TOOL_RESULT;
+            if (!existing || (existing.content === INTERRUPTED_TOOL_RESULT && !isInterrupted)) {
+              resultsByCallId.set(tr.toolUseId, tr);
+            }
+          }
+          j++;
+        } else if (onlyImages && resultsByCallId.size > 0) {
+          // Only old receipts lack the images array. A new receipt already
+          // owns its images (possibly none), so a following user image is real
+          // input even if it belongs to the same active UI turn.
+          const result = lastResultId ? resultsByCallId.get(lastResultId) : undefined;
+          if (result?.images !== undefined) break;
+          if (result) {
+            resultsByCallId.set(lastResultId!, { ...result,
+              images: [...(result.images ?? []), ...nx.content as NonNullable<ToolResultContent["images"]>],
+            });
+            changed = true;
+          } else trailingImageMsgs.push(nx);
+          j++;
+        } else {
+          break;
+        }
+      }
+
+      const allCallIds = toolUses.map((t) => t.id);
+      const orphanIds = allCallIds.filter((id) => !resultsByCallId.has(id));
+      report.synthesizedOrphanResults += orphanIds.length;
+      for (const id of orphanIds) {
+        resultsByCallId.set(id, {
+          type: "tool_result",
+          toolUseId: id,
+          content: INTERRUPTED_TOOL_RESULT,
+          isError: true,
+          images: [],
+        });
+      }
+
+      // Order results to match the assistant's tool_use declaration order;
+      // tool_results whose toolUseId has no matching tool_use in this
+      // assistant message are dropped — keeping them produces a
+      // function_call_output without function_call, which providers reject
+      // with "No tool call found for function call output with call_id ...".
+      const orderedResults: MessageContent[] = [];
+      let droppedOrphanResults = 0;
+      for (const id of allCallIds) {
+        const r = resultsByCallId.get(id);
+        if (r) orderedResults.push(r);
+      }
+      for (const id of resultsByCallId.keys()) {
+        if (!allCallIds.includes(id)) droppedOrphanResults++;
+      }
+      report.droppedUnmatchedResults += droppedOrphanResults;
+
+      // Detect whether the rewrite changes anything observable: orphan
+      // synthesis, dedup of duplicate tool_call_ids, or merging multiple
+      // adjacent user messages into one.
+      const originalCluster = messages.slice(i + 1, j);
+      const originalToolResultMsgs = originalCluster.filter((mm) =>
+        mm.content.every((c) => (c as { type?: string }).type === "tool_result"),
+      );
+      const originalToolResultCount = originalToolResultMsgs.reduce(
+        (sum, mm) => sum + mm.content.length,
+        0,
+      );
+      const distinctOriginalResultIds = new Set(
+        originalToolResultMsgs.flatMap((message) =>
+          message.content.map((content) =>
+            (content as { toolUseId?: unknown }).toolUseId,
+          ),
+        ),
+      ).size;
+      report.mergedParallelResultMessages += Math.max(0, originalToolResultMsgs.length - 1);
+      report.deduplicatedResults += Math.max(
+        0,
+        originalToolResultCount - distinctOriginalResultIds,
+      );
+      if (
+        orphanIds.length > 0 ||
+        droppedOrphanResults > 0 ||
+        originalToolResultMsgs.length > 1 ||
+        originalToolResultCount !== orderedResults.length
+      ) {
+        changed = true;
+      }
+
+      fixed.push(m);
+      if (orderedResults.length > 0) {
+        fixed.push({
+          role: "user",
+          content: orderedResults,
+          ...(m.turnId ? { turnId: m.turnId } : {}),
+        });
+      }
+      for (const im of trailingImageMsgs) fixed.push(im);
+
+      i = j;
+    }
+
+    report.changed = changed;
+    this.lastToolProtocolRepairReport = report;
+    if (!changed) return false;
+
+    // Preserve the rolling summary + resources across the merge — clearing and
+    // re-adding would null turnState and drop them (see method doc). On the load
+    // path turnState is still null here, so this is a plain message swap.
+    this.replaceMessagesPreservingContext(fixed);
+    return true;
+  }
+
+  /** Override: in-memory add + atomic append to disk. */
+  override addMessage(role: Message["role"], content: MessageContent[], turnId?: number): Message {
+    const message = super.addMessage(role, content, turnId);
+    this.alignOffsetsAfterAppend();
+    this.appendToDisk(message);
+    this.requestContextWrite();
+    return message;
+  }
+
+  /** Override: start a tracked UI turn + atomic append to disk. */
+  override beginUserTurn(content: MessageContent[]): number {
+    const id = super.beginUserTurn(content);
+    this.alignOffsetsAfterAppend();
+    this.appendToDisk({ role: "user", content, turnId: id });
+    this.requestContextWrite();
+    return id;
+  }
+
+  override replaceConversationHistory(
+    messages: readonly Message[],
+    source: string,
+    options: ConversationHistoryReplaceOptions = {},
+  ): number | null {
+    const changedFrom = super.replaceConversationHistory(messages, source, options);
+    if (changedFrom !== null) this.rewriteTailToDisk(changedFrom);
+    this.requestContextWrite();
+    return changedFrom;
+  }
+
+  override completeActiveTurn(outcome?: string): void {
+    super.completeActiveTurn(outcome);
+    this.requestContextWrite();
+  }
+
+  override configureHistoryBudget(usableInputTokens: number, requestCeilingTokens: number, fixedOverheadTokens: number): boolean {
+    const changed = super.configureHistoryBudget(usableInputTokens, requestCeilingTokens, fixedOverheadTokens);
+    if (changed) this.requestContextWrite();
+    return changed;
+  }
+
+  override addHistoryResource(resource: HistoryResource): void {
+    super.addHistoryResource(resource);
+    this.requestContextWrite();
+  }
+
+  override recordCompletedWork(input: CompletedWorkInput): CompletedWorkEntry | undefined {
+    const entry = super.recordCompletedWork(input);
+    if (entry) this.requestContextWrite();
+    return entry;
+  }
+
+  override recordToolObservations(input: {
+    toolCallId?: string;
+    tool: string;
+    observations?: ToolObservations;
+  }): WorkspaceObservationEntry | undefined {
+    const entry = super.recordToolObservations(input);
+    if (entry) this.requestContextWrite();
+    return entry;
+  }
+
+  override reconcileWorkspaceObservations(): WorkspaceObservationEntry | undefined {
+    const entry = super.reconcileWorkspaceObservations();
+    if (entry) this.requestContextWrite();
+    return entry;
+  }
+
+  override updateExecutionPlan(update: ExecutionPlanUpdate): ExecutionPlanState {
+    const previousRevision = this.getExecutionPlan()?.revision;
+    const plan = super.updateExecutionPlan(update);
+    if (plan.revision !== previousRevision) this.requestContextWrite();
+    return plan;
+  }
+
+  override ensureExecutionPlanAnchor(): ExecutionPlanState {
+    const plan = super.ensureExecutionPlanAnchor();
+    this.requestContextWrite();
+    return plan;
+  }
+
+  override clearExecutionPlan(): void {
+    super.clearExecutionPlan();
+    this.requestContextWrite();
+  }
+
+  override setToolSurfaceState(state: ToolSurfaceState | undefined): void {
+    super.setToolSurfaceState(state);
+    this.requestContextWrite();
+  }
+
+  override applyHistorySummary(
+    summary: string,
+    turnIds: readonly number[],
+  ): void {
+    super.applyHistorySummary(summary, turnIds);
+    this.requestContextWrite();
+  }
+
+  override applyEmergencyHistoryFold(notice: string, turnIds: readonly number[]): void {
+    super.applyEmergencyHistoryFold(notice, turnIds);
+    this.requestContextWrite();
+  }
+
+  override applyActiveCheckpointSummary(
+    summary: string,
+    checkpointThroughMessageIndex: number,
+    maxSummaryTokens?: number,
+  ): string {
+    const appliedSummary = super.applyActiveCheckpointSummary(
+      summary, checkpointThroughMessageIndex, maxSummaryTokens,
+    );
+    this.requestContextWrite();
+    return appliedSummary;
+  }
+
+  override applyPersistentBlockShrink(newSummaryText: string): void {
+    super.applyPersistentBlockShrink(newSummaryText);
+    this.requestContextWrite();
+  }
+
+  override withContextMutationBatch<T>(mutate: () => T): T {
+    this.contextMutationDepth++;
+    try {
+      return mutate();
+    } finally {
+      this.contextMutationDepth--;
+      if (this.contextMutationDepth === 0 && this.contextWriteDirty) {
+        this.attemptPersistence();
+      }
+    }
+  }
+
+  /** Persist an explicit reset in order, including after a failed append. */
+  override clear(): void {
+    super.clear();
+    this.flushToDisk();
+    this.requestContextWrite();
+  }
+
+  private requestContextWrite(): void {
+    this.contextWriteDirty = true;
+    if (this.contextMutationDepth === 0) this.attemptPersistence();
+  }
+
+  /** Capture the expected byte offset so partial appends can be retried without
+   * duplicating a complete row or joining a new row onto a torn write. */
+  private appendToDisk(record: Message): void {
+    const separator = this.needsAppendSeparator ? "\n" : "";
+    const line = separator + JSON.stringify({ ...record, ts: Date.now() }) + "\n";
+    const start = this.sessionFileSize;
+    this.needsAppendSeparator = false;
+    this.messageStartOffsets.push(start + separator.length);
+    this.sessionFileSize += Buffer.byteLength(line, "utf-8");
+    let attempted = false;
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      if (attempted) {
+        const size = fs.existsSync(this.sessionFile) ? fs.statSync(this.sessionFile).size : 0;
+        if (size < start) throw Object.assign(new Error("Session prefix changed"), { code: "EIO" });
+        if (size > start) fs.truncateSync(this.sessionFile, start);
+      }
+      attempted = true;
+      fs.appendFileSync(this.sessionFile, line, "utf-8");
+    });
+  }
+
+  /** Account for Session's legacy in-memory head trim before recording the
+   * newly appended line offset. The append-only JSONL intentionally retains
+   * that older prefix; only the in-memory offset index moves forward. */
+  private alignOffsetsAfterAppend(): void {
+    const dropped = Math.max(0, this.messageStartOffsets.length + 1 - this.length);
+    if (dropped) this.messageStartOffsets.splice(0, dropped);
+  }
+
+  /** Capture only the changed suffix, retaining the historical disk prefix. */
+  private rewriteTailToDisk(changedFrom: number): void {
+    let diskMatches = true;
+    if (!this.pendingWrites.length) {
+      try { diskMatches = fs.statSync(this.sessionFile).size === this.sessionFileSize; }
+      catch { diskMatches = false; }
+    }
+    if (changedFrom <= 0 || changedFrom > this.messageStartOffsets.length || !diskMatches) {
+      this.flushToDisk();
+      return;
+    }
+    const offset = this.messageStartOffsets[changedFrom] ?? this.sessionFileSize;
+    const lines = this.serializedMessages(changedFrom);
+    const payload = Buffer.from(lines.join(""), "utf-8");
+    this.updateOffsets(lines, changedFrom, offset);
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      const fd = fs.openSync(this.sessionFile, "r+");
+      try {
+        fs.ftruncateSync(fd, offset);
+        let written = 0;
+        while (written < payload.length) {
+          const count = fs.writeSync(fd, payload, written, payload.length - written, offset + written);
+          if (!count) throw Object.assign(new Error("Incomplete session write"), { code: "EIO" });
+          written += count;
+        }
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+    });
+  }
+
+  private serializedMessages(from = 0): string[] {
+    return this.getMessages().slice(from).map((m) => JSON.stringify({
+      role: m.role, content: m.content,
+      ...(m.turnId ? { turnId: m.turnId } : {}), ts: Date.now(),
+    }) + "\n");
+  }
+
+  private updateOffsets(lines: string[], from: number, offset: number): void {
+    this.messageStartOffsets = this.messageStartOffsets.slice(0, from);
+    for (const line of lines) {
+      this.messageStartOffsets.push(offset);
+      offset += Buffer.byteLength(line, "utf-8");
+    }
+    this.sessionFileSize = offset;
+    this.needsAppendSeparator = false;
+  }
+
+  /** Explicit full replacement (rebase/reset/heal), never an append retry. */
+  private flushToDisk(): void {
+    const records = this.serializedMessages();
+    const payload = records.join("");
+    this.updateOffsets(records, 0, 0);
+    this.enqueueWrite(() => {
+      this.ensureDir();
+      const tmp = `${this.sessionFile}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf-8");
+      fs.renameSync(tmp, this.sessionFile);
+    });
+  }
+
+  private loadContextFromDisk(): void {
+    if (!fs.existsSync(this.contextFile)) {
+      this.restoreContextState(null);
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.contextFile, "utf-8")) as SerializedSessionContextState;
+      const repaired = this.restoreContextState(raw);
+      if (repaired) {
+        const report = this.lastToolProtocolRepairReport;
+        const benignParallelNormalization = report.changed
+          && report.synthesizedOrphanResults === 0
+          && report.droppedUnmatchedResults === 0
+          && report.mergedParallelResultMessages > 0;
+        if (benignParallelNormalization) {
+          log.info("context sidecar normalized after parallel result merge");
+        } else {
+          log.warn("context sidecar repaired");
+        }
+        this.writeContextToDisk();
+      }
+    } catch (err) {
+      log.warn("session context read failed", { code: errorCodeForLog(err) });
+      this.restoreContextState(null);
+    }
+  }
+
+  private writeContextToDisk(): void {
+    this.requestContextWrite();
+  }
+
+  private persistContext(): void {
+    const cached = contextSnapshots.get(this.contextSnapshotKey);
+    if (cached?.token === this.contextPersistenceToken && contextFileMatches(this.contextFile, cached.bytes)) {
+      // Refresh recency without growing the cache or retaining a Session.
+      contextSnapshots.delete(this.contextSnapshotKey);
+      contextSnapshots.set(this.contextSnapshotKey, cached);
+      return;
+    }
+    const state = this.getSerializedContextState();
+    if (!state) {
+      if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
+      forgetContextSnapshot(this.contextSnapshotKey);
+      return;
+    }
+    this.ensureDir();
+    const tmp = `${this.contextFile}.tmp`;
+    const body = JSON.stringify(state) + "\n";
+    let bytes: Buffer | undefined;
+    try {
+      if (Buffer.byteLength(body) <= CONTEXT_CACHE_ITEM_BYTES) bytes = Buffer.from(body, "utf-8");
+    } catch {
+      // Optional pre-encoding failure retains the original string save path.
+    }
+    fs.writeFileSync(tmp, bytes ?? body, "utf-8");
+    fs.renameSync(tmp, this.contextFile);
+    // Publish cache state only after the original commit succeeds. Failures
+    // retain dirty state and the existing storage-only retry/flush barriers.
+    try {
+      rememberContextSnapshot(this.contextSnapshotKey, this.contextPersistenceToken, bytes);
+    } catch {
+      // A disposable optimization must not turn an already committed save
+      // into a persistence failure. Its next use falls back to a full save.
+      forgetContextSnapshot(this.contextSnapshotKey);
+    }
+  }
+
+  private ensureDir(): void {
+    const dir = path.dirname(this.sessionFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+}

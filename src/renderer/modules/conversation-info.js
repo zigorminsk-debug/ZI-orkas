@@ -1,0 +1,1368 @@
+// ─── Conversation info side panel ───────────────────────────────────────
+// Right-side companion panel for the active conversation. It summarizes what
+// the conversation produced, plus its attachments.
+//
+// The Files tab renders one already-merged list from
+// `features/conversation_outputs.ts`: the workspace disk scan (the only thing
+// that can see files `bash` and external CLI agents write), the artifact
+// bundles that live outside the workspace entirely, and the history-recorded
+// paths written somewhere else. Each entry's `origin` decides its section and
+// how it opens — the panel does not re-derive membership from history.
+
+const ConversationInfo = (() => {
+  const _infoLog = (typeof createLogger === 'function')
+    ? createLogger('conversation-info')
+    : { warn: () => {}, info: () => {}, error: () => {} };
+
+  let _cid = null;
+  let _open = false;
+  let _activeTab = 'files';
+  // Renderer-session preferences belong to each task, not the shared panel DOM.
+  const _panelStateByCid = new Map();
+  let _panelResize = null;
+  let _seq = 0;
+  let _fileSeq = 0;
+  let _attachmentSeq = 0;
+  const _locallyDeletedPaths = new Set();
+  const _expandedDirectoryPaths = new Set();
+  let _loading = false;
+  let _loadingSource = '';
+  let _loadingSeq = 0;
+  let _error = '';
+  let _fileMenuScrollHost = null;
+  let _fileMenuAnchor = null;
+  let _snapshot = {
+    conversation: null,
+    history: [],
+    files: [],
+    filesTruncated: false,
+    filesCount: 0,
+    filesScanSkipped: false,
+    attachments: [],
+  };
+  const _CI_TEXT_EXTS = new Set([
+    'md', 'markdown', 'txt', 'csv', 'tsv', 'jsonl', 'ndjson', 'rst', 'tex', 'srt', 'vtt', 'json', 'yaml', 'yml', 'log',
+    'html', 'htm', 'xml', 'toml', 'ini', 'conf',
+    'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+    'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
+    'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
+    'sql', 'graphql', 'gql',
+  ]);
+  const _CI_IMAGE_EXTS = new Set([
+    'png', 'apng', 'jpg', 'jpeg', 'jpe', 'jfif', 'webp', 'gif',
+    'avif', 'bmp', 'ico', 'svg',
+  ]);
+  const _CI_VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv']);
+  const _CI_AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'oga', 'opus', 'weba', 'm4a', 'aac', 'flac']);
+  const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
+  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm', 'xls']);
+  const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
+
+  function _label(key, fallback, vars) {
+    try {
+      const v = typeof t === 'function' ? t(key, vars || undefined) : key;
+      return v && v !== key ? v : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function _compactText(text, max = 82) {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    return s.length > max ? s.slice(0, max - 1) + '…' : s;
+  }
+
+  function _baseName(p) {
+    const parts = String(p || '').split(/[\\/]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(p || '');
+  }
+
+  function _extForName(name) {
+    const base = _baseName(name);
+    const idx = base.lastIndexOf('.');
+    return idx >= 0 ? base.slice(idx + 1).toLowerCase() : '';
+  }
+
+
+  function _savedAppSaveFailure(value, fallbackType = 'operation') {
+    const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    let errorCode = 'saved_app_save_failed';
+    if (rawCode === 'not_found' || /not found|does not exist/.test(message)) errorCode = 'source_not_found';
+    else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+    else if (/unsupported|no html entry/.test(message)) errorCode = 'unsupported_source';
+    else if (!value) errorCode = 'invalid_response';
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    else if (errorCode === 'source_not_found') errorType = 'operation';
+    return { error_type: errorType, error_code: errorCode };
+  }
+
+  function _libraryImportFailure(value, fallbackType = 'operation') {
+    const rawCode = String((value && (value.error_code || value.code || value.error)) || '').toLowerCase();
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    let errorCode = 'library_import_failed';
+    if (rawCode === 'not_found' || /not[_ ]found|does not exist/.test(message)) errorCode = 'source_not_found';
+    else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+    else if (rawCode === 'not_supported' || /unsupported/.test(message)) errorCode = 'unsupported_source';
+    else if (!value) errorCode = 'invalid_response';
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    return { error_type: errorType, error_code: errorCode };
+  }
+
+  function _logSavedAppSaveFailure(failure) {
+    _infoLog.warn('conversation info app save failed', { error_type: failure.error_type, error_code: failure.error_code });
+  }
+
+  function _dirName(p) {
+    const s = String(p || '').replace(/\\/g, '/');
+    const idx = s.lastIndexOf('/');
+    return idx >= 0 ? s.slice(0, idx) : '';
+  }
+
+  function _splitPath(p) {
+    return String(p || '')
+      .replace(/\\/g, '/')
+      .split('/')
+      .filter(Boolean);
+  }
+
+  function _normalizePath(p) {
+    return String(p || '').replace(/\\/g, '/').replace(/\/+/g, '/');
+  }
+
+  function _pathIsSameOrInside(parent, target) {
+    const p = _normalizePath(parent).replace(/\/+$/, '');
+    const t = _normalizePath(target);
+    return !!p && (t === p || t.startsWith(p + '/'));
+  }
+
+  function _isLocallyDeletedPath(p) {
+    const target = _normalizePath(p);
+    for (const deleted of _locallyDeletedPaths) {
+      if (_pathIsSameOrInside(deleted, target)) return true;
+    }
+    return false;
+  }
+
+  function _samePrefix(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length > b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  function _commonDirSegments(paths) {
+    const dirs = paths.map((p) => _splitPath(_dirName(p)));
+    if (!dirs.length) return [];
+    let common = dirs[0].slice();
+    for (let i = 1; i < dirs.length; i++) {
+      const next = dirs[i];
+      let j = 0;
+      while (j < common.length && j < next.length && common[j] === next[j]) j++;
+      common = common.slice(0, j);
+    }
+    return common;
+  }
+
+  // One-time warn when the shared icons helpers (`window.fileKindIconHtml` /
+  // `window.uiIconHtml`, defined by `modules/icons.js`) are missing — typical
+  // cause is an `index.html` script-list refactor that put `icons.js` after a
+  // consumer. Without this warn the panel just paints rows without icons,
+  // silently degrading; logging once lets DevTools surface the broken load
+  // order on the first render attempt. The flag is per-module-lifetime to
+  // avoid spamming on every refresh.
+  let _warnedIconsMissing = false;
+  function _warnIconsHelperMissingOnce(helperName) {
+    if (_warnedIconsMissing) return;
+    _warnedIconsMissing = true;
+    _infoLog.warn(`icons.js helper missing: ${helperName} — check index.html <script> load order`);
+  }
+
+  function _iconForName(name, kind) {
+    if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') return window.fileKindIconHtml(name, kind);
+    _warnIconsHelperMissingOnce('fileKindIconHtml');
+    return '';
+  }
+
+  function _uiIcon(name, className) {
+    if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+      return window.uiIconHtml(name, className);
+    }
+    _warnIconsHelperMissingOnce('uiIconHtml');
+    return '';
+  }
+
+  function _kindForName(name) {
+    const ext = _extForName(name);
+    if (_CI_IMAGE_EXTS.has(ext)) return 'image';
+    if (_CI_VIDEO_EXTS.has(ext)) return 'video';
+    if (_CI_AUDIO_EXTS.has(ext)) return 'audio';
+    if (ext === 'pdf') return 'pdf';
+    if (_CI_OFFICE_WORD_EXTS.has(ext)) return 'docx';
+    if (_CI_OFFICE_SHEET_EXTS.has(ext)) return 'spreadsheet';
+    if (_CI_OFFICE_PRESENTATION_EXTS.has(ext)) return 'presentation';
+    if (['doc', 'ppt'].includes(ext)) return 'legacy_office';
+    if (_CI_TEXT_EXTS.has(ext)) return 'text';
+    return 'unsupported';
+  }
+
+
+  function _logLibraryImportFailure(failure) {
+    _infoLog.warn('conversation info library import failed', { error_type: failure.error_type, error_code: failure.error_code });
+  }
+
+  function _fileOperationPolicy() {
+    return typeof window !== 'undefined' ? window.FileOperationPolicy : null;
+  }
+
+  function _canAddEntryToLibrary(name, projectScoped = false) {
+    const policy = _fileOperationPolicy();
+    return !!(policy && policy.canAddToLibrary(name, { projectScoped }));
+  }
+
+  function _canAddEntryToChat(name) {
+    const policy = _fileOperationPolicy();
+    return !!(policy && policy.canAddToChat(name));
+  }
+
+  function _isProjectConversation(cid) {
+    const target = String(cid || '');
+    const snapshotConversation = _snapshot.conversation;
+    if (snapshotConversation
+      && (!target || target === _cid || snapshotConversation.conversation_id === target)
+      && snapshotConversation.project_id) return true;
+    if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
+    const conversation = conversations.find((item) => item && item.conversation_id === target);
+    return !!(conversation && conversation.project_id);
+  }
+
+  function _formatBytes(bytes) {
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+    return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  }
+
+  async function _fetchJson(url) {
+    const res = await apiFetch(url);
+    const data = await res.json();
+    if (!data || data.ok === false) throw new Error((data && data.error) || 'load failed');
+    return data;
+  }
+
+  async function _load(cid) {
+    const enc = encodeURIComponent(cid);
+    const [historyData, filesData, attachmentData] = await Promise.all([
+      _fetchJson(typeof _historyRequestUrl === 'function'
+        ? _historyRequestUrl(cid)
+        : `/api/conversations/${enc}/history?limit=10`),
+      _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
+        _infoLog.warn('file list load failed', { cid, error: err && err.message });
+        return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
+      }),
+      _fetchJson(`/api/conversations/${enc}/attachments?scope=all`).catch((err) => {
+        _infoLog.warn('attachment load failed', { cid, error: err && err.message });
+        return { items: [] };
+      }),
+    ]);
+    return {
+      conversation: historyData.conversation || null,
+      history: Array.isArray(historyData.history) ? historyData.history : [],
+      files: Array.isArray(filesData.items) ? filesData.items : [],
+      filesTruncated: filesData.truncated === true,
+      filesCount: Number(filesData.count) || 0,
+      filesScanSkipped: filesData.scanSkipped === true,
+      attachments: Array.isArray(attachmentData.items) ? attachmentData.items : [],
+    };
+  }
+
+  async function _loadFileSnapshot(cid) {
+    const enc = encodeURIComponent(cid);
+    const filesData = await _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
+      _infoLog.warn('file list load failed', { cid, error: err && err.message });
+      return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
+    });
+    // A file-only refresh used to fetch the complete history again just to
+    // preserve the existing snapshot. The original panel load already owns
+    // that history; generated files are authoritative in the workspace scan.
+    // Leave history/conversation untouched in the caller's merge.
+    return {
+      files: Array.isArray(filesData.items) ? filesData.items : [],
+      filesTruncated: filesData.truncated === true,
+      filesCount: Number(filesData.count) || 0,
+      filesScanSkipped: filesData.scanSkipped === true,
+    };
+  }
+
+  function _currentConversationTitle() {
+    const c = _snapshot.conversation
+      || (Array.isArray(conversations) ? conversations.find((x) => x && x.conversation_id === _cid) : null);
+    return c && c.title ? c.title : _label('chat.new_conv_title', 'New conversation');
+  }
+
+  // The main process owns membership now (`features/conversation_outputs.ts`):
+  // the workspace scan, the artifact pool, and the history-recorded paths the
+  // scan structurally cannot reach, merged once with an `origin` on each entry.
+  // The panel used to re-derive that here from `_snapshot.history`, which is
+  // why an out-of-workspace file arrived with no relative path and got hung off
+  // the tree root as a bare basename.
+  function _outputEntries() {
+    return Array.isArray(_snapshot.files) ? _snapshot.files : [];
+  }
+
+  /** Ordinary files — the workspace tree plus anything written outside it. */
+  function _collectVisibleFiles() {
+    const byPath = new Map();
+    for (const item of _outputEntries()) {
+      if (!item || item.origin === 'artifact') continue;
+      const p = item.path ? String(item.path) : '';
+      if (!p || _isLocallyDeletedPath(p)) continue;
+      const key = _normalizePath(p);
+      if (byPath.has(key)) continue;
+      byPath.set(key, {
+        path: p,
+        relPath: item.relPath ? String(item.relPath) : '',
+        name: item.name || _baseName(p),
+        kind: item.kind || _kindForName(item.name || p),
+        time: item.mtime ? new Date(Number(item.mtime)).toISOString() : '',
+        bytes: Number(item.bytes) || 0,
+        origin: item.origin === 'outside' ? 'outside' : 'workspace',
+      });
+    }
+    return Array.from(byPath.values()).sort((a, b) => {
+      const ar = a.relPath || a.path || '';
+      const br = b.relPath || b.path || '';
+      return String(ar).localeCompare(String(br));
+    });
+  }
+
+  /** `create_artifact` bundles. One row each — an artifact is a directory of
+   *  web assets, so listing its internals would say nothing useful. */
+  function _collectVisibleArtifacts() {
+    const out = [];
+    for (const item of _outputEntries()) {
+      if (!item || item.origin !== 'artifact' || !item.artifactId) continue;
+      out.push({
+        artifactId: String(item.artifactId),
+        title: String(item.title || ''),
+        // Carried through so an interaction started from the panel routes back
+        // to the producing actor, exactly as it does from the bubble's frame.
+        agentId: String(item.agentId || ''),
+        mtime: Number(item.mtime) || 0,
+      });
+    }
+    return out;
+  }
+
+  function _buildFileTree(files) {
+    const root = { dirs: new Map(), files: [], path: '' };
+    const hasRelPaths = files.some((f) => f && f.relPath);
+    const common = hasRelPaths ? [] : _commonDirSegments(files.map((f) => f.path));
+    for (const file of files) {
+      const treePath = hasRelPaths ? (file.relPath || _baseName(file.path)) : file.path;
+      const all = _splitPath(treePath);
+      const rel = _samePrefix(common, all) ? all.slice(common.length) : all;
+      const parts = rel.length ? rel : [_baseName(file.path)];
+      const fullParts = _splitPath(file.path);
+      const baseOffset = Math.max(0, fullParts.length - parts.length);
+      let node = root;
+      for (let i = 0; i < parts.slice(0, -1).length; i++) {
+        const part = parts[i];
+        const dirPath = _pathFromSegmentsLike(file.path, fullParts.slice(0, baseOffset + i + 1));
+        if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [], path: dirPath });
+        else if (!node.dirs.get(part).path && dirPath) node.dirs.get(part).path = dirPath;
+        node = node.dirs.get(part);
+      }
+      node.files.push({ ...file, name: parts[parts.length - 1] || _baseName(file.path) });
+    }
+    return root;
+  }
+
+  function _pathFromSegmentsLike(sourcePath, segments) {
+    const source = _normalizePath(sourcePath);
+    const prefix = source.startsWith('/') ? '/' : '';
+    return prefix + (segments || []).join('/');
+  }
+
+  function _directoryStateKey(dirPath) {
+    return _normalizePath(dirPath).replace(/\/+$/, '');
+  }
+
+  function _captureExpandedDirectories(body) {
+    if (!body || typeof body.querySelectorAll !== 'function') return;
+    body.querySelectorAll('.conversation-info-dir[data-directory-key]').forEach((dir) => {
+      const key = _directoryStateKey(dir && dir.dataset && dir.dataset.directoryKey);
+      if (!key) return;
+      if (dir.open) _expandedDirectoryPaths.add(key);
+      else _expandedDirectoryPaths.delete(key);
+    });
+  }
+
+  function _renderTreeNode(node, depth) {
+    const dirs = Array.from(node.dirs.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+    const moreTitle = _label('common.more', 'More');
+    const dirHtml = dirs.map(([name, child]) => {
+      const dirPath = child && child.path ? String(child.path) : '';
+      const directoryKey = _directoryStateKey(dirPath);
+      const expandedAttr = directoryKey && _expandedDirectoryPaths.has(directoryKey) ? ' open' : '';
+      return `
+      <details class="conversation-info-dir" style="--depth:${depth}"
+               data-directory-key="${escapeHtml(directoryKey)}"${expandedAttr}>
+        <summary class="conversation-info-dir-summary" title="${escapeHtml(dirPath || name)}">
+          <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-closed">${_uiIcon('folder', 'ui-icon conversation-info-dir-svg-icon')}</span>
+          <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-open">${_uiIcon('folder-open', 'ui-icon conversation-info-dir-svg-icon')}</span>
+          <span class="conversation-info-dir-name">${escapeHtml(name)}</span>
+          ${dirPath ? `<button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
+                  data-entry-kind="dir" data-entry-path="${escapeHtml(dirPath)}" data-entry-name="${escapeHtml(name)}"
+                  title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>` : ''}
+        </summary>
+        ${_renderTreeNode(child, depth + 1)}
+      </details>
+    `;
+    }).join('');
+    const fileHtml = files.map((file) => {
+      const kind = file.kind || _kindForName(file.name || file.path);
+      return `
+      <div class="conversation-info-file" role="button" tabindex="0" style="--depth:${depth}"
+              data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
+        <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
+        <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
+        <button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
+                data-entry-kind="${escapeHtml(kind)}" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
+                title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>
+      </div>
+    `;
+    }).join('');
+    return dirHtml + fileHtml;
+  }
+
+  function _renderGroup(titleKey, fallback, rowsHtml) {
+    if (!rowsHtml) return '';
+    return `<div class="conversation-info-group">
+      <div class="conversation-info-group-title">${escapeHtml(_label(titleKey, fallback))}</div>
+      ${rowsHtml}
+    </div>`;
+  }
+
+  // Files the conversation produced outside its own workspace folder — an
+  // absolute path into the user's tree, the attachment pool, a sibling
+  // directory. They have no place in the workspace tree, and silently hanging
+  // them off its root made them read as workspace files. Full path stays in the
+  // tooltip because the basename alone cannot tell two of them apart.
+  function _renderOutsideFiles(files) {
+    const moreTitle = _label('common.more', 'More');
+    return files.map((file) => {
+      const kind = file.kind || _kindForName(file.name || file.path);
+      return `
+      <div class="conversation-info-file is-outside" role="button" tabindex="0" style="--depth:0"
+              data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
+        <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
+        <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
+        <button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
+                data-entry-kind="${escapeHtml(kind)}" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
+                title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>
+      </div>
+    `;
+    }).join('');
+  }
+
+  function _renderArtifactRows(artifacts) {
+    return artifacts.map((artifact) => {
+      const label = artifact.title || _label('artifact.title', 'Interactive app');
+      return `
+      <div class="conversation-info-file conversation-info-artifact" role="button" tabindex="0" style="--depth:0"
+              data-artifact-id="${escapeHtml(artifact.artifactId)}" title="${escapeHtml(label)}">
+        <span class="conversation-info-file-icon">${_uiIcon('layout-grid', 'ui-icon conversation-info-dir-svg-icon')}</span>
+        <span class="conversation-info-file-name">${escapeHtml(label)}</span>
+      </div>
+    `;
+    }).join('');
+  }
+
+  function _renderFiles() {
+    const allFiles = _collectVisibleFiles();
+    const artifacts = _collectVisibleArtifacts();
+    const files = allFiles.filter((file) => file.origin !== 'outside');
+    const outside = allFiles.filter((file) => file.origin === 'outside');
+    if (!allFiles.length && !artifacts.length) {
+      if (_snapshot.filesScanSkipped) {
+        return `<div class="conversation-info-empty">${escapeHtml(_label(
+          'conversation_info.files_scan_skipped',
+          'File listing is paused for this privacy-protected workspace. Files created or attached in chat still appear.'
+        ))}</div>`;
+      }
+      return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_files', 'No files yet'))}</div>`;
+    }
+    const tree = _buildFileTree(files);
+    const trunc = _snapshot.filesTruncated
+      ? `<div class="conversation-info-empty is-small">${escapeHtml(_label('conversation_info.files_truncated', 'Showing first {count} files', { count: _snapshot.filesCount || allFiles.length }))}</div>`
+      : '';
+    const treeHtml = files.length
+      ? `<div class="conversation-info-tree">${_renderTreeNode(tree, 0)}</div>`
+      : '';
+    const outsideHtml = _renderGroup(
+      'conversation_info.group_outside',
+      'Saved outside this conversation',
+      outside.length ? `<div class="conversation-info-tree">${_renderOutsideFiles(outside)}</div>` : '',
+    );
+    const artifactHtml = _renderGroup(
+      'conversation_info.group_artifacts',
+      'Interactive apps',
+      artifacts.length ? `<div class="conversation-info-tree">${_renderArtifactRows(artifacts)}</div>` : '',
+    );
+    return `<div class="ci-files">${trunc}${treeHtml}${outsideHtml}${artifactHtml}</div>`;
+  }
+
+  function _collectConversationAttachments() {
+    const byName = new Map();
+    for (const m of _snapshot.history || []) {
+      const ts = m && (m.ts || m.time || '');
+      const attachments = Array.isArray(m && m.attachments) ? m.attachments : [];
+      for (const name of attachments) {
+        if (typeof name !== 'string' || !name) continue;
+        if (!byName.has(name)) {
+          byName.set(name, { name, kind: _kindForName(name), bytes: 0, time: ts, pending: false });
+        }
+      }
+    }
+    for (const item of _snapshot.attachments || []) {
+      const name = String(item && item.name || '');
+      if (!name) continue;
+      byName.set(name, {
+        name,
+        displayName: item.displayName ? String(item.displayName) : '',
+        kind: item.kind || _kindForName(name),
+        bytes: Number(item.bytes) || 0,
+        time: item.mtime ? new Date(Number(item.mtime) * 1000).toISOString() : '',
+        pending: true,
+      });
+    }
+    return Array.from(byName.values()).sort((a, b) => {
+      const at = new Date(a.time || 0).getTime();
+      const bt = new Date(b.time || 0).getTime();
+      if (bt !== at) return bt - at;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+  }
+
+  function _ciThumbForKind(kind, name) {
+    const n = String(name || '').toLowerCase();
+    if (kind === 'image' || /\.(png|jpe?g|gif|webp|svg)$/i.test(n)) return { cls: 'is-image', label: 'IMG' };
+    if (kind === 'pdf' || /\.pdf$/i.test(n)) return { cls: '', label: 'PDF' };
+    if (/\.(docx?|docm)$/i.test(n)) return { cls: 'is-doc', label: 'DOC' };
+    if (/\.(xlsx?|xlsm)$/i.test(n)) return { cls: 'is-doc', label: 'XLS' };
+    if (/\.(pptx?|pptm)$/i.test(n)) return { cls: 'is-doc', label: 'PPT' };
+    if (/\.(md|markdown|txt|csv|tsv|json|yaml|yml|log)$/i.test(n)) return { cls: 'is-doc', label: (n.split('.').pop() || 'TXT').slice(0, 4).toUpperCase() };
+    return { cls: 'is-doc', label: 'FILE' };
+  }
+
+  function _renderAttachments() {
+    const items = _collectConversationAttachments();
+    if (!items.length) {
+      return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_attachments', 'No attachments'))}</div>`;
+    }
+    const rows = items.map((item) => {
+      const name = String(item.name || '');
+      const label = String(item.displayName || item.name || '');
+      const size = _formatBytes(item.bytes);
+      const time = item.time ? new Date(item.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+      const meta = [size, time].filter(Boolean).join(' · ');
+      const thumb = _ciThumbForKind(item.kind, label);
+      return `
+        <button type="button" class="ci-attach-row" data-attachment-name="${escapeHtml(name)}" title="${escapeHtml(label)}">
+          <span class="ci-attach-row-thumb ${thumb.cls}">${escapeHtml(thumb.label)}</span>
+          <div class="ci-attach-row-main">
+            <span class="ci-attach-row-name">${escapeHtml(label)}</span>
+            ${meta ? `<span class="ci-attach-row-meta">${escapeHtml(meta)}</span>` : ''}
+          </div>
+        </button>
+      `;
+    }).join('');
+    return `<div class="ci-attach"><div class="ci-attach-list">${rows}</div></div>`;
+  }
+
+  // Tab count chips — filled from the same _snapshot as the body renderers.
+  // Tasks count is `done/total`; files / attachments mirror visible rows.
+  function _refreshTabCounts() {
+    const filesEl = document.getElementById('conversation-info-tab-count-files');
+    if (filesEl) {
+      const count = _collectVisibleFiles().length + _collectVisibleArtifacts().length;
+      filesEl.textContent = count > 0 ? String(count) : '';
+    }
+    const attachEl = document.getElementById('conversation-info-tab-count-attachments');
+    if (attachEl) {
+      const count = _collectConversationAttachments().length;
+      attachEl.textContent = count > 0 ? String(count) : '';
+    }
+  }
+
+  function _renderBody() {
+    _closeFileMenu();
+    const body = document.getElementById('conversation-info-body');
+    if (!body) return;
+    body.hidden = _activeTab === 'browser';
+    if (_activeTab === 'browser') {
+      _refreshTabCounts();
+      return;
+    }
+    // File refreshes replace the tree markup. Capture the live <details>
+    // state first so a background refresh does not collapse folders the user
+    // is working in.
+    _captureExpandedDirectories(body);
+    if (!_cid) {
+      body.innerHTML = `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.no_conversation', 'Open a conversation to see details'))}</div>`;
+      _refreshTabCounts();
+      return;
+    }
+    if (_loading) {
+      body.innerHTML = `<div class="conversation-info-empty">${escapeHtml(_label('common.loading', 'Loading…'))}</div>`;
+      _refreshTabCounts();
+      return;
+    }
+    if (_error) {
+      body.innerHTML = `<div class="conversation-info-empty is-error">${escapeHtml(_label('conversation_info.load_failed', 'Could not load conversation info', { reason: _error }))}</div>`;
+      _refreshTabCounts();
+      return;
+    }
+    if (_activeTab === 'attachments') body.innerHTML = _renderAttachments();
+    else body.innerHTML = _renderFiles();
+    // Hydrate any data-ui-icon placeholders that the renderers emitted.
+    if (typeof window !== 'undefined' && typeof window.hydrateUiIcons === 'function') {
+      window.hydrateUiIcons(body);
+    }
+    _refreshTabCounts();
+  }
+
+  function _syncChrome() {
+    const panel = document.getElementById('conversation-info-panel');
+    const toggle = document.getElementById('conversation-info-toggle');
+    if (panel) panel.hidden = !_open;
+    if (_open) _panelResize?.apply();
+    if (toggle) {
+      toggle.classList.toggle('is-active', _open);
+      toggle.setAttribute('aria-expanded', _open ? 'true' : 'false');
+    }
+    document.querySelectorAll('.conversation-info-tab').forEach((tab) => {
+      tab.classList.toggle('is-active', tab.dataset.infoTab === _activeTab);
+    });
+    const body = document.getElementById('conversation-info-body');
+    if (body) body.hidden = _activeTab === 'browser';
+    window.WebAssist?.setPanelState(_open, _activeTab, _cid || '');
+  }
+
+  function _beginLoading(source, seq) {
+    _loading = true;
+    _loadingSource = source || '';
+    _loadingSeq = seq || 0;
+    _renderBody();
+  }
+
+  function _clearLoading(source, seq, opts = {}) {
+    if (!_loading || _loadingSource !== source) return false;
+    if (opts.clearAnyForSource === true || _loadingSeq === seq) {
+      _loading = false;
+      _loadingSource = '';
+      _loadingSeq = 0;
+      return true;
+    }
+    return false;
+  }
+
+  function _resetLoading() {
+    _loading = false;
+    _loadingSource = '';
+    _loadingSeq = 0;
+  }
+
+  function _setOpen(next) {
+    if (next) window.VideoCanvas?.close();
+    else _panelResize?.finish();
+    _open = !!next;
+    _syncChrome();
+    if (_open && _activeTab !== 'browser') refresh(_cid);
+  }
+
+  async function refresh(cid, opts = {}) {
+    const target = cid || _cid;
+    if (!target || target !== _cid || !_open) return;
+    const seq = ++_seq;
+    // Full and partial reads share ownership of each resource. A later read
+    // supersedes only its slice, without discarding the rest of a full load.
+    const fileSeq = ++_fileSeq;
+    const attachmentSeq = ++_attachmentSeq;
+    const silent = !!opts.silent;
+    if (silent && _loadingSource === 'full') {
+      _clearLoading('full', seq, { clearAnyForSource: true });
+      _renderBody();
+    }
+    if (!silent) {
+      _error = '';
+      _beginLoading('full', seq);
+    }
+    try {
+      const snapshot = await _load(target);
+      if (seq !== _seq || target !== _cid) return;
+      _snapshot = {
+        ...snapshot,
+        ...(fileSeq !== _fileSeq ? {
+          files: _snapshot.files,
+          filesTruncated: _snapshot.filesTruncated,
+          filesCount: _snapshot.filesCount,
+          filesScanSkipped: _snapshot.filesScanSkipped,
+        } : {}),
+        ...(attachmentSeq !== _attachmentSeq ? { attachments: _snapshot.attachments } : {}),
+      };
+      _error = '';
+    } catch (err) {
+      if (seq !== _seq || target !== _cid) return;
+      _error = (err && err.message) || String(err);
+    } finally {
+      if (seq === _seq && target === _cid) {
+        _clearLoading('full', seq, { clearAnyForSource: silent });
+        _renderBody();
+      }
+    }
+  }
+
+  async function refreshAttachments(cid) {
+    const target = cid || _cid;
+    if (!target || target !== _cid || !_open) return;
+    // Composer selections contain only unsent files. Always refresh the task
+    // inventory so sending/clearing a selection cannot erase earlier uploads.
+    const seq = ++_attachmentSeq;
+    try {
+      const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments?scope=all`);
+      if (seq !== _attachmentSeq || target !== _cid) return;
+      _snapshot = {
+        ..._snapshot,
+        attachments: Array.isArray(data.items) ? data.items : [],
+      };
+      if (_activeTab === 'attachments') _renderBody();
+      else _refreshTabCounts();
+    } catch (err) {
+      _infoLog.warn('attachment refresh failed', { cid: target, error: err && err.message });
+    }
+  }
+
+  async function refreshFiles(cid, opts = {}) {
+    const target = cid || _cid;
+    if (!target || target !== _cid || !_open) return;
+    const seq = ++_fileSeq;
+    const silent = !!opts.silent;
+    if (silent && _loadingSource === 'files') {
+      _clearLoading('files', seq, { clearAnyForSource: true });
+      if (_activeTab === 'files') _renderBody();
+    }
+    if (!silent && _activeTab === 'files') {
+      _error = '';
+      _beginLoading('files', seq);
+    }
+    try {
+      const partial = await _loadFileSnapshot(target);
+      if (seq !== _fileSeq || target !== _cid) return;
+      _snapshot = { ..._snapshot, ...partial };
+      _error = '';
+      if (_activeTab === 'files') _renderBody();
+    } catch (err) {
+      if (seq !== _fileSeq || target !== _cid) return;
+      _infoLog.warn('file refresh failed', { cid: target, error: err && err.message });
+      if (!silent) {
+        _error = (err && err.message) || String(err);
+        if (_activeTab === 'files') _renderBody();
+      }
+    } finally {
+      if (seq === _fileSeq && target === _cid) {
+        _clearLoading('files', seq, { clearAnyForSource: silent });
+        if (_activeTab === 'files') _renderBody();
+      }
+    }
+  }
+
+  function bind(cid) {
+    if (_cid) _panelStateByCid.set(_cid, { open: _open, tab: _activeTab });
+    _panelResize?.finish();
+    _cid = cid || null;
+    const saved = _cid ? _panelStateByCid.get(_cid) : null;
+    _open = saved?.open || false;
+    _activeTab = saved?.tab || 'files';
+    if (_open) window.VideoCanvas?.close();
+    _expandedDirectoryPaths.clear();
+    _snapshot = { conversation: null, history: [], files: [], filesTruncated: false, filesCount: 0, filesScanSkipped: false, attachments: [] };
+    _error = '';
+    _resetLoading();
+    _seq++;
+    _fileSeq++;
+    _attachmentSeq++;
+    _syncChrome();
+    _renderBody();
+    if (_open && _cid) refresh(_cid);
+  }
+
+  function unbind() {
+    bind(null);
+  }
+
+  function _openFile(absPath) {
+    if (!absPath || typeof openChatFileViewer !== 'function') return;
+    openChatFileViewer(absPath, _baseName(absPath), _cid ? { cid: _cid } : undefined);
+  }
+
+  /** Open a `create_artifact` bundle in the same full-screen frame the bubble's
+   *  own "open" action uses, so the panel adds a way in rather than a second
+   *  presentation of the app. */
+  function _openArtifact(artifactId) {
+    if (!artifactId || !_cid) return;
+    if (typeof window === 'undefined' || typeof window.openChatArtifactViewer !== 'function') return;
+    const entry = _collectVisibleArtifacts().find((item) => item.artifactId === artifactId);
+    window.openChatArtifactViewer({
+      cid: _cid,
+      artifactId,
+      title: (entry && entry.title) || '',
+      agentId: (entry && entry.agentId) || '',
+    });
+  }
+
+  function _attachmentEntriesForPath(absPath, kind) {
+    if (kind !== 'dir') {
+      return [{ path: absPath, name: _baseName(absPath) }];
+    }
+    return _collectVisibleFiles()
+      .filter((file) => file && file.path && _pathIsSameOrInside(absPath, file.path))
+      .map((file) => ({ path: file.path, name: _baseName(file.path) }));
+  }
+
+  async function _fallbackImportAttachments(entries, cidOverride) {
+    const targetCid = cidOverride || _cid;
+    if (!targetCid) return;
+    const rejected = [];
+    const imported = [];
+    for (const entry of entries) {
+      try {
+        const res = await apiFetch(`/api/conversations/${encodeURIComponent(targetCid)}/attachments/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: entry.path, name: entry.name }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok) {
+          rejected.push(_label('chat.attach_upload_fail', '{name} ({reason})', {
+            name: entry.name,
+            reason: (data && data.error) || _label('chat.attach_upload_generic_fail', 'Upload failed'),
+          }));
+          continue;
+        }
+        if (data.info) imported.push(data.info);
+      } catch (err) {
+        rejected.push(_label('chat.attach_upload_fail', '{name} ({reason})', {
+          name: entry.name,
+          reason: String(err && err.message || err),
+        }));
+      }
+    }
+    if (imported.length) await refreshAttachments(targetCid);
+    if (rejected.length) {
+      await uiAlert(_label('chat.attach_rejected_prefix', 'The following files could not be uploaded:\n\n{list}', {
+        list: rejected.join('\n'),
+      }));
+    }
+  }
+
+  function _fileActionPayload(absPath, cidOverride) {
+    const payload = { path: absPath };
+    const targetCid = cidOverride || _cid;
+    if (targetCid) payload.cid = targetCid;
+    return payload;
+  }
+
+  function _ensureFileMenu() {
+    let menu = document.getElementById('conversation-info-file-menu');
+    if (!menu) {
+      menu = document.createElement('div');
+      menu.id = 'conversation-info-file-menu';
+      menu.className = 'ctx-row-menu conversation-info-file-menu';
+      menu.style.display = 'none';
+      document.body.appendChild(menu);
+    }
+    return menu;
+  }
+
+  function _positionFileMenu(menuEl, anchorEl) {
+    menuEl.style.display = 'block';
+    menuEl.style.left = '-9999px';
+    menuEl.style.top = '-9999px';
+    const rect = anchorEl.getBoundingClientRect();
+    const menuRect = menuEl.getBoundingClientRect();
+    const margin = 8;
+    const gap = 4;
+    let left = rect.right - menuRect.width;
+    if (left < margin) left = margin;
+    if (left + menuRect.width > window.innerWidth - margin) {
+      left = window.innerWidth - menuRect.width - margin;
+    }
+    const below = rect.bottom + gap + menuRect.height <= window.innerHeight - margin;
+    const top = below ? rect.bottom + gap : Math.max(margin, rect.top - menuRect.height - gap);
+    menuEl.style.left = `${left}px`;
+    menuEl.style.top = `${top}px`;
+  }
+
+  function _closeFileMenu() {
+    const menu = document.getElementById('conversation-info-file-menu');
+    if (!menu || !menu.style) return;
+    menu.style.display = 'none';
+    if (_fileMenuAnchor && typeof _fileMenuAnchor.setAttribute === 'function') {
+      _fileMenuAnchor.setAttribute('aria-expanded', 'false');
+    }
+    _fileMenuAnchor = null;
+    if (menu.dataset) {
+      delete menu.dataset.filePath;
+      delete menu.dataset.fileName;
+    }
+    document.querySelectorAll('.conversation-info-file.is-menu-open, .conversation-info-dir-summary.is-menu-open, .chat-msg-produced-item.is-menu-open')
+      .forEach((row) => row.classList && row.classList.remove && row.classList.remove('is-menu-open'));
+    if (document.removeEventListener) {
+      document.removeEventListener('mousedown', _onFileMenuOutside, true);
+      document.removeEventListener('keydown', _onFileMenuKeyDown, true);
+    }
+    if (window.removeEventListener) window.removeEventListener('resize', _closeFileMenu);
+    if (_fileMenuScrollHost && _fileMenuScrollHost.removeEventListener) {
+      _fileMenuScrollHost.removeEventListener('scroll', _closeFileMenu);
+    }
+    _fileMenuScrollHost = null;
+  }
+
+  function _onFileMenuOutside(ev) {
+    const menu = document.getElementById('conversation-info-file-menu');
+    if (!menu || menu.style.display === 'none') return;
+    if (menu.contains(ev.target)) return;
+    if (ev.target && ev.target.closest && ev.target.closest('.conversation-info-file-menu-btn, .chat-msg-produced-menu-btn')) return;
+    _closeFileMenu();
+  }
+
+  function _onFileMenuKeyDown(ev) {
+    if (ev.key === 'Escape') _closeFileMenu();
+  }
+
+  async function _openFileMenu(anchorBtn, absPath, displayName, kind, options = {}) {
+    if (!anchorBtn || !absPath) return;
+    const menu = _ensureFileMenu();
+    const sameFile = menu.dataset.filePath === absPath && menu.style.display !== 'none';
+    if (sameFile) { _closeFileMenu(); return; }
+    _closeFileMenu();
+
+    const name = displayName || _baseName(absPath);
+    const entryKind = kind === 'dir' ? 'dir' : 'file';
+    const targetCid = options.cid || _cid;
+    const projectScoped = _isProjectConversation(targetCid);
+    const revealLabel = _label('conversation_info.file_reveal_action', 'Show in folder');
+    const addLabel = _label('conversation_info.file_add_to_chat_action', 'Add to chat');
+    const addLibraryLabel = _label('conversation_info.file_add_to_library_action', 'Add to Library');
+    const saveAppLabel = _label('apps.save_from_file_action', 'Save as app');
+    const deleteLabel = _label('common.delete', 'Delete');
+    let canSaveApp = false, saveTarget = null;
+    try {
+      const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _fileActionPayload(absPath, targetCid));
+      saveTarget = inspected?.target;
+      canSaveApp = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
+    } catch (_) { canSaveApp = false; }
+    const addItem = entryKind === 'file' && _canAddEntryToChat(name || absPath)
+      ? `<div class="ctx-row-menu-item" data-action="add-to-chat">${escapeHtml(addLabel)}</div>`
+      : '';
+    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(name || absPath, projectScoped)
+      ? `<div class="ctx-row-menu-item" data-action="add-to-library">${escapeHtml(addLibraryLabel)}</div>`
+      : '';
+    const saveAppItem = canSaveApp
+      ? `<div class="ctx-row-menu-item" data-action="save-as-app">${escapeHtml(saveTarget ? _label('apps.update_original', 'Update original app') : saveAppLabel)}</div>${saveTarget ? `<div class="ctx-row-menu-item" data-action="save-new-app">${escapeHtml(_label('apps.save_new', 'Save new app'))}</div>` : ''}`
+      : '';
+    menu.innerHTML = `
+      <div class="ctx-row-menu-item" data-action="reveal">${escapeHtml(revealLabel)}</div>
+      ${saveAppItem}
+      ${addLibraryItem}
+      ${addItem}
+      <div class="ctx-row-menu-item is-danger" data-action="delete">${escapeHtml(deleteLabel)}</div>
+    `;
+    menu.dataset.filePath = absPath;
+    menu.dataset.fileName = name;
+    menu.dataset.entryKind = entryKind;
+    const row = anchorBtn.closest('.conversation-info-file, .conversation-info-dir-summary, .chat-msg-produced-item');
+    if (row) row.classList.add('is-menu-open');
+    _fileMenuAnchor = anchorBtn;
+    if (typeof anchorBtn.setAttribute === 'function') {
+      anchorBtn.setAttribute('aria-expanded', 'true');
+    }
+    _positionFileMenu(menu, anchorBtn);
+    _fileMenuScrollHost = anchorBtn.closest('.chat-msg-produced, .chat-history, .skills-chat-messages, .agents-chat-messages');
+    if (_fileMenuScrollHost && _fileMenuScrollHost.addEventListener) {
+      _fileMenuScrollHost.addEventListener('scroll', _closeFileMenu, { passive: true });
+    }
+
+    menu.querySelectorAll('.ctx-row-menu-item').forEach((item) => {
+      item.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const action = item.dataset.action || '';
+        _closeFileMenu();
+        await _runFileMenuAction(action, absPath, name, entryKind, {
+          cid: targetCid,
+          onDeleted: typeof options.onDeleted === 'function' ? options.onDeleted : null,
+        });
+      });
+    });
+    document.addEventListener('mousedown', _onFileMenuOutside, true);
+    document.addEventListener('keydown', _onFileMenuKeyDown, true);
+    window.addEventListener('resize', _closeFileMenu);
+  }
+
+  async function _revealEntry(absPath, cidOverride) {
+    try {
+      const res = await window.orkas.invoke('workspace.revealPath', _fileActionPayload(absPath, cidOverride));
+      // Host reasons can carry local paths or internal errors; show only localized recovery copy.
+      if (!res || !res.ok) await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not open the folder. The file may have been moved or deleted.'));
+    } catch (_) {
+      await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not open the folder. The file may have been moved or deleted.'));
+    }
+  }
+
+  async function _addEntryToChat(absPath, kind, cidOverride) {
+    const targetCid = cidOverride || _cid;
+    if (!targetCid) return;
+    const entries = _attachmentEntriesForPath(absPath, kind);
+    if (!entries.length) {
+      await uiAlert(_label('conversation_info.dir_add_empty', 'No files in this folder can be added'));
+      return;
+    }
+    if (typeof window.addChatAttachmentsFromPaths === 'function') {
+      await window.addChatAttachmentsFromPaths(targetCid, entries);
+      return;
+    }
+    await _fallbackImportAttachments(entries, targetCid);
+  }
+
+  async function _addEntryToLibrary(absPath, cidOverride) {
+    const targetCid = cidOverride || _cid;
+    if (!_canAddEntryToLibrary(absPath, _isProjectConversation(targetCid))) return;
+
+    let res;
+    try {
+      res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
+    } catch (err) {
+      _logLibraryImportFailure(_libraryImportFailure(err, 'ipc'));
+      await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
+        reason: String(err && err.message || err),
+      }));
+      return;
+    }
+    if (!res || !res.ok) {
+      _logLibraryImportFailure(_libraryImportFailure(res, 'operation'));
+      await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
+        reason: String((res && res.error) || 'failed'),
+      }));
+      return;
+    }
+
+
+    try {
+      const libraryLabel = res.scope === 'project'
+        ? _label('contexts.transfer.project_library', 'Project Library')
+        : _label('contexts.transfer.global_library', 'Global Library');
+      const message = _label('conversation_info.file_add_to_library_done', 'Added to {library}', {
+        library: libraryLabel,
+      });
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
+      else if (typeof uiAlert === 'function') await uiAlert(message);
+      if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
+        loadContexts();
+      }
+      if (res.scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
+        loadProjectDetail(res.projectId).catch(() => {});
+      }
+    } catch (_) {
+      _infoLog.warn('conversation info library import presentation failed', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }
+
+  async function _saveEntryAsApp(absPath, cidOverride, resourceKind = 'file', mode = 'auto') {
+    let res;
+    try {
+      res = await window.OrkasAppSave.save('savedApps.saveFromPath', {..._fileActionPayload(absPath, cidOverride), ...(mode === 'new' ? {mode} : {})}, _label);
+      if (res?.canceled) {
+        return;
+      }
+    } catch (err) {
+      _logSavedAppSaveFailure(_savedAppSaveFailure(err, 'ipc'));
+      try {
+        await uiAlert(_label('apps.save_failed', 'Could not save the app'));
+      } catch (_) {
+        _infoLog.warn('conversation info app save presentation failed', {
+          error_type: 'presentation',
+          error_code: 'file_viewer_presentation_failed',
+        });
+      }
+      return;
+    }
+    if (!res || res.ok === false) {
+      _logSavedAppSaveFailure(_savedAppSaveFailure(res, 'operation'));
+      try {
+        const message = res?.error === 'app_bundle_root'
+          ? _label('apps.save_root_folder_required', 'Move the HTML and its resources into a separate folder, then save as an app again.')
+          : _label('apps.save_failed', 'Could not save the app');
+        await uiAlert(message);
+      } catch (_) {
+        _infoLog.warn('conversation info app save presentation failed', {
+          error_type: 'presentation',
+          error_code: 'file_viewer_presentation_failed',
+        });
+      }
+      return;
+    }
+
+
+    try {
+      const message = _label('apps.saved_toast', 'Saved to Apps');
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
+      else if (typeof uiAlert === 'function') await uiAlert(message);
+      if (typeof loadSavedApps === 'function') loadSavedApps(true);
+    } catch (_) {
+      _infoLog.warn('conversation info app save presentation failed', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }
+
+  async function _deleteEntry(absPath, displayName, kind, options = {}) {
+    const name = displayName || _baseName(absPath);
+    const isDir = kind === 'dir';
+    const confirmTitle = isDir
+      ? _label('conversation_info.dir_delete_confirm_title', 'Delete folder')
+      : _label('conversation_info.file_delete_confirm_title', 'Delete file');
+    const confirmMessage = isDir
+      ? _label('conversation_info.dir_delete_confirm_msg', 'Delete folder "{name}" and everything inside it?', { name })
+      : _label('conversation_info.file_delete_confirm_msg', 'Delete "{name}"?', { name });
+    const dangerLabel = _label('common.delete', 'Delete');
+    const ok = typeof uiConfirmDanger === 'function'
+      ? await uiConfirmDanger({ title: confirmTitle, message: confirmMessage, dangerLabel })
+      : await uiConfirm(confirmMessage);
+    if (!ok) return;
+
+    try {
+      const res = await window.orkas.invoke('workspace.deletePath', _fileActionPayload(absPath, options.cid));
+      if (!res || !res.ok) {
+        await uiAlert(_label(isDir ? 'conversation_info.dir_delete_failed' : 'conversation_info.file_delete_failed', 'Could not delete: {reason}', {
+          reason: (res && res.error) || 'failed',
+        }));
+        return;
+      }
+      const deletedPath = _normalizePath(res.path || absPath);
+      _locallyDeletedPaths.add(deletedPath);
+      _snapshot = {
+        ..._snapshot,
+        files: (_snapshot.files || []).filter((item) => !_pathIsSameOrInside(deletedPath, item && item.path)),
+      };
+      _renderBody();
+      if (_cid) refresh(_cid, { silent: true });
+      if (typeof options.onDeleted === 'function') options.onDeleted(deletedPath);
+    } catch (err) {
+      await uiAlert(_label(isDir ? 'conversation_info.dir_delete_failed' : 'conversation_info.file_delete_failed', 'Could not delete: {reason}', {
+        reason: String(err && err.message || err),
+      }));
+    }
+  }
+
+  async function _runFileMenuAction(action, absPath, displayName, kind, options = {}) {
+    if (action === 'reveal') return _revealEntry(absPath, options.cid);
+    if (action === 'save-new-app') return _saveEntryAsApp(absPath, options.cid, kind, 'new');
+    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid, kind);
+    if (action === 'add-to-library') return _addEntryToLibrary(absPath, options.cid);
+    if (action === 'add-to-chat') return _addEntryToChat(absPath, kind, options.cid);
+    if (action === 'delete') return _deleteEntry(absPath, displayName, kind, options);
+  }
+
+  async function _openAttachment(name) {
+    if (!_cid || !name || typeof openChatFileViewer !== 'function') return;
+    try {
+      const res = await window.orkas.invoke('attachments.absPath', { cid: _cid, name });
+      if (!res || !res.ok || !res.path) {
+        _infoLog.warn('attachment preview resolve failed', { cid: _cid, name, error: res && res.error });
+        const message = _label('chat.file_missing_toast', 'The file no longer exists.', { name });
+        if (typeof uiToast === 'function') uiToast(message, { variant: 'warning' });
+        else if (typeof uiAlert === 'function') await uiAlert(message);
+        return;
+      }
+      openChatFileViewer(res.path, name, { cid: _cid });
+    } catch (err) {
+      _infoLog.warn('attachment preview threw', { cid: _cid, name, error: String(err && err.message || err) });
+      const message = _label('chat.file_missing_toast', 'The file no longer exists.', { name });
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'warning' });
+      else if (typeof uiAlert === 'function') await uiAlert(message);
+    }
+  }
+
+  function _bindPanelResize() {
+    _panelResize = window.TaskSidePanel?.bind('conversation-info-panel', 'conversation-info-resize',
+      (resizing) => window.WebAssist?.setResizing(resizing));
+  }
+
+  function _bindDom() {
+    const toggle = document.getElementById('conversation-info-toggle');
+    const close = document.getElementById('conversation-info-close');
+    const body = document.getElementById('conversation-info-body');
+    _bindPanelResize();
+    if (toggle && toggle.dataset.bound !== '1') {
+      toggle.dataset.bound = '1';
+      toggle.addEventListener('click', () => _setOpen(!_open));
+    }
+    if (close && close.dataset.bound !== '1') {
+      close.dataset.bound = '1';
+      close.addEventListener('click', () => _setOpen(false));
+    }
+    document.querySelectorAll('.conversation-info-tab').forEach((tab) => {
+      if (tab.dataset.bound === '1') return;
+      tab.dataset.bound = '1';
+      tab.addEventListener('click', () => {
+        _activeTab = tab.dataset.infoTab || 'files';
+        _syncChrome();
+        _renderBody();
+      });
+    });
+    if (body && body.dataset.bound !== '1') {
+      body.dataset.bound = '1';
+      body.addEventListener('click', (ev) => {
+        const ciAttach = ev.target.closest('.ci-attach-row[data-attachment-name]');
+        if (ciAttach) {
+          ev.preventDefault();
+          _openAttachment(ciAttach.dataset.attachmentName || '');
+          return;
+        }
+        const menuBtn = ev.target.closest('.conversation-info-file-menu-btn[data-entry-path]');
+        if (menuBtn) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          _openFileMenu(
+            menuBtn,
+            menuBtn.dataset.entryPath || '',
+            menuBtn.dataset.entryName || '',
+            menuBtn.dataset.entryKind || 'file',
+          );
+          return;
+        }
+        const artifact = ev.target.closest('.conversation-info-artifact[data-artifact-id]');
+        if (artifact) {
+          ev.preventDefault();
+          _openArtifact(artifact.dataset.artifactId || '');
+          return;
+        }
+        const file = ev.target.closest('.conversation-info-file[data-file-path]');
+        if (file) {
+          ev.preventDefault();
+          _openFile(file.dataset.filePath || '');
+          return;
+        }
+        const attachment = ev.target.closest('.conversation-info-attachment[data-attachment-name]');
+        if (attachment) {
+          ev.preventDefault();
+          _openAttachment(attachment.dataset.attachmentName || '');
+        }
+      });
+      body.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        const artifact = ev.target.closest('.conversation-info-artifact[data-artifact-id]');
+        if (artifact) {
+          ev.preventDefault();
+          _openArtifact(artifact.dataset.artifactId || '');
+          return;
+        }
+        const file = ev.target.closest('.conversation-info-file[data-file-path]');
+        if (!file || ev.target.closest('.conversation-info-file-menu-btn')) return;
+        ev.preventDefault();
+        _openFile(file.dataset.filePath || '');
+      });
+      body.addEventListener('dragstart', (ev) => {
+        const file = ev.target.closest('.conversation-info-file[data-file-path]');
+        if (!file || !ev.dataTransfer) return;
+        const path = file.dataset.filePath || '';
+        if (!path) return;
+        const name = (file.querySelector('.conversation-info-file-name')?.textContent || _baseName(path)).trim();
+        try {
+          ev.dataTransfer.effectAllowed = 'copy';
+          ev.dataTransfer.setData('application/x-orkas-file', JSON.stringify({ path, name }));
+          ev.dataTransfer.setData('text/plain', path);
+        } catch (_) { /* best-effort */ }
+      });
+      body.addEventListener('scroll', _closeFileMenu);
+    }
+    _syncChrome();
+    _renderBody();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _bindDom, { once: true });
+  } else {
+    _bindDom();
+  }
+  window.addEventListener('i18n-change', () => {
+    _syncChrome();
+    _renderBody();
+  });
+
+  // External callers (chat header "详情" button, i18n-change listeners) read
+  // open/close/toggle via this surface. Keeping the imperative variant +
+  // `openAndSetTab(tab)` shorthand instead of exposing _setOpen +
+  // _setActiveTab separately keeps the contract narrow.
+  function open()  { _setOpen(true); }
+  function close() { _setOpen(false); }
+  function toggle() { _setOpen(!_open); }
+  function openAndSetTab(tab, ownerCid) {
+    // Automatic reveals belong to their originating task, including while
+    // navigation and the details binding are temporarily out of sync.
+    if (ownerCid !== undefined && (!ownerCid || ownerCid !== _cid
+        || typeof currentView !== 'string' || currentView !== 'conversation'
+        || typeof currentCid !== 'string' || currentCid !== ownerCid)) return false;
+    _activeTab = tab || 'files';
+    _setOpen(true);
+    _syncChrome();
+    _renderBody();
+    return true;
+  }
+  function closeBrowserForTask(ownerCid) {
+    if (!ownerCid) return false;
+    if (ownerCid !== _cid) {
+      const saved = _panelStateByCid.get(ownerCid);
+      if (!saved?.open || saved.tab !== 'browser') return false;
+      _panelStateByCid.set(ownerCid, { ...saved, open: false });
+      return true;
+    }
+    // Model page closure must preserve the user's Files/Attachments selection.
+    if (!_open || _activeTab !== 'browser') return false;
+    _setOpen(false);
+    return true;
+  }
+  function openFileMenu(anchorBtn, absPath, displayName, options = {}) {
+    return _openFileMenu(anchorBtn, absPath, displayName, 'file', options);
+  }
+
+  return {
+    bind,
+    unbind,
+    refresh,
+    refreshFiles,
+    refreshAttachments,
+    open,
+    close,
+    toggle,
+    openAndSetTab,
+    closeBrowserForTask,
+    openFileMenu,
+  };
+})();
+
+window.ConversationInfo = ConversationInfo;

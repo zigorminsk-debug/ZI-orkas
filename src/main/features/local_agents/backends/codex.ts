@@ -1,0 +1,1742 @@
+/**
+ * Codex CLI backend — talks the `codex app-server --listen stdio://`
+ * JSON-RPC 2.0 protocol. Modelled after multica's `codex.go`, distilled
+ * to what we need for one-shot agent dispatch:
+ *
+ *  1. Spawn `codex app-server --listen stdio://`.
+ *  2. RPC `initialize` (clientInfo + experimentalApi capability).
+ *  3. Notify `initialized`.
+ *  4. RPC `thread/start` (or `thread/resume` if we have a prior thread)
+ *     → `result.threadId`.
+ *  5. RPC `turn/start` with `{threadId, input:[{type:"text", text:prompt}]}`.
+ *  6. Listen for notifications until the turn ends:
+ *     - `codex/event` (params is an event object with `type`):
+ *         task_started / agent_message / exec_command_begin/end /
+ *         patch_apply_begin/end / task_complete / turn_aborted
+ *     - `turn/started` / `turn/completed` (top-level v2 lifecycle)
+ *     - `error` (top-level transport error; non-retry → terminal)
+ *  7. Close stdin → codex exits cleanly.
+ *
+ * Notifications carry `threadId`; codex multiplexes subagent threads
+ * (memory consolidation, etc.) on the same stdio pipe. We filter to
+ * our own threadId to avoid surfacing unrelated chatter.
+ *
+ * Resume: when `opts.resumeSessionId` is set, we attempt
+ * `thread/resume` first; on any failure we fall back to a fresh
+ * `thread/start` so the user's task still runs (matching multica).
+ */
+
+import { t } from '../../../i18n.js';
+import { CODEX_NATIVE_MODEL_MINIMUMS, codexNativeModelMinimum, compatibleCodexDefault } from '../compatibility.js';
+import { cliVersionAtLeast } from '../version.js';
+import { createLogger } from '../../../logger.js';
+import { logErrorSummary } from '../../../util/log-redact.js';
+import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
+import {
+  type LocalBackend,
+  type LocalActiveRunIngress,
+  type LocalActiveRunInput,
+  type BackendRunOptions,
+  type LocalEvent,
+  type LocalCliPermissionDecision,
+  StderrTail,
+  spawnCli,
+  reapCliAfterProtocolTerminal,
+  armKillWatchdog,
+  LineSplitter,
+  stripAnsi,
+} from './base.js';
+import {
+  normalizeLocalTextPhase,
+  type LocalTextPhase,
+} from '../text-phase.js';
+
+/** codex notifications that are pure metadata noise — we keep them
+ *  visible only at level=debug. Everything outside this list AND
+ *  outside the structured handlers above falls through to a level=info
+ *  log event so users see what the binary is up to. usage notifications
+ *  are intentionally OUT of this list because step 6 promotes them to
+ *  a structured `status:'usage'` event with live counters. */
+const CODEX_DROP_TO_DEBUG = new Set<string>([
+  'thread/started',
+  'account/rateLimits/updated',
+  'mcpServer/startupStatus/updated',
+]);
+
+/** Notifications that must not cross into the process rail or persisted
+ * history. Host metadata may contain machine-private identifiers. Streaming
+ * command/file/reasoning deltas can arrive once per progress character, such
+ * as unittest's "." output, so forwarding them as unknown info logs creates
+ * hundreds of noisy rows. Command deltas and raw reasoning text are consumed
+ * separately as content-free liveness below. Model-authored reasoning summaries
+ * use their own bounded public event path; the remaining notifications drop. */
+const CODEX_IGNORED_NOTIFICATIONS = new Set<string>([
+  'remoteControl/status/changed',
+  'item/commandExecution/outputDelta',
+  'item/fileChange/outputDelta',
+  'item/fileChange/patchUpdated',
+  'item/plan/delta',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/summaryPartAdded',
+  'item/reasoning/textDelta',
+]);
+
+const log = createLogger('local-agents:codex');
+
+/** Keep a quiet-but-active Codex item below the runner's 90s idle-warning
+ * window without putting every token or stdout byte into history. Heartbeats
+ * carry no reasoning/command content and are excluded from persisted chat
+ * process items by the group-chat bridge. */
+export const CODEX_ACTIVITY_HEARTBEAT_MS = 30_000;
+
+interface CodexReasoningState {
+  itemSummary: string;
+  streamedSummary: string;
+  partSummaries: string[];
+  rawChars: number;
+}
+
+function codexReasoningSummaryText(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map(part => codexReasoningSummaryText(part))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (value && typeof value === 'object') {
+    const part = value as Record<string, unknown>;
+    if (typeof part.text === 'string') return part.text.trim();
+  }
+  return '';
+}
+
+export class CodexActivityHeartbeat {
+  private readonly reasoning = new Set<string>();
+  private readonly commands = new Set<string>();
+
+  startReasoning(itemId: string): boolean {
+    if (!itemId || this.reasoning.has(itemId)) return false;
+    this.reasoning.add(itemId);
+    return true;
+  }
+
+  startCommand(itemId: string): boolean {
+    if (!itemId || this.commands.has(itemId)) return false;
+    this.commands.add(itemId);
+    return true;
+  }
+
+  complete(itemId: string): void {
+    if (!itemId) return;
+    this.reasoning.delete(itemId);
+    this.commands.delete(itemId);
+  }
+
+  pulseEvents(): LocalEvent[] {
+    return [
+      ...Array.from(this.reasoning, itemId => ({
+        type: 'thinking' as const,
+        chars: 0,
+        itemId,
+        heartbeat: true,
+        synthetic: true,
+      })),
+      ...Array.from(this.commands, callId => ({
+        type: 'status' as const,
+        status: 'tool-progress',
+        tool: 'exec_command',
+        callId,
+        heartbeat: true,
+        synthetic: true,
+      })),
+    ];
+  }
+}
+
+/** Tracks the phase and streamed body of Codex `agentMessage` items. Delta
+ * notifications carry only itemId + text, while the phase lives on the
+ * matching item/started or item/completed payload. Keeping this as a small
+ * pure accumulator makes version-skew fallbacks deterministic and testable. */
+export class CodexAgentMessageAccumulator {
+  private readonly phases = new Map<string, LocalTextPhase>();
+  private readonly asyncItems = new Set<string>();
+  private readonly deliveredAsyncItems = new Set<string>();
+  private readonly streamedByItem = new Map<string, string>();
+  private readonly chunks: Array<{ text: string; itemId: string; phase?: LocalTextPhase }> = [];
+
+  rememberItem(raw: unknown): void {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage') return;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    const phase = normalizeLocalTextPhase(item.phase);
+    if (itemId && phase) this.phases.set(itemId, phase);
+    if (itemId && item.delivery === 'async') this.asyncItems.add(itemId);
+  }
+
+  appendDelta(raw: unknown): { text: string; itemId?: string; phase?: LocalTextPhase } | null {
+    const params = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    const text = typeof params.delta === 'string' ? params.delta : '';
+    if (!text) return null;
+    const itemId = typeof params.itemId === 'string' ? params.itemId : '';
+    if (this.asyncItems.has(itemId)) return null;
+    return this.append(text, itemId, normalizeLocalTextPhase(params.phase) || this.phases.get(itemId));
+  }
+
+  appendCompletedFallback(raw: unknown): { text: string; itemId?: string; phase?: LocalTextPhase } | null {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage') return null;
+    this.rememberItem(item);
+    if (item.delivery === 'async' || this.asyncItems.has(String(item.id || ''))) return null;
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (!text) return null;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    const streamed = itemId ? (this.streamedByItem.get(itemId) || '') : '';
+    if (streamed === text) return null;
+    // Some Codex builds omit the last delta but include the complete item on
+    // completion. Emit only the missing suffix. If the bodies disagree, keep
+    // the live stream authoritative rather than duplicating the whole item.
+    if (streamed && !text.startsWith(streamed)) return null;
+    const suffix = streamed ? text.slice(streamed.length) : text;
+    const phase = this.phases.get(itemId) || normalizeLocalTextPhase(item.phase);
+    return suffix ? this.append(suffix, itemId, phase) : null;
+  }
+
+  output(): string {
+    const chunks = this.chunks.filter(chunk => !this.asyncItems.has(chunk.itemId));
+    return chunks.filter(chunk => chunk.phase === 'final_answer').map(chunk => chunk.text).join('')
+      || chunks.map(chunk => chunk.text).join('');
+  }
+
+  hasText(): boolean {
+    return this.chunks.some(chunk => !this.asyncItems.has(chunk.itemId) && !!chunk.text);
+  }
+
+  completedAsyncMessage(raw: unknown): LocalEvent | null {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage' || item.delivery !== 'async') return null;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    if (!itemId || this.deliveredAsyncItems.has(itemId)) return null;
+    this.rememberItem(item);
+    const questions = (Array.isArray(item.questions) ? item.questions : [])
+      .filter((q): q is { title: string; options?: unknown } => !!q && typeof q.title === 'string' && !!q.title.trim())
+      .map(q => ({
+        title: q.title,
+        ...(Array.isArray(q.options) ? { options: q.options.filter((v): v is string => typeof v === 'string' && !!v.trim()) } : {}),
+      }));
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (!text && !questions.length) return null;
+    this.deliveredAsyncItems.add(itemId);
+    return { type: 'async-message', itemId, text, questions };
+  }
+
+  private append(
+    text: string,
+    itemId: string,
+    phase?: LocalTextPhase,
+  ): { text: string; itemId?: string; phase?: LocalTextPhase } {
+    this.chunks.push({ text, itemId, phase });
+    if (itemId) this.streamedByItem.set(itemId, (this.streamedByItem.get(itemId) || '') + text);
+    return {
+      text,
+      ...(itemId ? { itemId } : {}),
+      ...(phase ? { phase } : {}),
+    };
+  }
+}
+
+/** Translate Codex item variants that represent observable work into the
+ * common tool lifecycle. Agent text/reasoning and command/file items retain
+ * their dedicated handlers; this covers MCP, dynamic tools, collaboration,
+ * background agents, search/media work, sleeps and context compaction. */
+export function mapCodexItemToolEvent(
+  raw: unknown,
+  phase: 'use' | 'result',
+): LocalEvent | null {
+  const item = raw && typeof raw === 'object' ? raw as Record<string, any> : {};
+  const type = String(item.type || '');
+  const callId = String(item.id || '');
+  let tool = '';
+  let input: unknown;
+  let output: unknown;
+
+  switch (type) {
+    case 'mcpToolCall':
+      tool = [String(item.server || 'mcp'), String(item.tool || 'tool')].join('.');
+      input = item.arguments ?? {};
+      output = item.error ?? item.result ?? item.status ?? '';
+      break;
+    case 'dynamicToolCall':
+      tool = [item.namespace, item.tool].filter(Boolean).map(String).join('.') || 'dynamic_tool';
+      input = item.arguments ?? {};
+      output = item.contentItems ?? item.success ?? item.status ?? '';
+      break;
+    case 'collabAgentToolCall':
+      tool = `collaboration:${String(item.tool || 'agent')}`;
+      input = {
+        receiverCount: Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.length : 0,
+        ...(typeof item.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}),
+      };
+      output = item.agentsStates ?? item.status ?? '';
+      break;
+    case 'subAgentActivity':
+      tool = 'background_agent';
+      input = { kind: item.kind || 'started' };
+      output = item.kind || '';
+      break;
+    case 'webSearch':
+      tool = 'web_search';
+      input = { query: String(item.query || '') };
+      output = item.results ?? item.action ?? '';
+      break;
+    case 'imageView':
+      tool = 'view_image';
+      input = { path: String(item.path || '') };
+      output = item.status ?? '';
+      break;
+    case 'imageGeneration':
+      tool = 'image_generation';
+      input = item.prompt ? { prompt: String(item.prompt) } : {};
+      output = item.result ?? item.status ?? '';
+      break;
+    case 'sleep':
+      tool = 'background_wait';
+      input = { durationMs: Number(item.durationMs) || 0 };
+      output = item.status ?? '';
+      break;
+    case 'contextCompaction':
+      tool = 'context_compaction';
+      input = {};
+      output = item.status ?? '';
+      break;
+    default:
+      return null;
+  }
+
+  return {
+    type: 'tool-event',
+    tool,
+    callId,
+    phase,
+    ...(phase === 'use' ? { input } : { output }),
+  };
+}
+
+/** Control-call boundary for the app-server bootstrap (initialize, thread
+ *  start/resume, turn/start). Tests shorten it through the environment. */
+const CODEX_BOOTSTRAP_TIMEOUT_MS = 60_000;
+function codexBootstrapTimeoutMs(): number {
+  const override = Number(process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CODEX_BOOTSTRAP_TIMEOUT_MS;
+}
+
+export const codexBackend: LocalBackend = {
+  async run(opts: BackendRunOptions): Promise<void> {
+    const args = buildCodexArgs(opts);
+    // The bridge env (token/socket file path) reaches the MCP child through
+    // `-c mcp_servers.orkas.env.*` (buildCodexBridgeOverrides); Codex itself,
+    // and every shell it runs, must not inherit those handles.
+    const child = spawnCli(opts.binPath, args, opts.cwd);
+    const detachAbort = () => opts.signal.removeEventListener('abort', cancelAndReap);
+    const tail = new StderrTail();
+    const startedAt = Date.now();
+
+    let exited = false;
+    let cancellationRequested = false;
+    let interruptCleanup: ReturnType<typeof setTimeout> | undefined;
+    let bootstrapTimer: NodeJS.Timeout | null = null;
+    let resolveOuter!: () => void;
+    const outerPromise = new Promise<void>(resolve => { resolveOuter = resolve; });
+
+    opts.onEvent({
+      type: 'process-info',
+      pid: child.pid ?? -1,
+      cwd: opts.cwd,
+      cmd: opts.binPath,
+      args,
+    });
+
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      deadlineAt: opts.deadlineAt,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+      terminate: () => cancelAndReap(),
+    });
+
+    // ─── JSON-RPC client state ────────────────────────────────────────
+    let nextRpcId = 1;
+    const pending = new Map<number, { method: string; resolve: (r: any) => void; reject: (e: Error) => void }>();
+    const userInputRequests = new Map<string | number, AbortController>();
+    const inputCancellations = new Map<string | number, CliInputCancellation>();
+    // `allow_run` is host-owned and must not become a durable CLI grant, so an
+    // approved MCP tool is remembered for this run only. Without it a turn that
+    // calls the same bridge tool repeatedly re-prompts on every call.
+    const mcpToolRunGrants = new Set<string>();
+    let threadId: string | undefined;
+    let activeTurnId: string | undefined;
+    let turnStartSent = false;
+    let turnStarted = false;
+    let turnAborted = false;
+    let turnCompleted = false;
+    let turnFailed = false;
+    let retryAttempt = 0;
+    const seenTurnIds = new Set<string>();
+    const agentMessages = new CodexAgentMessageAccumulator();
+    const activity = new CodexActivityHeartbeat();
+    const reasoningByItem = new Map<string, CodexReasoningState>();
+    let turnError: string | undefined;
+    let systemErrorTimer: ReturnType<typeof setTimeout> | null = null;
+    let systemErrorPending = false;
+    // Latest usage snapshot from `thread/tokenUsage/updated` —
+    // each notification is a cumulative state (not an increment),
+    // so we just overwrite. Threaded into the done event below.
+    let lastUsage: Record<string, number | string> | undefined;
+
+    const activityTimer = setInterval(() => {
+      if (exited) return;
+      for (const event of activity.pulseEvents()) opts.onEvent(event);
+    }, CODEX_ACTIVITY_HEARTBEAT_MS);
+    if (typeof activityTimer.unref === 'function') activityTimer.unref();
+
+    const sendLine = (msg: object) => {
+      try { child.stdin.write(JSON.stringify(msg) + '\n'); }
+      catch (err) { log.warn('codex stdin write failed', { error: logErrorSummary(err) }); }
+    };
+
+    const rpc = (method: string, params: Record<string, unknown>): Promise<any> =>
+      new Promise<any>((resolve, reject) => {
+        if (exited) { reject(new Error('codex shutting down')); return; }
+        const id = nextRpcId++;
+        pending.set(id, { method, resolve, reject });
+        sendLine({ jsonrpc: '2.0', id, method, params });
+      });
+
+    function reapAfterInterrupt() {
+      if (interruptCleanup) clearTimeout(interruptCleanup);
+      interruptCleanup = undefined;
+      reapCliAfterProtocolTerminal(child);
+    }
+
+    function cancelAndReap() {
+      if (cancellationRequested) return;
+      cancellationRequested = true;
+      // turn/interrupt is part of the verified v2 floor (0.145.0), with
+      // threadId + turnId. Let the native tool host close before discovering
+      // and forcing leftover descendants; otherwise Code Mode reports an
+      // unexpected stdout closure while Orkas is cancelling normally.
+      if (!exited && threadId && activeTurnId) {
+        interruptCleanup = setTimeout(reapAfterInterrupt, 500);
+        interruptCleanup.unref?.();
+        void rpc('turn/interrupt', { threadId, turnId: activeTurnId }).catch(() => {
+          if (!exited) log.warn('codex native interruption failed; forcing process cleanup');
+        });
+      } else reapAfterInterrupt();
+    }
+    child.once('close', () => {
+      if (interruptCleanup) clearTimeout(interruptCleanup);
+      interruptCleanup = undefined;
+    });
+
+    const notify = (method: string, params?: Record<string, unknown>) => {
+      sendLine({ jsonrpc: '2.0', method, ...(params ? { params } : {}) });
+    };
+
+    const respondToServerRequest = async (env: any): Promise<void> => {
+      const method = String(env?.method || '');
+      if (!CODEX_PERMISSION_REQUEST_METHODS.has(method)) return;
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let permissionDecision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      if (!fullAccess && opts.requestPermission) {
+        try {
+          permissionDecision = await opts.requestPermission({
+            id: String(params.approvalId || params.itemId || env.id || ''),
+            tool: method.includes('commandExecution')
+              ? 'command'
+              : method.includes('fileChange') ? 'file_change' : 'permissions',
+            description: typeof params.reason === 'string' ? params.reason : undefined,
+            command: typeof params.command === 'string' ? params.command : undefined,
+            subject: typeof params.grantRoot === 'string'
+              ? params.grantRoot
+              : typeof params.cwd === 'string' ? params.cwd : undefined,
+          });
+        } catch (err) {
+          log.warn('codex host permission request failed; denying', { error: logErrorSummary(err) });
+        }
+      }
+      let result: Record<string, unknown>;
+      if (method === 'item/permissions/requestApproval') {
+        result = permissionDecision === 'deny'
+          ? { permissions: {}, scope: 'turn' }
+          : {
+            permissions: params.permissions && typeof params.permissions === 'object'
+              ? params.permissions
+              : {},
+            scope: 'turn',
+          };
+      } else {
+        result = {
+          decision: permissionDecision === 'deny'
+            ? 'decline'
+            : 'accept',
+        };
+      }
+      sendLine({ jsonrpc: '2.0', id: env.id, result });
+      opts.onEvent({
+        type: 'permission-request',
+        id: String(params.approvalId || params.itemId || env.id || ''),
+        tool: method,
+        ...(fullAccess
+          ? { autoDecided: 'allow', reason: 'full_access' }
+          : { decision: permissionDecision === 'deny' ? 'deny' : 'allow', reason: 'user' }),
+      });
+    };
+
+    const respondToMcpElicitation = async (env: any): Promise<void> => {
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const meta = params._meta && typeof params._meta === 'object' ? params._meta : {};
+      const serverName = typeof params.serverName === 'string' ? params.serverName : '';
+      const message = typeof params.message === 'string' ? params.message : '';
+      const reply = (result: Record<string, unknown>) => sendLine({ jsonrpc: '2.0', id: env.id, result });
+      // A server collecting form input has no Orkas surface. Decline inside
+      // the protocol so Codex degrades cleanly rather than logging a client
+      // error, and keep the permission path for tool approval only.
+      if (meta.codex_approval_kind !== CODEX_MCP_TOOL_APPROVAL_KIND) {
+        reply({ action: 'decline' });
+        return;
+      }
+      let argumentPreview = '';
+      if (meta.tool_params && typeof meta.tool_params === 'object') {
+        try {
+          const serialized = JSON.stringify(meta.tool_params);
+          if (serialized && serialized !== '{}') argumentPreview = serialized;
+        } catch { /* unserializable arguments are simply not previewed */ }
+      }
+      const grantKey = `${serverName} ${message}`;
+      const fullAccess = opts.permissionPolicy === 'full_access';
+      let decision: LocalCliPermissionDecision = fullAccess ? 'allow_once' : 'deny';
+      let autoReason = fullAccess ? 'full_access' : '';
+      if (!fullAccess && mcpToolRunGrants.has(grantKey)) {
+        decision = 'allow_run';
+        autoReason = 'allow_run';
+      } else if (!fullAccess && opts.requestPermission) {
+        try {
+          decision = await opts.requestPermission({
+            id: String(env.id ?? ''),
+            tool: 'mcp_tool',
+            description: message || `Run an MCP tool from "${serverName}"?`,
+            ...(argumentPreview ? { command: argumentPreview } : {}),
+            ...(serverName ? { subject: serverName } : {}),
+          });
+        } catch (err) {
+          log.warn('codex MCP elicitation permission request failed; declining', {
+            error: logErrorSummary(err),
+          });
+          decision = 'deny';
+        }
+      }
+      if (decision === 'allow_run') mcpToolRunGrants.add(grantKey);
+      reply(decision === 'deny' ? { action: 'decline' } : { action: 'accept', content: {} });
+      opts.onEvent({
+        type: 'permission-request',
+        id: String(env.id ?? ''),
+        tool: CODEX_MCP_ELICITATION_METHOD,
+        ...(autoReason
+          ? { autoDecided: decision === 'deny' ? 'deny' : 'allow', reason: autoReason }
+          : { decision: decision === 'deny' ? 'deny' : 'allow', reason: 'user' }),
+      });
+    };
+
+    const respondToUserInputRequest = async (env: any, signal: AbortSignal): Promise<void> => {
+      const params = env?.params && typeof env.params === 'object' ? env.params : {};
+      const questions = (Array.isArray(params.questions) ? params.questions : [])
+        .map((question: any) => ({
+          id: typeof question?.id === 'string' ? question.id : '',
+          header: typeof question?.header === 'string' ? question.header : undefined,
+          question: typeof question?.question === 'string' ? question.question : '',
+          options: (Array.isArray(question?.options) ? question.options : [])
+            .map((option: any) => ({
+              label: typeof option?.label === 'string' ? option.label : '',
+              description: typeof option?.description === 'string' ? option.description : undefined,
+            })),
+          isOther: question?.isOther === true,
+          isSecret: question?.isSecret === true,
+        }))
+        .filter((question: { id: string; question: string }) => question.id && question.question);
+      const cancellation = new CliInputCancellation(signal, () => new Promise<void>((resolve, reject) => {
+        if (exited || signal.aborted || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new CliInputNotSentError('codex input request is no longer writable'));
+          return;
+        }
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: env.id, result: { answers: {} } }) + '\n',
+          (error?: Error | null) => error ? reject(error) : resolve());
+      }));
+      inputCancellations.set(env.id, cancellation);
+      const response = opts.requestUserInput
+        ? await opts.requestUserInput({
+            id: typeof params.itemId === 'string' ? params.itemId : String(env.id),
+            signal,
+            cancel: cancellation.cancel,
+            questions,
+            ...(typeof params.isBlocking === 'boolean' ? { isBlocking: params.isBlocking } : {}),
+            ...(Number.isFinite(params.autoResolutionMs)
+              ? { autoResolutionMs: Number(params.autoResolutionMs) }
+              : {}),
+          })
+        : {
+            cancelled: true,
+            answers: Object.fromEntries(questions.map((question: { id: string }) => [question.id, []])),
+          };
+      if (signal.aborted || cancellation.mayHaveSent) return;
+      const answers = Object.fromEntries(questions.map((question: { id: string }) => [
+        question.id,
+        {
+          answers: Array.isArray(response.answers?.[question.id])
+            ? response.answers[question.id].map(String)
+            : [],
+        },
+      ]));
+      sendLine({ jsonrpc: '2.0', id: env.id, result: { answers } });
+    };
+
+    const publishActiveIngress = (turnId: string | null): void => {
+      activeTurnId = turnId || undefined;
+      if (!turnId || !threadId || exited || turnCompleted) {
+        try { opts.onActiveRunIngress?.(null); } catch { /* host already gone */ }
+        return;
+      }
+      const ingressThreadId = threadId;
+      const ingressTurnId = turnId;
+      const ingress: LocalActiveRunIngress = {
+        submit: async (input: LocalActiveRunInput) => {
+          if (
+            exited
+            || turnCompleted
+            || threadId !== ingressThreadId
+            || activeTurnId !== ingressTurnId
+          ) {
+            return { mode: 'queued_followup', reason: 'codex turn is no longer active' };
+          }
+          const richInput: Array<Record<string, unknown>> = [];
+          const text = String(input.text || '').trim();
+          if (text) richInput.push({ type: 'text', text });
+          for (const image of input.localImages || []) {
+            const imagePath = String(image?.path || '').trim();
+            if (imagePath) richInput.push({ type: 'localImage', path: imagePath });
+          }
+          if (!richInput.length) {
+            return { mode: 'rejected', reason: 'empty active-turn input' };
+          }
+          try {
+            const result = await rpc('turn/steer', {
+              threadId: ingressThreadId,
+              expectedTurnId: ingressTurnId,
+              clientUserMessageId: input.id,
+              input: richInput,
+            });
+            const acceptedTurnId = typeof result?.turnId === 'string' ? result.turnId : '';
+            if (acceptedTurnId !== ingressTurnId) {
+              return {
+                mode: 'queued_followup',
+                reason: acceptedTurnId
+                  ? 'codex acknowledged a different active turn'
+                  : 'codex did not acknowledge the active turn',
+              };
+            }
+            return { mode: 'steered', acceptedId: input.id };
+          } catch (err) {
+            // ActiveTurnNotSteerable, a completed/mismatched expectedTurnId,
+            // transport shutdown and version-skew all degrade to the durable
+            // worker FIFO. Never acknowledge a message on an uncertain RPC.
+            return {
+              mode: 'queued_followup',
+              reason: (err as Error).message || String(err),
+            };
+          }
+        },
+      };
+      try { opts.onActiveRunIngress?.(ingress); } catch { /* host already gone */ }
+    };
+
+    const closePending = (err: Error) => {
+      for (const controller of userInputRequests.values()) controller.abort();
+      userInputRequests.clear();
+      inputCancellations.clear();
+      for (const { reject } of pending.values()) reject(err);
+      pending.clear();
+    };
+
+    // ─── stdout JSON-RPC framing ─────────────────────────────────────
+    const splitter = new LineSplitter();
+    const stdoutLine = (line: string): void => {
+      if (exited) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let env: any;
+      try { env = JSON.parse(trimmed); }
+      catch {
+        // codex stdout is supposed to be pure JSON-RPC; a non-JSON
+        // line here means the binary logged something directly to
+        // stdout (rare, but diagnostic-worthy when it happens — we
+        // were swallowing these before).
+        if (!exited) opts.onEvent({ type: 'raw-line', line: trimmed });
+        return;
+      }
+      // Response (matches a pending request by id).
+      if (env && typeof env.id === 'number' && pending.has(env.id)) {
+        const p = pending.get(env.id)!;
+        pending.delete(env.id);
+        if (env.error) {
+          p.reject(new Error(`${p.method}: ${env.error.message || 'rpc error'} (code=${env.error.code ?? 0})`));
+        } else {
+          p.resolve(env.result);
+        }
+        return;
+      }
+      // App-server callbacks (method + id) are requests, not notifications,
+      // and every one must receive a JSON-RPC response. Silently treating a
+      // request added by a newer CLI as a notification leaves that CLI
+      // waiting forever. Known permission methods use the host bridge;
+      // unknown methods fail fast and let the runner quarantine/fallback.
+      if (env && env.id !== undefined && typeof env.method === 'string') {
+        if (CODEX_PERMISSION_REQUEST_METHODS.has(env.method)) {
+          void respondToServerRequest(env).catch((err) => {
+            log.warn('codex permission response failed', { error: logErrorSummary(err) });
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32603, message: 'Permission request could not be completed.' },
+            });
+          });
+        } else if (env.method === CODEX_USER_INPUT_REQUEST_METHOD) {
+          const controller = new AbortController();
+          userInputRequests.set(env.id, controller);
+          void respondToUserInputRequest(env, controller.signal).catch((err) => {
+            if (controller.signal.aborted) return;
+            log.warn('codex user-input response failed', { error: logErrorSummary(err) });
+            sendLine({
+              jsonrpc: '2.0',
+              id: env.id,
+              error: { code: -32603, message: 'User input request could not be completed.' },
+            });
+          }).finally(() => {
+            if (userInputRequests.get(env.id) === controller) userInputRequests.delete(env.id);
+            inputCancellations.delete(env.id);
+          });
+        } else if (env.method === CODEX_MCP_ELICITATION_METHOD) {
+          void respondToMcpElicitation(env).catch((err) => {
+            log.warn('codex MCP elicitation response failed', { error: logErrorSummary(err) });
+            // Stay inside the elicitation contract. A JSON-RPC error here is
+            // exactly what made Codex report a rejection the user never made.
+            sendLine({ jsonrpc: '2.0', id: env.id, result: { action: 'decline' } });
+          });
+        } else if (CODEX_OPTIONAL_SERVER_REQUEST_METHODS.has(env.method)) {
+          // These callbacks require an explicit client capability or a
+          // feature Orkas did not register (dynamic tools, openai forms,
+          // auth/attestation). Reply immediately so Codex can degrade; an
+          // absent optional integration must not wedge or kill the turn.
+          sendLine({
+            jsonrpc: '2.0',
+            id: env.id,
+            error: { code: -32601, message: 'Optional Codex callback is not supported by Orkas.' },
+          });
+        } else {
+          sendLine({
+            jsonrpc: '2.0',
+            id: env.id,
+            error: { code: -32601, message: 'Unsupported Codex app-server request.' },
+          });
+          failProtocol(`unsupported Codex app-server request: ${env.method}`);
+        }
+        return;
+      }
+      // Notification (no id, has method).
+      if (env && typeof env.method === 'string') {
+        handleNotification(env.method, env.params || {});
+      }
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => splitter.push(chunk, stdoutLine));
+    child.stdout.on('end', () => splitter.flush(stdoutLine));
+
+    const stderrLines = new LineSplitter(64 * 1024);
+    const stderrLine = (raw: string) => {
+      const line = stripAnsi(raw);
+      if (line) opts.onEvent({ type: 'stderr-line', line });
+    };
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      if (exited) return;
+      tail.push(stripAnsi(chunk));
+      stderrLines.push(chunk, stderrLine);
+    });
+
+    function emitTextDelta(chunk: { text: string; itemId?: string; phase?: LocalTextPhase } | null) {
+      if (!chunk?.text) return;
+      opts.onEvent({ type: 'text-delta', ...chunk });
+    }
+
+    function reasoningState(itemId: string): CodexReasoningState {
+      let state = reasoningByItem.get(itemId);
+      if (!state) {
+        state = { itemSummary: '', streamedSummary: '', partSummaries: [], rawChars: 0 };
+        reasoningByItem.set(itemId, state);
+      }
+      return state;
+    }
+
+    function currentReasoningSummary(state: CodexReasoningState): string {
+      return state.itemSummary || state.streamedSummary || state.partSummaries.join('\n').trim();
+    }
+
+    function emitReasoningActivity(itemId: string, state: CodexReasoningState): void {
+      const summary = currentReasoningSummary(state);
+      opts.onEvent({
+        type: 'thinking',
+        chars: summary.length || state.rawChars,
+        itemId,
+        heartbeat: true,
+        ...(summary ? { summary } : {}),
+      });
+    }
+
+    function completeReasoning(itemId: string, rawItem: unknown): void {
+      const item = rawItem && typeof rawItem === 'object'
+        ? rawItem as Record<string, unknown>
+        : {};
+      const state = reasoningState(itemId);
+      const completedSummary = codexReasoningSummaryText(item.summary);
+      if (completedSummary) state.itemSummary = completedSummary;
+      if (typeof item.text === 'string') state.rawChars = Math.max(state.rawChars, item.text.length);
+      const summary = currentReasoningSummary(state);
+      opts.onEvent({
+        type: 'thinking',
+        chars: summary.length || state.rawChars,
+        itemId,
+        ...(summary ? { summary } : {}),
+      });
+      reasoningByItem.delete(itemId);
+    }
+
+    // Codex 0.125+ uses fine-grained notifications:
+    //   thread/started, thread/status/changed, thread/tokenUsage/updated
+    //   turn/started, turn/completed
+    //   item/started, item/completed (with item.type: userMessage,
+    //     agentMessage, agentReasoning, commandExecution, ...)
+    //   item/agentMessage/delta (params.delta is the streamed text chunk)
+    //   account/rateLimits/updated, mcpServer/startupStatus/updated (noise)
+    // Older codex (per multica) used `codex/event` notifications wrapping
+    // events with type:task_started/agent_message/etc — we keep a
+    // best-effort handler for that shape too in case older codex builds
+    // are encountered.
+    function handleNotification(method: string, params: Record<string, any>) {
+      if (exited) return;
+      const eventThreadId = typeof params.threadId === 'string' ? params.threadId : '';
+      if (threadId && eventThreadId && eventThreadId !== threadId) return;
+      if (method === 'serverRequest/resolved') {
+        if (!threadId || eventThreadId !== threadId) return;
+        inputCancellations.get(params.requestId)?.confirm();
+        userInputRequests.get(params.requestId)?.abort();
+        userInputRequests.delete(params.requestId);
+        return;
+      }
+
+      // Newer Codex builds stream public reasoning summaries separately from
+      // raw reasoning text. Summary pulses may update the live activity label,
+      // but only the completed aggregate becomes a persisted process row.
+      if (method === 'item/reasoning/summaryTextDelta') {
+        const itemId = String(params.itemId || 'reasoning');
+        activity.startReasoning(itemId);
+        const state = reasoningState(itemId);
+        if (typeof params.delta === 'string') state.streamedSummary += params.delta;
+        emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/reasoning/summaryPartAdded') {
+        const itemId = String(params.itemId || 'reasoning');
+        activity.startReasoning(itemId);
+        const state = reasoningState(itemId);
+        const part = codexReasoningSummaryText(params.part);
+        if (part && !state.partSummaries.includes(part)) state.partSummaries.push(part);
+        emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/reasoning/textDelta') {
+        const itemId = String(params.itemId || 'reasoning');
+        const state = reasoningState(itemId);
+        if (typeof params.delta === 'string') state.rawChars += params.delta.length;
+        opts.onActivity?.();
+        if (activity.startReasoning(itemId)) emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/commandExecution/outputDelta') {
+        const itemId = String(params.itemId || 'command');
+        opts.onActivity?.();
+        if (activity.startCommand(itemId)) {
+          opts.onEvent({
+            type: 'status',
+            status: 'tool-progress',
+            tool: 'exec_command',
+            callId: itemId,
+            heartbeat: true,
+          });
+        }
+        return;
+      }
+      if (CODEX_IGNORED_NOTIFICATIONS.has(method)) return;
+
+      // ── Streaming agent text (the important one) ─────────────────
+      if (method === 'item/agentMessage/delta') {
+        emitTextDelta(agentMessages.appendDelta(params));
+        return;
+      }
+
+      // ── Lifecycle ────────────────────────────────────────────────
+      if (method === 'turn/started') {
+        turnStarted = true;
+        const startedTurnId = typeof params?.turn?.id === 'string'
+          ? params.turn.id
+          : (typeof params?.turnId === 'string' ? params.turnId : '');
+        if (startedTurnId) publishActiveIngress(startedTurnId);
+        opts.onEvent({ type: 'status', status: 'running' });
+        return;
+      }
+      if (method === 'turn/completed') {
+        const turn = params?.turn || {};
+        const turnId: string = typeof turn?.id === 'string' ? turn.id : '';
+        const status: string = typeof turn?.status === 'string' ? turn.status : '';
+        if (status === 'inProgress') return;
+        if (turnId && seenTurnIds.has(turnId)) return;
+        if (turnId) seenTurnIds.add(turnId);
+        if (status === 'failed') {
+          turnFailed = true;
+          const message = turn?.error?.message && String(turn.error.message).trim();
+          if (message) turnError = message;
+        }
+        const aborted = status === 'cancelled' || status === 'canceled'
+                     || status === 'aborted' || status === 'interrupted';
+        finishTurn(aborted);
+        return;
+      }
+
+      // ── item/* — surface tool-equivalent events; fallback final text ──
+      if (method === 'item/started') {
+        const item = params.item || {};
+        const itemId = String(item.id || '');
+        agentMessages.rememberItem(item);
+        if (item.type === 'commandExecution') {
+          activity.startCommand(itemId);
+          opts.onEvent({
+            type: 'tool-event',
+            tool: 'exec_command',
+            callId: itemId,
+            phase: 'use',
+            input: { command: item.command || item.script || '' },
+          });
+        } else if (item.type === 'fileChange' || item.type === 'patchApply') {
+          opts.onEvent({
+            type: 'tool-event',
+            tool: 'patch_apply',
+            callId: String(item.id || ''),
+            phase: 'use',
+          });
+        } else if (item.type === 'agentReasoning' || item.type === 'reasoning') {
+          // Older Codex builds place a user-facing summary on item/started.
+          // Raw item.text remains private and contributes only a character
+          // count. The completed event below publishes one durable row.
+          const reasoningId = itemId || 'reasoning';
+          const state = reasoningState(reasoningId);
+          const summary = codexReasoningSummaryText(item.summary);
+          if (summary) state.itemSummary = summary;
+          if (typeof item.text === 'string') state.rawChars = Math.max(state.rawChars, item.text.length);
+          activity.startReasoning(reasoningId);
+          emitReasoningActivity(reasoningId, state);
+        } else {
+          const event = mapCodexItemToolEvent(item, 'use');
+          if (event) opts.onEvent(event);
+        }
+        return;
+      }
+      if (method === 'item/completed') {
+        const item = params.item || {};
+        const itemId = String(item.id || '');
+        activity.complete(itemId || (item.type === 'reasoning' || item.type === 'agentReasoning'
+          ? 'reasoning'
+          : (item.type === 'commandExecution' ? 'command' : '')));
+        agentMessages.rememberItem(item);
+        if (item.type === 'commandExecution') {
+          opts.onEvent({
+            type: 'tool-event',
+            tool: 'exec_command',
+            callId: itemId,
+            phase: 'result',
+            output: typeof item.output === 'string' ? item.output : (item.aggregatedOutput ?? ''),
+          });
+        } else if (item.type === 'fileChange' || item.type === 'patchApply') {
+          opts.onEvent({
+            type: 'tool-event',
+            tool: 'patch_apply',
+            callId: String(item.id || ''),
+            phase: 'result',
+          });
+        } else if (item.type === 'agentMessage') {
+          const asyncMessage = agentMessages.completedAsyncMessage(item);
+          if (asyncMessage) opts.onEvent(asyncMessage);
+          else emitTextDelta(agentMessages.appendCompletedFallback(item));
+        } else if (item.type === 'agentReasoning' || item.type === 'reasoning') {
+          completeReasoning(itemId || 'reasoning', item);
+        } else {
+          const event = mapCodexItemToolEvent(item, 'result');
+          if (event) opts.onEvent(event);
+        }
+        return;
+      }
+
+      // ── Top-level error ──────────────────────────────────────────
+      if (method === 'error') {
+        const willRetry = !!params.willRetry;
+        const errMsg = ((params.error?.message && String(params.error.message))
+                    || (typeof params.message === 'string' ? params.message : '')).trim();
+        if (willRetry) {
+          clearSystemErrorFallback();
+          retryAttempt += 1;
+          opts.onEvent({
+            type: 'status',
+            status: 'retrying',
+            attempt: retryAttempt,
+            ...(errMsg ? { message: errMsg } : {}),
+          });
+          return;
+        }
+        turnFailed = true;
+        if (errMsg) turnError = errMsg;
+        finishTurn(false);
+        return;
+      }
+
+      // ── Idle fallback when turn/completed never arrives ─────────
+      if (method === 'thread/status/changed') {
+        const statusType = params?.status?.type;
+        if (statusType === 'idle' && turnStarted && !systemErrorPending) {
+          finishTurn(false);
+        } else if (statusType === 'systemError') {
+          scheduleSystemErrorFallback();
+        } else if (statusType === 'active') {
+          clearSystemErrorFallback();
+          const flags = Array.isArray(params?.status?.activeFlags)
+            ? params.status.activeFlags
+            : [];
+          if (flags.includes('waitingOnApproval')) {
+            opts.onEvent({ type: 'status', status: 'waiting-approval' });
+          } else if (flags.includes('waitingOnUserInput')) {
+            opts.onEvent({ type: 'status', status: 'waiting-input' });
+          }
+        }
+        return;
+      }
+
+      if (method === 'turn/plan/updated') {
+        const plan = Array.isArray(params?.plan) ? params.plan : [];
+        opts.onEvent({
+          type: 'status',
+          status: 'plan-updated',
+          steps: plan.map((step: any) => ({
+            step: String(step?.step || ''),
+            status: String(step?.status || ''),
+          })),
+          ...(typeof params?.explanation === 'string' && params.explanation
+            ? { message: params.explanation }
+            : {}),
+        });
+        return;
+      }
+
+      if (method === 'item/mcpToolCall/progress') {
+        opts.onEvent({
+          type: 'status',
+          status: 'tool-progress',
+          callId: String(params?.itemId || ''),
+          message: String(params?.message || ''),
+        });
+        return;
+      }
+
+      if (method === 'hook/started' || method === 'hook/completed') {
+        const run = params?.run || {};
+        const name = String(run?.eventName || run?.handlerType || 'hook');
+        const completed = method === 'hook/completed';
+        const entries = Array.isArray(run?.entries)
+          ? run.entries.map((entry: any) => String(entry?.text || '')).filter(Boolean).join('\n')
+          : '';
+        opts.onEvent({
+          type: 'tool-event',
+          tool: `hook:${name}`,
+          callId: String(run?.id || ''),
+          phase: completed ? 'result' : 'use',
+          ...(completed
+            ? { output: entries || String(run?.statusMessage || run?.status || '') }
+            : { input: { status: run?.status || 'running' } }),
+        });
+        return;
+      }
+
+      if (method === 'thread/compacted') {
+        opts.onEvent({ type: 'status', status: 'compacted' });
+        return;
+      }
+
+      if (method === 'model/rerouted') {
+        opts.onEvent({
+          type: 'status',
+          status: 'model-rerouted',
+          fromModel: String(params?.fromModel || ''),
+          toModel: String(params?.toModel || ''),
+          reason: String(params?.reason || ''),
+        });
+        return;
+      }
+
+      if (method === 'warning' || method === 'guardianWarning'
+          || method === 'deprecationNotice' || method === 'configWarning') {
+        const message = typeof params?.message === 'string'
+          ? params.message
+          : JSON.stringify(params || {});
+        opts.onEvent({ type: 'log', level: 'warn', message, source: 'codex' });
+        return;
+      }
+
+      if (method === 'thread/closed') {
+        if (turnStarted) finishTurn(false);
+        return;
+      }
+
+      // ── Token-usage streaming pulse ─────────────────────────────
+      // codex 0.125+ emits this notification through a turn whenever
+      // the cumulative token count advances. Strongest 'still alive'
+      // signal short of actual text — surface as a status:'usage'
+      // event the rail can render as a live counter row, and stash
+      // the latest value for the terminal done event.
+      if (method === 'thread/tokenUsage/updated') {
+        const u = extractCodexUsage(params);
+        if (u) {
+          lastUsage = u;
+          opts.onEvent({ type: 'status', status: 'usage', usage: u });
+        }
+        return;
+      }
+
+      if (method === 'turn/diff/updated') {
+        const files = extractCodexDiffFiles(typeof params?.diff === 'string' ? params.diff : '');
+        if (files.length) opts.onEvent({ type: 'file-change', paths: files });
+        opts.onEvent({
+          type: 'log',
+          level: 'debug',
+          message: `turn/diff/updated: ${files.join(', ') || 'diff updated'}`,
+          source: 'codex',
+        });
+        return;
+      }
+
+      // ── Legacy codex/event protocol (older codex builds) ─────────
+      if (method === 'codex/event' || method.startsWith('codex/event/')) {
+        const ev = (params && typeof params === 'object' && typeof params.type === 'string')
+          ? params
+          : (params?.msg && typeof params.msg === 'object' ? params.msg : null);
+        if (ev) handleLegacyCodexEvent(ev);
+        return;
+      }
+
+      // Anything else — surface as a log event. Bucketed noise
+      // (CODEX_DROP_TO_DEBUG) goes at level=debug so it's visible only
+      // with ORKAS_LOG_LEVEL=debug; everything genuinely unknown goes
+      // at level=info so users see what the binary is doing instead
+      // of staring at a quiet rail. Trimmed to keep rail rows short.
+      const lvl: 'debug' | 'info' = CODEX_DROP_TO_DEBUG.has(method) ? 'debug' : 'info';
+      const summary = JSON.stringify(params || {}).slice(0, 200);
+      opts.onEvent({
+        type: 'log',
+        level: lvl,
+        message: `${method}: ${summary}`,
+        source: 'codex',
+      });
+    }
+
+    function handleLegacyCodexEvent(ev: Record<string, any>) {
+      switch (ev.type) {
+        case 'task_started':
+          turnStarted = true;
+          opts.onEvent({ type: 'status', status: 'running' });
+          return;
+        case 'agent_message': {
+          const text = typeof ev.message === 'string' ? ev.message : '';
+          emitTextDelta(agentMessages.appendDelta({ delta: text }));
+          return;
+        }
+        case 'agent_message_delta': {
+          const text = typeof ev.delta === 'string' ? ev.delta
+                     : (typeof ev.message === 'string' ? ev.message : '');
+          emitTextDelta(agentMessages.appendDelta({ delta: text }));
+          return;
+        }
+        case 'exec_command_begin':
+          opts.onEvent({
+            type: 'tool-event', tool: 'exec_command',
+            callId: String(ev.call_id || ev.callId || ''),
+            phase: 'use', input: { command: ev.command },
+          });
+          return;
+        case 'exec_command_end':
+          opts.onEvent({
+            type: 'tool-event', tool: 'exec_command',
+            callId: String(ev.call_id || ev.callId || ''),
+            phase: 'result', output: typeof ev.output === 'string' ? ev.output : '',
+          });
+          return;
+        case 'patch_apply_begin':
+          opts.onEvent({ type: 'tool-event', tool: 'patch_apply', callId: String(ev.call_id || ev.callId || ''), phase: 'use' });
+          return;
+        case 'patch_apply_end':
+          opts.onEvent({ type: 'tool-event', tool: 'patch_apply', callId: String(ev.call_id || ev.callId || ''), phase: 'result' });
+          return;
+        case 'task_complete':
+          finishTurn(false);
+          return;
+        case 'turn_aborted':
+          turnAborted = true;
+          finishTurn(true);
+          return;
+      }
+    }
+
+    function finishTurn(aborted: boolean) {
+      if (turnCompleted) return;
+      turnCompleted = true;
+      publishActiveIngress(null);
+      if (aborted) turnAborted = true;
+      const output = agentMessages.output();
+      if (watchdog.fired() && !opts.signal.aborted) {
+        finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
+      } else if (turnAborted || opts.signal.aborted) {
+        finish('cancelled', { output });
+      } else if (turnFailed) {
+        finish('failed', {
+          ...(turnError ? { error: turnError } : {}),
+          output,
+          stderrTail: tail.toString(),
+        });
+      } else {
+        finish('completed', { output });
+      }
+      // Resolve the run from the authoritative protocol terminal event.
+      // Process reaping is deliberately asynchronous so an inherited pipe or
+      // background terminal cannot leave the conversation spinner running.
+      reapAfterInterrupt();
+    }
+
+    function clearSystemErrorFallback() {
+      systemErrorPending = false;
+      if (systemErrorTimer) clearTimeout(systemErrorTimer);
+      systemErrorTimer = null;
+    }
+
+    function scheduleSystemErrorFallback() {
+      if (systemErrorPending || exited) return;
+      systemErrorPending = true;
+      // Codex may publish systemError immediately before the authoritative
+      // turn/completed payload that carries the real CLI error. Give that
+      // terminal event one short ordering window; if it never arrives, report
+      // failure without inventing a more specific explanation.
+      systemErrorTimer = setTimeout(() => {
+        systemErrorTimer = null;
+        if (exited || !systemErrorPending) return;
+        systemErrorPending = false;
+        finish('failed', { output: agentMessages.output(), stderrTail: tail.toString() });
+        reapCliAfterProtocolTerminal(child);
+      }, 250);
+      if (typeof systemErrorTimer.unref === 'function') systemErrorTimer.unref();
+    }
+
+    function finish(status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) {
+      if (exited) return;
+      publishActiveIngress(null);
+      exited = true;
+      stderrLines.flush(stderrLine);
+      if (bootstrapTimer) clearTimeout(bootstrapTimer);
+      clearSystemErrorFallback();
+      clearInterval(activityTimer);
+      watchdog.disarm();
+      detachAbort();
+      closePending(new Error('codex shutting down'));
+      opts.onEvent({
+        type: 'done', status,
+        durationMs: Date.now() - startedAt,
+        sessionId: threadId,
+        ...(lastUsage ? { usage: lastUsage } : {}),
+        ...extra,
+      });
+      resolveOuter();
+    }
+
+    function failProtocol(error: string, bootstrapTimeout = false) {
+      // A JSON-RPC setup failure resolves before the normal close-driven
+      // lifecycle. Explicitly terminate the detached process group so a CLI
+      // that keeps its event loop alive cannot outlive the failed dispatch.
+      // Use the existing terminal cleanup owner: on Windows EOF must wait
+      // until taskkill has traversed the live parent. POSIX retains the short
+      // escalation. Submission, not a missing acknowledgement, decides replay safety.
+      reapCliAfterProtocolTerminal(child, 250);
+      finish('failed', {
+        error,
+        stderrTail: tail.toString(),
+        failureKind: 'cli_protocol',
+        retrySafe: !turnStartSent && !turnStarted,
+        ...(bootstrapTimeout ? { bootstrapTimeout: true } : {}),
+      });
+    }
+
+    child.on('error', err => {
+      log.warn('codex spawn error', { error: logErrorSummary(err) });
+      finish('failed', {
+        error: (err as Error).message,
+        stderrTail: tail.toString(),
+        failureKind: 'cli_spawn',
+        retrySafe: !turnStartSent && !turnStarted,
+      });
+    });
+    child.on('close', code => {
+      const output = agentMessages.output();
+      if (opts.signal.aborted) return finish('cancelled', { output });
+if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
+      if (turnAborted) return finish('cancelled', { output });
+      if (turnFailed) {
+        return finish('failed', {
+          ...(turnError ? { error: turnError } : {}),
+          output,
+          stderrTail: tail.toString(),
+        });
+      }
+      if (systemErrorPending) return finish('failed', { output, stderrTail: tail.toString() });
+      if (code === 0 && (turnCompleted || agentMessages.hasText())) {
+        return finish('completed', { output });
+      }
+      finish('failed', {
+        error: `codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'),
+        output,
+        stderrTail: tail.toString(),
+        ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: !turnStartSent } : {}),
+      });
+    });
+
+    if (opts.signal.aborted) cancelAndReap();
+    else opts.signal.addEventListener('abort', cancelAndReap, { once: true });
+
+    // ─── Drive the protocol ──────────────────────────────────────────
+    // initialize → thread → turn/start is a control-plane exchange. A binary
+    // that never answers must fail fast and retry-safe (cli_protocol) instead
+    // of burning the 30-minute idle watchdog with a non-retryable timeout
+    // that the candidate-fallback loop never sees.
+    bootstrapTimer = setTimeout(() => {
+      if (exited || turnStarted) return;
+      failProtocol('codex bootstrap timed out before turn/start', true);
+    }, codexBootstrapTimeoutMs());
+    if (typeof bootstrapTimer.unref === 'function') bootstrapTimer.unref();
+    (async () => {
+      try {
+        await rpc('initialize', {
+          clientInfo: { name: 'orkas', title: 'Orkas', version: '0.1.0' },
+          // Named permission profiles (`thread/start.permissions` and the
+          // corresponding resume/turn fields) are capability-gated even
+          // though the surrounding v2 methods are stable. Orkas handles the
+          // callbacks those profiles need; optional callbacks are rejected
+          // explicitly and unknown requests fail fast below.
+          capabilities: { experimentalApi: true },
+        });
+        notify('initialized');
+        const runtimeOptions = { ...opts };
+
+        // Mandatory protocol support does not imply optional catalog support.
+        // Read effective configuration (including custom -c/profile arguments)
+        // before any thread/session/task side effects. API/custom-provider model
+        // ids are owned by that provider and must not be treated as native ids.
+        if (opts.cliVersion && (opts.thinkingLevel || Object.values(CODEX_NATIVE_MODEL_MINIMUMS)
+          .some(minimum => !cliVersionAtLeast(opts.cliVersion, minimum)))) {
+          const configResult = await rpc('config/read', { cwd: opts.cwd, includeLayers: false });
+          const config = configResult?.config || {};
+          const model = opts.modelOverride || config.model;
+          const minimum = codexNativeModelMinimum(model, opts.cliVersion);
+          if ((minimum || opts.thinkingLevel) && (!config.model_provider || config.model_provider === 'openai')) {
+            const accountResult = await rpc('account/read', { refreshToken: false });
+            if (accountResult?.account?.type === 'chatgpt') {
+              const catalog = await rpc('model/list', {});
+              const rows = Array.isArray(catalog?.data) ? catalog.data : [];
+              if (minimum) {
+                const fallback = !opts.modelOverride && compatibleCodexDefault(rows, opts.cliVersion);
+                if (!fallback) {
+                  finish('failed', { failureKind: 'cli_compatibility', retrySafe: false,
+                    cliError: 'model_unsupported', error: t('cli_agent.model_unsupported', { cli: 'Codex', model }) });
+                  reapCliAfterProtocolTerminal(child);
+                  return;
+                }
+                // Inherit an available default for this invocation only. Explicit
+                // model choices and the external CLI's saved config are preserved.
+                runtimeOptions.modelOverride = fallback.model || fallback.id;
+              }
+              const effectiveModel = runtimeOptions.modelOverride || model;
+              const selected = Array.isArray(catalog?.data)
+                ? catalog.data.find((entry: any) => entry?.model === effectiveModel || entry?.id === effectiveModel) : null;
+              const efforts = selected?.supportedReasoningEfforts;
+              if (opts.thinkingLevel && Array.isArray(efforts)
+                && !efforts.some((entry: any) => entry?.reasoningEffort === opts.thinkingLevel)) {
+                runtimeOptions.thinkingLevel = efforts.some((entry: any) => entry?.reasoningEffort === selected.defaultReasoningEffort)
+                  ? selected.defaultReasoningEffort : undefined;
+              }
+            }
+          }
+        }
+
+        const prepared = await startOrResumeThread(runtimeOptions);
+        threadId = prepared.threadId;
+        if (!threadId) {
+          failProtocol('codex thread/start returned no thread id');
+          return;
+        }
+
+        // Once submitted, a lost response cannot prove the task did not run.
+        turnStartSent = true;
+        await rpc('turn/start', {
+          threadId,
+          input: [{
+            type: 'text',
+            text: selectCodexTurnPrompt(opts, prepared.resumed),
+          }],
+          ...buildCodexTurnRuntimeOverrides(runtimeOptions),
+          ...buildCodexTurnPermissionOverrides(opts.cwd, opts.permissionPolicy || 'inherit'),
+        });
+        if (bootstrapTimer) { clearTimeout(bootstrapTimer); bootstrapTimer = null; }
+        // After turn/start succeeds we wait passively — turn end is
+        // driven by `turn/completed` / `task_complete` notifications.
+        // Their protocol terminal immediately resolves outerPromise;
+        // process cleanup continues asynchronously.
+      } catch (err) {
+        const msg = (err as Error).message || String(err);
+        // A terminal process/spawn path closes pending RPCs as part of normal
+        // cleanup. Do not misreport that expected rejection as a second
+        // protocol failure after the authoritative done event was emitted.
+        if (exited) return;
+        log.warn('codex protocol error', { error: logErrorSummary(err) });
+        failProtocol(msg);
+      }
+    })();
+
+    async function startOrResumeThread(
+      o: BackendRunOptions,
+    ): Promise<{ threadId?: string; resumed: boolean }> {
+      if (o.resumeSessionId) {
+        try {
+          const r = await rpc('thread/resume', {
+            threadId: o.resumeSessionId,
+            cwd: o.cwd,
+            ...(o.modelOverride ? { model: o.modelOverride } : {}),
+            ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
+            ...codexThreadDeveloperInstructionParams(o, true),
+          });
+          const tid = extractThreadId(r);
+          if (tid) return { threadId: tid, resumed: true };
+          log.warn('codex thread/resume returned no thread id; falling back to thread/start');
+        } catch (err) {
+          if (exited) throw err;
+          log.warn('codex thread/resume failed; falling back to thread/start', { error: logErrorSummary(err) });
+        }
+      }
+      const r = await rpc('thread/start', {
+        ...(o.modelOverride ? { model: o.modelOverride } : {}),
+        modelProvider: null,
+        profile: null,
+        cwd: o.cwd,
+        ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
+        config: null,
+        baseInstructions: null,
+        ...codexThreadDeveloperInstructionParams(o, false),
+        experimentalRawEvents: false,
+      });
+      return { threadId: extractThreadId(r), resumed: false };
+    }
+
+    return outerPromise;
+  },
+};
+
+/**
+ * orkas-bridge context for codex (plan §D3): the prompt that tells the
+ * agent it runs inside Orkas and which `orkas` MCP tools exist. Passed as
+ * codex's `developerInstructions` — the protocol-level slot for this —
+ * preferred over writing an AGENTS.md into cwd (no file pollution, no
+ * cleanup-on-crash, never clobbers the user's own AGENTS.md). The bridge
+ * config injection (`-c mcp_servers.orkas.*`) already connects the server;
+ * this makes the agent reach for it. Orkas durable CLI instructions share
+ * this native field; null means neither source supplied content. Exported for
+ * tests.
+ */
+export function codexDeveloperInstructions(opts: BackendRunOptions): string | null {
+  const value = [
+    opts.systemPrompt,
+    opts.bridge?.appendSystemPrompt,
+  ].map((part) => String(part || '').trim()).filter(Boolean).join('\n\n');
+  return value || null;
+}
+
+/**
+ * Codex persists developer instructions in its native thread. Once the stored
+ * Orkas hash matches, omit the resume override entirely; `null` would clear it.
+ * A resume fallback still calls thread/start and therefore restores the full
+ * current instruction bundle.
+ */
+export function codexThreadDeveloperInstructionParams(
+  opts: BackendRunOptions,
+  resumed: boolean,
+): { developerInstructions?: string | null } {
+  if (resumed && opts.reuseSessionInstructions) return {};
+  return { developerInstructions: codexDeveloperInstructions(opts) };
+}
+
+/**
+ * A rejected resume must never run a delta-only turn on the replacement
+ * thread. Keep this decision pure so the recovery boundary is deterministic
+ * and independently covered without starting Codex.
+ */
+export function selectCodexTurnPrompt(
+  opts: Pick<BackendRunOptions, 'prompt' | 'resumeSessionId' | 'resumeFallbackPrompt'>,
+  resumed: boolean,
+): string {
+  if (resumed || !opts.resumeSessionId) return opts.prompt;
+  return opts.resumeFallbackPrompt || opts.prompt;
+}
+
+/** Optional per-turn overrides. Omitting keys is significant: Codex then
+ * resolves the account/profile default and keeps existing sessions portable. */
+export function buildCodexTurnRuntimeOverrides(
+  opts: Pick<BackendRunOptions, 'modelOverride' | 'thinkingLevel'>,
+): { model?: string; effort?: string } {
+  return {
+    ...(opts.modelOverride ? { model: opts.modelOverride } : {}),
+    ...(opts.thinkingLevel ? { effort: opts.thinkingLevel } : {}),
+  };
+}
+
+export function buildCodexArgs(opts: BackendRunOptions): string[] {
+  // Per multica: `codex app-server --listen stdio://` is the entry
+  // point for the JSON-RPC protocol. customArgs trail.
+  // Keep Codex's built-in OpenAI provider intact. Current Codex versions
+  // reserve that provider id and reject `model_providers.openai.*` overrides
+  // before JSON-RPC initialization; ChatGPT login also relies on the built-in
+  // provider owning its WebSocket-to-HTTPS fallback. Orkas observes Codex
+  // retry events and applies its process watchdog, but does not select the
+  // provider transport itself.
+  const args = ['app-server', '--listen', 'stdio://'];
+  // orkas-bridge: codex takes config-layer overrides (`-c key=value`,
+  // TOML-parsed) instead of a config file. Codex spawns stdio MCP servers
+  // with a sanitized env (PATH/HOME only) — it does NOT inherit this Codex
+  // process's env — so the non-secret bridge env must be injected via `-c
+  // mcp_servers.orkas.env.*`. The token/socket are NOT here; they live in
+  // the 0600 file that ORKAS_BRIDGE_ENV_FILE points at, so they never hit argv.
+  if (opts.bridge) args.push(...buildCodexBridgeOverrides(opts.bridge.server));
+  if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
+  return args;
+}
+
+/** Secret-bearing bridge env keys that must never be serialized into argv.
+ *  They reach orkas-bridge.cjs through the 0600 file referenced by
+ *  ORKAS_BRIDGE_ENV_FILE, which IS injected (it is just a path). */
+const CODEX_BRIDGE_SECRET_ENV_KEYS = new Set(['ORKAS_BRIDGE_TOKEN', 'ORKAS_BRIDGE_SOCKET']);
+
+/** `-c mcp_servers.orkas.*` override args from the bridge server entry.
+ *  Values are TOML: strings quoted, args as an inline array. The non-secret
+ *  env is injected as `mcp_servers.orkas.env.<KEY>` because Codex spawns MCP
+ *  servers with a sanitized env and does NOT inherit this process's env —
+ *  without it orkas-bridge.cjs exits "env required" and the agent gets no
+ *  orkas_* tools (skills/connectors/KB). Token/socket are filtered out so
+ *  they never land in argv/events.
+ *  Exported for tests. */
+export function buildCodexBridgeOverrides(server: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+  const tomlStr = (s: string) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const argsToml = `[${server.args.map(tomlStr).join(', ')}]`;
+  const overrides = [
+    '-c', `mcp_servers.orkas.command=${tomlStr(server.command)}`,
+    '-c', `mcp_servers.orkas.args=${argsToml}`,
+  ];
+  for (const [key, value] of Object.entries(server.env || {})) {
+    if (value == null || CODEX_BRIDGE_SECRET_ENV_KEYS.has(key)) continue;
+    overrides.push('-c', `mcp_servers.orkas.env.${key}=${tomlStr(value)}`);
+  }
+  return overrides;
+}
+
+const CODEX_PERMISSION_REQUEST_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+]);
+const CODEX_USER_INPUT_REQUEST_METHOD = 'item/tool/requestUserInput';
+/** Codex asks for MCP tool-call approval through MCP elicitation
+ *  (`_meta.codex_approval_kind === 'mcp_tool_call'`), so this callback is a
+ *  permission surface rather than an optional integration. Answering it with
+ *  a JSON-RPC error makes Codex resolve the elicitation as `Decline`, which
+ *  reaches the model as "user rejected MCP tool call" even though the user
+ *  was never asked — every orkas bridge tool would be unusable below
+ *  `full_access`. */
+const CODEX_MCP_ELICITATION_METHOD = 'mcpServer/elicitation/request';
+const CODEX_MCP_TOOL_APPROVAL_KIND = 'mcp_tool_call';
+const CODEX_OPTIONAL_SERVER_REQUEST_METHODS = new Set([
+  'account/chatgptAuthTokens/refresh',
+  'attestation/generate',
+  'currentTime/read',
+  'item/tool/call',
+  'openai/form',
+]);
+
+export function buildCodexThreadPermissionOverrides(
+  policy: NonNullable<BackendRunOptions['permissionPolicy']> = 'inherit',
+): { approvalPolicy?: string; approvalsReviewer?: string; permissions?: string } {
+  if (policy === 'full_access') {
+    return {
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
+    };
+  }
+  if (policy === 'inherit') return {};
+  // Always write the complete approval tuple. Codex persists thread settings;
+  // omitting one field on resume can otherwise retain `never` from an older
+  // trusted task while restoring a restricted sandbox, making escalation
+  // impossible instead of asking Orkas.
+  return {
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    permissions: ':workspace',
+  };
+}
+
+export function buildCodexTurnPermissionOverrides(
+  cwd: string,
+  policy: NonNullable<BackendRunOptions['permissionPolicy']> = 'inherit',
+): {
+  cwd: string;
+  approvalPolicy?: string;
+  approvalsReviewer?: string;
+  permissions?: string;
+} {
+  if (policy === 'full_access') {
+    return {
+      cwd,
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      permissions: ':danger-full-access',
+    };
+  }
+  if (policy === 'inherit') return { cwd };
+  return {
+    cwd,
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    permissions: ':workspace',
+  };
+}
+
+export function extractCodexDiffFiles(diff: string): string[] {
+  if (typeof diff !== 'string' || !diff) return [];
+  const out = new Set<string>();
+  let current = '';
+  let deleted = false;
+  const flush = () => {
+    if (current && !deleted) out.add(current);
+    current = '';
+    deleted = false;
+  };
+  for (const raw of diff.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    const git = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (git) {
+      flush();
+      current = normalizeDiffPath(git[2] || git[1]);
+      continue;
+    }
+    if (/^deleted file mode\b/.test(line) || line === '+++ /dev/null') {
+      deleted = true;
+      continue;
+    }
+    const plus = /^\+\+\+ b\/(.+)$/.exec(line);
+    if (plus) {
+      const p = normalizeDiffPath(plus[1]);
+      if (p) current = p;
+    }
+  }
+  flush();
+  return Array.from(out);
+}
+
+function normalizeDiffPath(raw: string): string {
+  let p = String(raw || '').trim();
+  if (!p || p === '/dev/null') return '';
+  if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+    p = p.slice(1, -1);
+  }
+  return p;
+}
+
+/** Pull the `threadId` out of a `thread/start` or `thread/resume`
+ *  response. Codex puts it at the top level of the result; older
+ *  stubs sometimes wrap it under `thread`. Exposed for unit tests. */
+export function extractThreadId(result: any): string | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+  if (typeof result.threadId === 'string' && result.threadId) return result.threadId;
+  if (result.thread && typeof result.thread.id === 'string' && result.thread.id) return result.thread.id;
+  return undefined;
+}
+
+/** Extract token usage from a `thread/tokenUsage/updated` notification's
+ *  params block. Codex flips between snake_case and camelCase across
+ *  versions and wraps the counters under `usage` / `info.totalTokenUsage`
+ *  / `info.lastTokenUsage`; we accept all observed shapes and produce
+ *  the normalized `{input, output, cacheRead, cacheCreate, model}`
+ *  payload the rest of the system speaks. Returns undefined when no
+ *  recognizable numeric field is present.
+ *
+ *  Exposed for unit testing. */
+export function extractCodexUsage(params: any): undefined | Record<string, number | string> {
+  if (!params || typeof params !== 'object') return undefined;
+  const candidates: any[] = [];
+  if (params.usage) candidates.push(params.usage);
+  if (params.info?.totalTokenUsage) candidates.push(params.info.totalTokenUsage);
+  if (params.info?.lastTokenUsage) candidates.push(params.info.lastTokenUsage);
+  if (params.payload?.info?.totalTokenUsage) candidates.push(params.payload.info.totalTokenUsage);
+  if (params.payload?.info?.lastTokenUsage) candidates.push(params.payload.info.lastTokenUsage);
+  // Bare params block can itself carry the fields when codex inlines them.
+  candidates.push(params);
+
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const input = pickNum(c, ['input_tokens', 'inputTokens']);
+    const output = pickNum(c, ['output_tokens', 'outputTokens']);
+    const cacheRead = pickNum(c, ['cache_read_input_tokens', 'cacheReadInputTokens', 'cached_input_tokens', 'cachedInputTokens']);
+    const cacheCreate = pickNum(c, ['cache_creation_input_tokens', 'cacheCreationInputTokens']);
+    if (input === undefined && output === undefined && cacheRead === undefined && cacheCreate === undefined) continue;
+    const out: Record<string, number | string> = {};
+    if (input !== undefined) out.input = input;
+    if (output !== undefined) out.output = output;
+    if (cacheRead !== undefined) out.cacheRead = cacheRead;
+    if (cacheCreate !== undefined) out.cacheCreate = cacheCreate;
+    const model = params.model || params.info?.model || params.payload?.info?.model || params.payload?.model;
+    if (typeof model === 'string' && model) out.model = model;
+    return out;
+  }
+  return undefined;
+}
+
+function pickNum(o: Record<string, any>, keys: string[]): number | undefined {
+  for (const k of keys) {
+    if (typeof o[k] === 'number' && Number.isFinite(o[k])) return o[k];
+  }
+  return undefined;
+}

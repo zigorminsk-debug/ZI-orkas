@@ -1,0 +1,586 @@
+#!/usr/bin/env node
+/**
+ * Opt-in real local-agent verification.
+ *
+ * It detects every requested CLI using Orkas' production registry, binds a
+ * cached test-managed install when present, installs missing CLIs, then sends
+ * one harmless fixed-output request through the production runner.
+ */
+
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  localAgentLiveUsage,
+  createLiveDeliveryTrace,
+  observeLiveDeliveryEvent,
+  scoreLiveDelivery,
+  liveRuntimeOverrides,
+  createLiveToolTrace,
+  observeLiveToolEvent,
+  createLiveBridgeTrace,
+  observeLiveBridgeCall,
+  ingestLocalAgentLogEvent,
+  createLocalAgentLogCollector,
+  LOCAL_AGENT_ENV_KEYS,
+  localAgentBenchmarkScenariosFor,
+  classifyLiveFailure,
+  ensureRequestedAgents,
+  installerPlan,
+  managedBinaryCandidates,
+  parseLiveArgs,
+  scoreLocalAgentBenchmarkScenario,
+  validateLocalAgentBenchmarkInventory,
+  waitForLiveCliExit,
+} from './local-agent-live-support.mjs';
+import { resolveCliCommand } from '../src/main/features/local_agents/spawn-command.js';
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const pcRoot = path.resolve(scriptDir, '..');
+const installRoot = process.env.ORKAS_LOCAL_AGENT_TEST_INSTALL_ROOT
+  ? path.resolve(process.env.ORKAS_LOCAL_AGENT_TEST_INSTALL_ROOT)
+  : path.join(pcRoot, 'node_modules', '.orkas-local-agent-live');
+
+function printableCommand(command: string, args: string[]): string {
+  return [command, ...args].map(part => /\s/.test(part) ? JSON.stringify(part) : part).join(' ');
+}
+
+async function runProcess(
+  command: string,
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<void> {
+  process.stdout.write(`\n[local-agent-live] $ ${printableCommand(command, args)}\n`);
+  await new Promise<void>((resolve, reject) => {
+    const env = { ...process.env, ...options.env };
+    const launch = resolveCliCommand(command, args, process.platform, env);
+    const child = spawn(launch.command, launch.args, {
+      cwd: pcRoot,
+      env,
+      stdio: 'inherit',
+      windowsHide: true,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
+    });
+    const timeoutMs = options.timeoutMs ?? Number(process.env.ORKAS_LOCAL_AGENT_INSTALL_TIMEOUT_MS || 15 * 60_000);
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+    child.once('error', error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${command} failed (${signal ? `signal ${signal}` : `exit ${code}`})`));
+    });
+  });
+}
+
+function bindManagedBinary(type: string): boolean {
+  for (const candidate of managedBinaryCandidates(type, { platform: process.platform, installRoot })) {
+    try {
+      const stat = fs.statSync(candidate);
+      if (!stat.isFile()) continue;
+      process.env[LOCAL_AGENT_ENV_KEYS[type]] = candidate;
+      if (type === 'hermes') {
+        process.env.HERMES_HOME = path.join(installRoot, 'hermes-home');
+      }
+      return true;
+    } catch {
+      // Try the next known install layout.
+    }
+  }
+  return false;
+}
+
+function applyManagedRuntimeEnv(entry: { type: string; path?: string | null }): void {
+  if (entry.type !== 'hermes' || !entry.path) return;
+  try {
+    const realBinary = fs.realpathSync(entry.path);
+    const managedPrefix = `${fs.realpathSync(installRoot)}${path.sep}`;
+    if (realBinary.startsWith(managedPrefix)) {
+      process.env.HERMES_HOME = path.join(installRoot, 'hermes-home');
+    }
+  } catch {
+    // Detection already validated the executable; leave its normal env alone.
+  }
+}
+
+async function installAgent(type: string): Promise<void> {
+  fs.mkdirSync(installRoot, { recursive: true });
+  if (type === 'hermes') {
+    const repository = path.join(installRoot, 'hermes-home', 'hermes-agent');
+    if (fs.existsSync(repository)) {
+      const validManagedClone = fs.existsSync(path.join(repository, '.git', 'HEAD'))
+        && (fs.existsSync(path.join(repository, 'pyproject.toml'))
+          || fs.existsSync(path.join(repository, 'setup.py')));
+      if (!validManagedClone) {
+        // The official updater treats any existing directory as a Git clone.
+        // Removing an interrupted test-only install prevents `git -C` from
+        // walking upward into the enclosing Orkas repository.
+        fs.rmSync(repository, {
+          recursive: true,
+          force: true,
+          maxRetries: process.platform === 'win32' ? 20 : 0,
+          retryDelay: process.platform === 'win32' ? 100 : 0,
+        });
+      }
+    }
+  }
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), `orkas-${type}-installer-`));
+  try {
+    const plan = installerPlan(type, {
+      platform: process.platform,
+      installRoot,
+      downloadDir,
+    });
+    for (const step of plan) {
+      try {
+        await runProcess(step.command, step.args, { env: step.env });
+      } catch (error) {
+        // OpenCode's Windows postinstall can finish copying a valid platform
+        // executable and then fail while npm removes the staging directory.
+        // Accept that narrow partial-success case; ensureRequestedAgents will
+        // still run the production version probe before considering it ready.
+        if (type === 'opencode' && process.platform === 'win32' && bindManagedBinary(type)) {
+          process.stderr.write(
+            `[local-agent-live] warning: OpenCode installer exited non-zero after producing a managed executable: ${(error as Error).message}\n`,
+          );
+          break;
+        }
+        throw error;
+      }
+    }
+  } finally {
+    fs.rmSync(downloadDir, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: process.platform === 'win32' ? 100 : 0,
+    });
+  }
+  if (!bindManagedBinary(type)) {
+    throw new Error(`${type} installer completed but no managed executable was found under ${installRoot}`);
+  }
+}
+
+type QualityRun = {
+  agent: string;
+  scenario: string;
+  rollout: number;
+  passed: boolean;
+  status: string;
+  wallMs: number;
+  checks: Array<{ name: string; pass: boolean; detail: string }>;
+  outputSha256: string;
+  cliLogAnalysis?: unknown;
+  bridgeEvidence?: unknown;
+  failureKind: string | null;
+};
+
+function outputFingerprint(text: string): string {
+  return text
+    ? createHash('sha256').update(text.replace(/\r\n/g, '\n').trim()).digest('hex')
+    : '';
+}
+
+function scorecardFileTimestamp(iso: string): string {
+  return iso.replace(/[:.]/g, '-');
+}
+
+function listWorkspaceFiles(root: string, relativeDir = ''): string[] {
+  const absoluteDir = path.join(root, relativeDir);
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(absoluteDir, { withFileTypes: true })) {
+    const relativePath = path.join(relativeDir, entry.name);
+    if (entry.isDirectory()) files.push(...listWorkspaceFiles(root, relativePath));
+    else files.push(relativePath.split(path.sep).join('/'));
+  }
+  return files.sort();
+}
+
+async function readLivePersistence(uid: string, runId: string) {
+  const { localAgentRunDir } = await import('../src/main/paths.js');
+  try {
+    const directory = localAgentRunDir(uid, runId);
+    return { meta: JSON.parse(fs.readFileSync(path.join(directory, 'meta.json'), 'utf8')),
+      output: fs.readFileSync(path.join(directory, 'output.txt'), 'utf8') };
+  } catch { return { meta: null, output: null }; }
+}
+
+async function runQualityBenchmark(
+  entries: Array<{ type: string; version?: string | null }>,
+  run: (options: any) => Promise<any>,
+  uid: string,
+  testDataRoot: string,
+  options: { k: number; noSave: boolean; scenarios?: string[] },
+): Promise<void> {
+  const inventoryErrors = validateLocalAgentBenchmarkInventory();
+  if (inventoryErrors.length) {
+    throw new Error(`invalid local-agent benchmark inventory:\n${inventoryErrors.map(error => `- ${error}`).join('\n')}`);
+  }
+  const startedAt = new Date().toISOString();
+  const results: QualityRun[] = [];
+  const [chats, storage, layout, paths, skillRegistry] = await Promise.all([
+    import('../src/main/features/chats.js'),
+    import('../src/main/storage.js'),
+    import('../src/main/util/project-layout.js'),
+    import('../src/main/paths.js'),
+    import('../src/main/model/core-agent/skill-registry.js'),
+  ]);
+
+  for (const entry of entries) {
+    for (const scenario of localAgentBenchmarkScenariosFor(entry.type).filter(item => !options.scenarios || options.scenarios.includes(item.id))) {
+      for (let rollout = 1; rollout <= options.k; rollout += 1) {
+        const cwd = path.join(testDataRoot, 'benchmark', entry.type, scenario.id, `rollout-${rollout}`);
+        fs.mkdirSync(cwd, { recursive: true });
+        for (const [relPath, content] of Object.entries(scenario.seedFiles)) {
+          const absPath = path.join(cwd, relPath);
+          fs.mkdirSync(path.dirname(absPath), { recursive: true });
+          fs.writeFileSync(absPath, String(content), 'utf8');
+        }
+        const bridgeSkills = Object.entries((scenario as any).bridgeSkills || {});
+        for (const [skillId, skillBody] of bridgeSkills) {
+          const skillDir = path.join(paths.userSkillsDir(uid), skillId);
+          fs.mkdirSync(skillDir, { recursive: true });
+          fs.writeFileSync(path.join(skillDir, 'SKILL.md'), String(skillBody), 'utf8');
+        }
+        if (bridgeSkills.length) await skillRegistry.invalidateSkills();
+
+        const cid = `c-bench-${entry.type}-${scenario.id}-${rollout}`;
+        const agentId = `a-bench-${entry.type}`;
+        const currentMessageId = `trigger-${scenario.id}-${rollout}`;
+        let projectId: string | undefined;
+        let taskId: string | undefined;
+        if ((scenario as any).projectTask) {
+          const projects = await import('../src/main/features/projects.js');
+          const tasks = await import('../src/main/features/project_tasks.js');
+          const project = await projects.createProject(uid, `${entry.type} ${rollout} ${scenario.id}`);
+          if (!project.ok) throw new Error('project fixture setup failed');
+          projectId = project.project.project_id;
+          await projects.addAgentBinding(uid, projectId, agentId);
+          const task = await tasks.createTask(uid, projectId, { title: 'Release review', status: (scenario as any).projectTask.initialStatus, origin_cid: cid });
+          if (!task.ok) throw new Error('task fixture setup failed');
+          taskId = task.task.id;
+        }
+        await chats.createConversation(uid, {
+          conversationId: cid,
+          ...(projectId ? { projectId } : {}),
+          title: `Local Agent benchmark: ${scenario.id}`,
+        });
+        const messageFile = layout.conversationMessageFile(uid, cid, projectId);
+        const historyRows = Array.isArray((scenario as any).chatHistory?.messages)
+          ? (scenario as any).chatHistory.messages
+          : [];
+        const baseTime = Date.parse('2033-01-01T00:00:00.000Z');
+        for (const [index, row] of historyRows.entries()) {
+          await storage.appendJsonlAtomic(messageFile, {
+            id: `history-${scenario.id}-${index + 1}`,
+            ts: new Date(baseTime + index * 1_000).toISOString(),
+            from: row.from,
+            to: [...row.to],
+            text: row.text,
+          });
+        }
+        await storage.appendJsonlAtomic(messageFile, {
+          id: currentMessageId,
+          ts: new Date(baseTime + historyRows.length * 1_000).toISOString(),
+          from: 'user',
+          to: [agentId],
+          text: scenario.prompt,
+        });
+
+        const cliLogs = createLocalAgentLogCollector(`${entry.type}/${scenario.id}/${rollout}`);
+        let terminalEvent: any = null;
+        const deliveryTrace = createLiveDeliveryTrace();
+        const toolTrace = createLiveToolTrace();
+        const bridgeTrace = createLiveBridgeTrace();
+        const toolNames: string[] = toolTrace.toolNames;
+        const historyReadModes: string[] = toolTrace.historyReadModes;
+        const handoffWorkspaceSnapshots: Record<string, string | null>[] = [];
+        const observeTool = (event: any) => {
+          if (!event) return;
+          ingestLocalAgentLogEvent(cliLogs, event);
+          if (observeLiveToolEvent(toolTrace, event)
+            && scenario.id === 'local-agent-skill-source-and-install'
+            && /orkas_handoff_to_commander$/i.test(String(event.tool))) {
+            const snapshot: Record<string, string | null> = {};
+            for (const relPath of scenario.observedFiles) {
+              try { snapshot[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
+              catch { snapshot[relPath] = null; }
+            }
+            handoffWorkspaceSnapshots.push(snapshot);
+          }
+        };
+        const t0 = Date.now();
+        const result = await run({
+          uid,
+          cid,
+          agentId,
+          agentName: `Benchmark ${entry.type}`,
+          currentMessageId,
+          cli: entry.type,
+          ...(projectId ? { projectId } : {}),
+          // These isolated fixtures test capability selection, not unattended approval UI.
+          ...(projectId || (scenario as any).permissionPolicy === 'full_access' ? { permissionPolicy: 'full_access' } : {}),
+          ...liveRuntimeOverrides(entry.type),
+          // Some native agents retain a configured workspace independent of
+          // process.cwd(). Supply the isolated fixture location as task data.
+          prompt: `${scenario.prompt}\n\nTask workspace: ${cwd}`,
+          cwd,
+          signal: new AbortController().signal,
+          // OpenClaw has no native tool event rail. Observe the same actual
+          // host calls without adding UI events or changing tool execution.
+          onBridgeCallObserved: (call: any) => {
+            const event = observeLiveBridgeCall(bridgeTrace, call);
+            // Other adapters retain their native event oracle, with host
+            // outcomes saved separately so one call cannot count twice.
+            if (entry.type === 'openclaw') observeTool(event);
+          },
+          onEvent: (event: any) => {
+            observeLiveDeliveryEvent(deliveryTrace, event);
+            if (event?.type === 'done') terminalEvent = event;
+            observeTool(event);
+          },
+        });
+        const files: Record<string, string | null> = {};
+        for (const relPath of scenario.observedFiles) {
+          try { files[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
+          catch { files[relPath] = null; }
+        }
+        let projectTaskState: Record<string, unknown> | undefined;
+        if (projectId && taskId) {
+          const tasks = await import('../src/main/features/project_tasks.js');
+          projectTaskState = { task: await tasks.getTask(uid, projectId, taskId), taskCount: (await tasks.listTasks(uid, projectId)).length, originCid: cid };
+        }
+        const output = String(result.output || '');
+        const checks = scoreLocalAgentBenchmarkScenario(scenario, {
+          status: result.status,
+          projectTaskState,
+          output,
+          files,
+          workspaceFiles: listWorkspaceFiles(cwd),
+          toolNames,
+          historyReadModes,
+          handoffWorkspaceSnapshots,
+          commanderHandoff: result.commanderHandoff || null,
+        });
+        checks.push(...scoreLiveDelivery(entry.type, result, deliveryTrace, await readLivePersistence(uid, result.runId)));
+        const cliLogAnalysis = cliLogs.finish();
+        checks.push({ name: 'tool-trace-bounded', pass: !toolTrace.overflow, detail: 'native tool trace retained within its bounded case budget' });
+        checks.push({ name: 'bridge-trace-bounded', pass: !bridgeTrace.overflow, detail: 'host tool outcomes retained within the bounded case budget' });
+        checks.push({ name: 'cli-log-health', pass: cliLogAnalysis.passed, detail: `coverage=${cliLogAnalysis.analyzedLineCount}/${cliLogAnalysis.capturedLineCount}; warnings=${cliLogAnalysis.levelCounts.warn}; errors=${cliLogAnalysis.levelCounts.error}` });
+        const passed = checks.every(check => check.pass);
+        const failureKind = passed
+          ? null
+          : classifyLiveFailure({
+              ...result,
+              stderrTail: typeof terminalEvent?.stderrTail === 'string' ? terminalEvent.stderrTail : '',
+            });
+        results.push({
+          agent: entry.type,
+          scenario: scenario.id,
+          rollout,
+          passed,
+          status: String(result.status || 'unknown'),
+          wallMs: Date.now() - t0,
+          checks,
+          outputSha256: outputFingerprint(output),
+          cliLogAnalysis,
+          bridgeEvidence: bridgeTrace,
+          failureKind,
+        });
+        const failedChecks = checks.filter(check => !check.pass).map(check => check.name);
+        process.stdout.write(
+          `  ${passed ? '✓' : '✗'} ${entry.type}/${scenario.id} rollout ${rollout}/${options.k}`
+          + `${failedChecks.length ? ` failed=${failedChecks.join(',')}` : ''}\n`,
+        );
+      }
+    }
+  }
+
+  const robustGroups = new Map<string, boolean>();
+  for (const result of results) {
+    const key = `${result.agent}/${result.scenario}`;
+    robustGroups.set(key, (robustGroups.get(key) ?? true) && result.passed);
+  }
+  const passedRollouts = results.filter(result => result.passed).length;
+  const robustPassed = [...robustGroups.values()].filter(Boolean).length;
+  const scorecard = {
+    kind: 'local-agent-quality',
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    k: options.k,
+    environment: {
+      platform: process.platform,
+      arch: process.arch,
+      node: process.version,
+      agents: entries.map(entry => ({ type: entry.type, version: entry.version || null })),
+    },
+    aggregate: {
+      rollouts: results.length,
+      passed: passedRollouts,
+      passRate: results.length ? passedRollouts / results.length : 0,
+      scenarioGroups: robustGroups.size,
+      robustPassed,
+    },
+    results,
+  };
+
+  if (!options.noSave) {
+    const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
+    fs.mkdirSync(resultsDir, { recursive: true });
+    const fileName = `local-agent-quality-${scorecardFileTimestamp(startedAt)}-${process.pid}.json`;
+    const outputPath = path.join(resultsDir, fileName);
+    fs.writeFileSync(outputPath, `${JSON.stringify(scorecard, null, 2)}\n`, 'utf8');
+    process.stdout.write(`[local-agent-benchmark] scorecard: ${path.relative(pcRoot, outputPath)}\n`);
+    process.stdout.write(`report=${path.relative(pcRoot, outputPath)}\n`);
+  } else {
+    process.stdout.write('[local-agent-benchmark] scorecard not saved (--no-save)\n');
+  }
+  process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+  if (passedRollouts !== results.length) {
+    throw new Error(
+      `local-agent quality benchmark failed: ${passedRollouts}/${results.length} rollouts passed,`
+      + ` ${robustPassed}/${robustGroups.size} scenario groups robust`,
+    );
+  }
+}
+
+export async function main(argv = process.argv.slice(2)): Promise<number> {
+  const args = parseLiveArgs(argv);
+  if (args.help) {
+    process.stdout.write(`${localAgentLiveUsage()}\n`);
+    return 0;
+  }
+
+  if (!process.versions.electron) throw new Error('Local Agent live verification requires Electron. Use the npm local-agent entry.');
+  const { probeSqlite } = createRequire(import.meta.url)('./native-dependency-probe.cjs');
+  await probeSqlite(createRequire(import.meta.url));
+  process.stdout.write('[local-agent-live] native database and vector operations verified before model dispatch\n');
+
+  const testDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-local-agent-live-data-'));
+  process.env.ORKAS_WORKSPACE_ROOT = testDataRoot;
+  process.env.ORKAS_LOCAL_AGENT_TIMEOUT_MS ||= '180000';
+  process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS ||= '60000';
+  const dispatchedPids = new Set<number>();
+
+  try {
+    const registry = await import('../src/main/features/local_agents/registry.js');
+    const entries = await ensureRequestedAgents({
+      agents: args.agents,
+      installMissing: args.installMissing,
+      detect: async (type: any) => registry.detectOne(type),
+      bindCached: async (type: string) => bindManagedBinary(type),
+      install: async (type: string) => installAgent(type),
+    });
+
+    process.stdout.write('\n[local-agent-live] prepared:\n');
+    for (const entry of entries) {
+      applyManagedRuntimeEnv(entry);
+      process.stdout.write(`  ✓ ${entry.type} ${entry.version || '(version unknown)'}\n`);
+    }
+    if (args.installOnly) return 0;
+
+    const [{ activateUser }, { run: runAgent }] = await Promise.all([
+      import('../src/main/features/users.js'),
+      import('../src/main/features/local_agents/runner.js'),
+    ]);
+    const run: typeof runAgent = opts => runAgent({ ...opts, onEvent: event => {
+      if (event.type === 'process-info' && Number.isSafeInteger(event.pid) && Number(event.pid) > 0) dispatchedPids.add(Number(event.pid));
+      opts.onEvent(event);
+    } });
+    const uid = 'u-local-agent-live';
+    activateUser(uid);
+    if (args.lifecycle) {
+      const { runLiveLifecycleCanary } = await import('./local-agent-lifecycle.mjs');
+      const scorecard = await runLiveLifecycleCanary(entries, run, uid, testDataRoot, { fault: args.lifecycleFault || 'cancel' });
+      const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
+      if (!args.noSave) {
+        fs.mkdirSync(resultsDir, { recursive: true });
+        const fileName = `local-agent-lifecycle-${scorecardFileTimestamp(scorecard.startedAt)}-${process.pid}.json`;
+        fs.writeFileSync(path.join(resultsDir, fileName), `${JSON.stringify(scorecard, null, 2)}\n`);
+        process.stdout.write(`[local-agent-lifecycle] scorecard: test-results/local-agents/${fileName}\n`);
+        process.stdout.write(`report=test-results/local-agents/${fileName}\n`);
+      }
+      process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+      if (!scorecard.passed) throw new Error('real CLI lifecycle verification failed');
+      return 0;
+    }
+    if (args.benchmark) {
+      process.stdout.write(`\n[local-agent-benchmark] running pass@${args.k}...\n`);
+      await runQualityBenchmark(entries, run, uid, testDataRoot, { k: args.k, noSave: args.noSave, scenarios: args.scenarios });
+      return 0;
+    }
+    const startedAt = new Date().toISOString();
+    const smokeResults: any[] = [];
+    for (const entry of entries) {
+      const cwd = path.join(testDataRoot, `work-${entry.type}`);
+      fs.mkdirSync(cwd, { recursive: true });
+      const trace = createLiveDeliveryTrace();
+      const logs = createModelEvalLogCollector(`${entry.type}/smoke`);
+      let toolEvents = 0;
+      process.stdout.write(`\n[local-agent-live] probing ${entry.type}...\n`);
+      const result = await run({
+        uid, cid: `c-live-${entry.type}`, agentId: `a-live-${entry.type}`,
+        agentName: `Live ${entry.type} probe`, currentMessageId: `trigger-live-${entry.type}`,
+        cli: entry.type, ...liveRuntimeOverrides(entry.type),
+        prompt: 'Do not call tools or access or modify files. Reply with exactly ORKAS_AGENT_OK and nothing else.',
+        cwd, signal: new AbortController().signal,
+        onEvent: (event: any) => {
+          observeLiveDeliveryEvent(trace, event);
+          ingestLocalAgentLogEvent(logs, event);
+          if (event.type === 'tool-event') toolEvents++;
+        },
+      });
+      const cliLogAnalysis = logs.finish();
+      const checks = [
+        ...scoreLiveDelivery(entry.type, result, trace, await readLivePersistence(uid, result.runId)),
+        { name: 'exact-round-trip', pass: result.status === 'completed' && String(result.output || '').trim() === 'ORKAS_AGENT_OK' },
+        { name: 'no-tools', pass: toolEvents === 0 },
+        { name: 'cli-log-health', pass: cliLogAnalysis.passed },
+      ];
+      const passed = checks.every(check => check.pass);
+      smokeResults.push({ agent: entry.type, version: entry.version, status: result.status, passed, checks, cliLogAnalysis });
+      process.stdout.write(`  ${passed ? '✓' : '✗'} ${entry.type}: round-trip ${passed ? 'passed' : 'failed'}${passed ? '' : ` checks=${checks.filter(check => !check.pass).map(check => check.name).join(',')}`}\n`);
+    }
+    const scorecard = { kind: 'local-agent-smoke', startedAt, finishedAt: new Date().toISOString(),
+      passed: smokeResults.every(result => result.passed), results: smokeResults };
+    if (!args.noSave) {
+      const resultsDir = path.join(pcRoot, 'test-results', 'local-agents');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      const name = `local-agent-smoke-${scorecardFileTimestamp(startedAt)}-${process.pid}.json`;
+      fs.writeFileSync(path.join(resultsDir, name), `${JSON.stringify(scorecard, null, 2)}\n`);
+      process.stdout.write(`[local-agent-live] scorecard: test-results/local-agents/${name}\n`);
+      process.stdout.write(`report=test-results/local-agents/${name}\n`);
+    }
+    process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+    if (!scorecard.passed) throw new Error('local-agent live round-trip or delivery/log verification failed');
+    return 0;
+  } finally {
+    await waitForLiveCliExit(dispatchedPids);
+    // A just-exited CLI can keep its working directory briefly open on
+    // Windows. Use Node's bounded rimraf retry instead of turning an otherwise
+    // successful live benchmark into an EBUSY infrastructure failure.
+    fs.rmSync(testDataRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: process.platform === 'win32' ? 100 : 0,
+    });
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().then(code => { process.exitCode = code; }).catch(error => {
+    process.stderr.write(`\n[local-agent-live] ${error instanceof Error ? error.message : 'verification failed'}\n`);
+    process.exitCode = 1;
+  });
+}

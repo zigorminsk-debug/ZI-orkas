@@ -1,0 +1,4901 @@
+const _agentsLog = createLogger('agents');
+
+function _agentManageErrorCode(value, fallback = 'operation_failed') {
+  const message = String((value && value.message) || '').trim();
+  const raw = String((value && (value.code || value.error_code))
+    || (/^[A-Za-z0-9_.:-]{1,64}$/.test(message) ? message : '')).trim();
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : fallback;
+}
+
+let _agentsCache = null;
+// Startup holds a deliberately small identity cache for chat mentions and
+// avatars. The Agents tab upgrades it to the complete listing on first entry.
+let _agentsCacheIsSummary = false;
+let _agentsLoadInFlight = null;
+let _selectedAgent = null; // { id, name, source }
+let _agentEditing = false;
+let _agentFieldSaveTimer = null;
+let _agentSkillNameRows = null;
+let _agentSkillNameLoadInFlight = null;
+let _agentDetailReturnTarget = null; // { view, id? } — page that opened the detail
+const _agentCliRuntimeOptionsCache = new Map();
+const _agentCliRuntimeOptionsInFlight = new Map();
+const _agentCliRuntimeSnapshots = new Map();
+const _COMMANDER_AGENT_ID = 'commander';
+let _commanderAgentMemoryEntries = [];
+let _commanderAgentAvatar = null;
+let _commanderAgentProfile = null;
+let _commanderAgentRuntimeStats = null;
+let _commanderAgentStateInFlight = null;
+
+function _agentUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
+// Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
+// without a round-trip. Server is still authoritative — this is just UX.
+const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
+/** Return only the CLI brand name for the agent card's runtime chip. */
+function _cliBadgeLabel(type) {
+  const key = 'agent.external_badge.' + type;
+  const v = t(key);
+  return (!v || v === key) ? type : v;
+}
+
+function _isReservedAgentName(name) {
+  const key = String(name || '').replace(/\s+/g, '').toLowerCase();
+  return _RESERVED_AGENT_NAMES.has(key);
+}
+
+function _agentSource(source) {
+  return (typeof normalizeCatalogSource === 'function')
+    ? normalizeCatalogSource(source)
+    : String(source || '');
+}
+
+function _isAgentProfileMock() {
+  return false;
+}
+
+function _isAgentPlatformSource(source) {
+  return (typeof isMarketplaceCatalogSource === 'function')
+    ? isMarketplaceCatalogSource(source)
+    : _agentSource(source) === 'marketplace';
+}
+
+function _isExternalCliAgent(agent) {
+  return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
+}
+
+function _agentSupportsMemory(agent) {
+  if (!_isExternalCliAgent(agent)) return true;
+  return agent.runtime.cli === 'claude' || agent.runtime.cli === 'codex';
+}
+
+function _agentCardMetaHtml(a, lang) {
+  if (_isCommanderAgent(a)) {
+    return '';
+  }
+  const parts = [];
+  if (a.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(a.version));
+    parts.push(`<span class="agent-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  const catLabel = _resolveCategoryLabel(a.category, lang);
+  if (catLabel) parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
+  return parts.join('');
+}
+
+function _agentPlatformStatusChipsHtml(a) {
+  return '';
+}
+
+function _agentLabel(key, zh, en, ja) {
+  const raw = t(key);
+  if (raw && raw !== key) return raw;
+  const lang = getLang();
+  if (lang === 'zh') return zh;
+  if (lang === 'ja') return ja || en;
+  return en;
+}
+
+function _isCommanderAgent(agentOrId) {
+  if (!agentOrId) return false;
+  if (typeof agentOrId === 'string') return agentOrId === _COMMANDER_AGENT_ID || agentOrId === '__commander__';
+  return String(agentOrId.agent_id || agentOrId.id || '') === _COMMANDER_AGENT_ID
+    || _agentSource(agentOrId.source) === _COMMANDER_AGENT_ID;
+}
+
+function _commanderLocalizedText(value, fallback = '', opts = {}) {
+  const clean = (text) => {
+    if (opts.preserveNewlines) {
+      return String(text || '')
+        .replace(/\\"/g, '"')
+        .replace(/\\'/g, "'")
+        .replace(/\\{2,}/g, '\\')
+        .replace(/\r\n?/g, '\n')
+        .trim();
+    }
+    return normalizeDisplayText(text);
+  };
+  if (typeof value === 'string') return clean(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
+  const lang = getLang();
+  const direct = clean(value[lang]);
+  if (direct) return direct;
+  return clean(value.zh) || clean(value.en) || clean(value.ja) || fallback;
+}
+
+function _commanderLocalizedList(value) {
+  if (Array.isArray(value)) return value.map(normalizeDisplayText).filter(Boolean);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const lang = getLang();
+  const direct = Array.isArray(value[lang]) ? value[lang] : null;
+  const fallback = direct || (Array.isArray(value.zh) ? value.zh : null) || (Array.isArray(value.en) ? value.en : null) || (Array.isArray(value.ja) ? value.ja : []);
+  return fallback.map(normalizeDisplayText).filter(Boolean);
+}
+
+function _commanderAvatarFallback() {
+  const fallback = (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT)
+    ? COMMANDER_DEFAULT
+    : { icon: 'crown', color: 'gold' };
+  return {
+    icon: fallback.icon || 'crown',
+    color: _commanderAgentAvatar?.color || fallback.color || 'gold',
+  };
+}
+
+async function _refreshCommanderAgentState() {
+  if (_commanderAgentStateInFlight) return _commanderAgentStateInFlight;
+  _commanderAgentStateInFlight = (async () => {
+    if (typeof window === 'undefined' || !window.orkas?.invoke) return;
+    const [memoryRes, avatarRes, profileRes, statsRes] = await Promise.allSettled([
+      window.orkas.invoke('memory.list', { target: 'agent', agentId: _COMMANDER_AGENT_ID }),
+      window.orkas.invoke('prefs.getCommanderAvatar'),
+      window.orkas.invoke('commander.getProfile'),
+      window.orkas.invoke('commander.runtimeStats.get'),
+    ]);
+    if (memoryRes.status === 'fulfilled') {
+      _commanderAgentMemoryEntries = Array.isArray(memoryRes.value?.entries)
+        ? memoryRes.value.entries.map(normalizeDisplayText).filter(Boolean)
+        : [];
+    }
+    if (avatarRes.status === 'fulfilled' && avatarRes.value?.avatar) {
+      const avatar = avatarRes.value.avatar;
+      if (avatar.icon && avatar.color) _commanderAgentAvatar = { icon: avatar.icon, color: avatar.color };
+    }
+    if (profileRes.status === 'fulfilled' && profileRes.value?.profile) {
+      _commanderAgentProfile = profileRes.value.profile;
+    }
+    if (statsRes.status === 'fulfilled') {
+      _commanderAgentRuntimeStats = statsRes.value?.runtime_stats || null;
+    }
+  })().catch((err) => {
+    _agentsLog.warn('load commander agent state failed', err);
+  }).finally(() => {
+    _commanderAgentStateInFlight = null;
+  });
+  return _commanderAgentStateInFlight;
+}
+
+function _buildCommanderAgent() {
+  const avatar = _commanderAvatarFallback();
+  const profile = _commanderAgentProfile || {};
+  const name = _commanderLocalizedText(profile.name, t('chat.recipient_commander'));
+  const description = _commanderLocalizedText(profile.description, '');
+  const workflow = _commanderLocalizedText(profile.workflow, '', { preserveNewlines: true });
+  const knowhow = _commanderLocalizedList(profile.knowhow);
+  const standards = _commanderLocalizedList(profile.standards);
+  return {
+    agent_id: _COMMANDER_AGENT_ID,
+    id: _COMMANDER_AGENT_ID,
+    name,
+    source: _COMMANDER_AGENT_ID,
+    category: 'general',
+    enabled: true,
+    icon: avatar.icon,
+    color: avatar.color,
+    description,
+    workflow,
+    knowhow,
+    standards,
+    profile: {
+      knowhow,
+      standards,
+      memory: _commanderAgentMemoryEntries.map((title) => ({ title })),
+    },
+    skill_list: [],
+    runtime_stats: _commanderAgentRuntimeStats || {},
+  };
+}
+
+function _withCommanderAgent(agents) {
+  const list = Array.isArray(agents) ? agents : [];
+  return [_buildCommanderAgent(), ...list.filter((a) => !_isCommanderAgent(a))];
+}
+
+function _agentProfile(agent) {
+  const p = agent && agent.profile;
+  const profile = p && typeof p === 'object' && !Array.isArray(p) ? { ...p } : {};
+  if (agent && Array.isArray(agent.knowhow) && !Array.isArray(profile.knowhow)) {
+    profile.knowhow = agent.knowhow;
+  }
+  if (agent && Array.isArray(agent.standards) && !Array.isArray(profile.standards)) {
+    profile.standards = agent.standards;
+  }
+  return profile;
+}
+
+function _agentProfileEntries(value) {
+  if (!Array.isArray(value)) return [];
+  const entries = [];
+  for (const item of value) {
+    if (typeof item === 'string' || typeof item === 'number') {
+      const title = normalizeDisplayText(item);
+      if (title) entries.push({ title, description: '', tool: '', source: '', updated_at: '' });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || item.kept === false) continue;
+    const entry = {
+      title: normalizeDisplayText(item.title || item.name || item.t || ''),
+      description: normalizeDisplayText(item.description || item.d || ''),
+      tool: normalizeDisplayText(item.tool || item.skill || ''),
+      source: normalizeDisplayText(item.source || item.from || ''),
+      updated_at: normalizeDisplayText(item.updated_at || item.when || ''),
+    };
+    if (entry.title || entry.description) entries.push(entry);
+  }
+  return entries;
+}
+
+function _agentSummary(agent, lang) {
+  if (_isCommanderAgent(agent)) return normalizeDisplayText(agent && agent.description);
+  return (pickDesc(agent, lang) || '').trim();
+}
+
+function _agentWorkflowSteps(agent) {
+  return [];
+}
+
+function _agentMemoryEntries(agent) {
+  if (!_agentSupportsMemory(agent)) return [];
+  return _agentProfileEntries(_agentProfile(agent).memory);
+}
+
+function _agentKnownSkillRows() {
+  const rows = [];
+  if (Array.isArray(_agentSkillNameRows)) rows.push(..._agentSkillNameRows);
+  if (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache)) rows.push(..._skillsCache);
+  if (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache)) rows.push(..._openSkillsCache);
+  return rows;
+}
+
+function _agentSkillNameForId(skillId) {
+  const id = normalizeDisplayText(skillId);
+  if (!id) return '';
+  const row = _agentKnownSkillRows().find((s) => {
+    if (!s || typeof s !== 'object') return false;
+    return String(s.id || '') === id || String(s.skill_id || '') === id;
+  });
+  const name = normalizeDisplayText(row && (row.name || row.display_name || row.title));
+  return name || id;
+}
+
+function _agentSkillIds(agent) {
+  return Array.isArray(agent && agent.skill_list)
+    ? agent.skill_list.map(normalizeDisplayText).filter(Boolean)
+    : [];
+}
+
+function _maybeLoadAgentSkillNames(ids, agentId, opts = {}) {
+  if (!ids.length || _agentSkillNameRows) return Promise.resolve();
+  if (_agentSkillNameLoadInFlight) return _agentSkillNameLoadInFlight;
+  const hasUnresolved = ids.some((id) => _agentSkillNameForId(id) === id);
+  if (!hasUnresolved || typeof window === 'undefined' || !window.orkas?.invoke) return Promise.resolve();
+  _agentSkillNameLoadInFlight = (async () => {
+    try {
+      const [trustedRes, openRes] = await Promise.allSettled([
+        window.orkas.invoke('skills.list'),
+        window.orkas.invoke('skills.listOpen'),
+      ]);
+      const trusted = trustedRes.status === 'fulfilled' && Array.isArray(trustedRes.value?.skills)
+        ? trustedRes.value.skills
+        : [];
+      const open = openRes.status === 'fulfilled' && openRes.value?.ok && Array.isArray(openRes.value.skills)
+        ? openRes.value.skills
+        : [];
+      _agentSkillNameRows = [...trusted, ...open];
+    } catch (err) {
+      _agentsLog.warn('load skill names for agent detail failed', err);
+      _agentSkillNameRows = [];
+    } finally {
+      _agentSkillNameLoadInFlight = null;
+    }
+    const shouldRefresh = opts.refresh !== false;
+    if (shouldRefresh && !_agentEditing && _selectedAgent?.id === agentId) {
+      selectAgent(agentId).catch(() => { /* best-effort refresh */ });
+    }
+  })();
+  return _agentSkillNameLoadInFlight;
+}
+
+function _agentSkillRefs(agent) {
+  const ids = _agentSkillIds(agent);
+  _maybeLoadAgentSkillNames(ids, agent && agent.agent_id);
+  return ids
+    .map((id) => ({ id, title: _agentSkillNameForId(id) }))
+    .filter((skill) => skill.title);
+}
+
+function _agentRuntimeStats(agent) {
+  const raw = agent && typeof agent === 'object' ? agent.runtime_stats : null;
+  const attempts = Math.max(0, Number(raw && raw.attempts) || 0);
+  const deliveries = Math.max(0, Number(raw && raw.deliveries) || 0);
+  const executionFailures = Math.max(0, Number(raw && raw.execution_failures) || 0);
+  const successes = raw && raw.successes !== undefined
+    ? Math.max(0, Number(raw.successes) || 0)
+    : deliveries;
+  const totalDurationMs = Math.max(0, Number(raw && raw.total_duration_ms) || 0);
+  const successfulDurationMs = Math.max(0, Number(raw && raw.successful_duration_ms) || 0);
+  return {
+    attempts,
+    successes,
+    deliveries,
+    executionFailures,
+    failures: Math.max(0, Number(raw && raw.failures) || 0),
+    errors: Math.max(0, Number(raw && raw.errors) || 0),
+    totalDurationMs,
+    successfulDurationMs,
+    updatedAt: normalizeDisplayText(raw && raw.updated_at),
+  };
+}
+
+async function _refreshAgentRuntimeStatsAfterRun(agentId) {
+  const id = String(agentId || '');
+  if (!id || _isCommanderAgent(id) || _isAgentProfileMock(id) || !window.orkas?.invoke) return;
+  try {
+    await loadAgents(true);
+    if (_selectedAgent?.id === id && !_agentEditing) await selectAgent(id);
+  } catch (err) {
+    _agentsLog.warn('refresh agent runtime stats failed', err);
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('orkas-agent-run-finished', (event) => {
+    const detail = event && event.detail ? event.detail : {};
+    _refreshAgentRuntimeStatsAfterRun(detail.agent_id).catch(() => {});
+  });
+}
+
+function _agentDeliveryCount(agent) {
+  return _agentRuntimeStats(agent).deliveries;
+}
+
+function _agentDeliveryChip(count) {
+  const n = Math.max(0, Number(count) || 0);
+  if (n <= 0) return '';
+  const label = _agentLabel('agents.card_delivery_count', '{n} 交付', '{n} delivered', '{n} 納品');
+  return `<span class="agent-card-chip">${escapeHtml(label.replace('{n}', String(n)))}</span>`;
+}
+
+function _agentRoundedSeconds(ms, count) {
+  const avg = count > 0 ? Math.round(ms / count / 1000) : 0;
+  return ms > 0 && avg === 0 ? 1 : avg;
+}
+
+function _agentExecutionSuccessRate(runtime) {
+  const assessed = runtime.successes + runtime.executionFailures;
+  return assessed > 0 ? Math.round((runtime.successes / assessed) * 100) : 0;
+}
+
+function _agentDetailStats(agent) {
+  const runtime = _agentRuntimeStats(agent);
+  // Success rate measures host-observed execution health. The legacy
+  // `failures` bucket came from model-authored result markers and is excluded;
+  // cancelled and waiting-input runs increment attempts only.
+  const successRate = _agentExecutionSuccessRate(runtime);
+  const avgSource = runtime.deliveries > 0 ? runtime.successfulDurationMs : runtime.totalDurationMs;
+  const avgCount = runtime.deliveries > 0 ? runtime.deliveries : runtime.attempts;
+  const stats = [
+    {
+      key: _agentLabel('agents.stat_delivery_label', '交付', 'Delivered', '納品'),
+      value: String(runtime.deliveries),
+      unit: _agentLabel('agents.stat_delivery_unit', '次', 'times', '回'),
+      kind: 'delivery',
+    },
+    {
+      key: _agentLabel('agents.stat_success_label', '成功率', 'Success rate', '成功率'),
+      value: String(successRate),
+      unit: '%',
+      kind: 'success',
+    },
+    {
+      key: _agentLabel('agents.stat_avg_time_label', '耗时', 'Time', '時間'),
+      value: String(_agentRoundedSeconds(avgSource, avgCount)),
+      unit: _agentLabel('agents.stat_avg_time_unit', '秒', 's', '秒'),
+      kind: 'duration',
+    },
+  ];
+  if (_agentSupportsMemory(agent)) {
+    const memory = _agentMemoryEntries(agent);
+    stats.push({
+      key: _agentLabel('agents.stat_memory_label', '记忆', 'Memory', '記憶'),
+      value: String(memory.length),
+      unit: _agentLabel('agents.stat_memory_unit', '项', 'items', '件'),
+      kind: 'memory',
+    });
+  }
+  return stats;
+}
+
+function _agentExplicitCountChip(label, count) {
+  return count > 0
+    ? `<span class="agent-card-chip">${escapeHtml(label.replace('{n}', String(count)))}</span>`
+    : '';
+}
+
+function _generalCategoryLabel(lang) {
+  const code = 'general';
+  const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const c = list.find((x) => {
+    const xCode = typeof _mpCanonicalCategoryCode === 'function' ? _mpCanonicalCategoryCode(x && x.code) : String(x && x.code || '').trim();
+    return xCode === code;
+  });
+  const label = c ? pickLocalizedName(c, lang) : '';
+  if (label) return label;
+  return t('marketplace.category_general');
+}
+
+function _knownCategoryCodes(cats) {
+  const canonicalCategoryCode = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  return new Set(
+    (cats || []).map((c) => canonicalCategoryCode(c && c.code)).filter(Boolean),
+  );
+}
+
+function _effectiveCategoryCode(code, knownCodes) {
+  const canonical = typeof _mpCanonicalCategoryCode === 'function'
+    ? _mpCanonicalCategoryCode(code)
+    : String(code || '').trim();
+  return canonical && knownCodes.has(canonical) ? canonical : 'general';
+}
+
+/** Shared category-code → localized label. Missing or non-registry codes display as General
+ *  while marketplace.js schedules a throttled registry refresh for possible server drift. */
+function _resolveCategoryLabel(code, lang) {
+  if (!code) return _generalCategoryLabel(lang);
+  if (typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
+    _mpMaybeRefreshCategoriesForCodes([code]);
+  }
+  const canonical = typeof _mpCanonicalCategoryCode === 'function' ? _mpCanonicalCategoryCode(code) : String(code || '').trim();
+  const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const c = list.find((x) => {
+    const xCode = typeof _mpCanonicalCategoryCode === 'function' ? _mpCanonicalCategoryCode(x && x.code) : String(x && x.code || '').trim();
+    return xCode === canonical;
+  });
+  if (!c) return _generalCategoryLabel(lang);
+  return pickLocalizedName(c, lang) || code;
+}
+
+// Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
+// the round-trip. Charset must round-trip through the bus's @-mention
+// regex; see backend for the full reasoning. UIs may still surface
+// server errors (E_AGENT_NAME_INVALID / E_AGENT_NAME_TOO_LONG) when
+// the LLM-driven path produces a bad name.
+const _NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+$/;
+function _isValidAgentNameCharset(name) {
+  const v = String(name || '');
+  const trimmed = v.trim();
+  if (!trimmed) return true;
+  if (v !== trimmed) return false;
+  if (typeof window.nameDisplayWidth === 'function' && window.nameDisplayWidth(trimmed) > window.NAME_DISPLAY_MAX_UNITS) return false;
+  return _NAME_TOKEN_RE.test(trimmed);
+}
+
+async function loadAgents(forceRefresh, opts = {}) {
+  const summary = opts.summary === true;
+  if (_agentsLoadInFlight) {
+    await _agentsLoadInFlight.catch(() => {});
+  }
+  if (_agentsCache && !forceRefresh && (summary || !_agentsCacheIsSummary)) {
+    if (!summary) {
+      await _refreshCommanderAgentState();
+      renderAgentsList(_agentsCache);
+    }
+    return;
+  }
+  _agentsLoadInFlight = (async () => {
+    try {
+      const query = new URLSearchParams();
+      if (forceRefresh) query.set('force', '1');
+      if (summary) query.set('summary', '1');
+      const res = await apiFetch(`/api/agents/list${query.size ? `?${query}` : ''}`);
+      const data = await res.json();
+      if (!data.ok) return false;
+      if (data.ok) {
+        // Sort once on cache fill so picker + grid share the order.
+        // Order: custom group first, then within each group sort by a key
+        // built from "Chinese chars → pinyin first letter, Latin / digits
+        // / punctuation pass through unchanged" and compare as a plain
+        // string. Electron ships small ICU; Intl.Collator does not
+        // recognize zh pinyin tailoring (neither co-pinyin nor
+        // zh-Hans-CN works), so Chinese ends up clumped together and
+        // Latin clumped together. We use vendor/pinyin-firstletter's
+        // table to map e.g. '悲观' → 'bg' / 'Claude' → 'claude' /
+        // 'Orkas' → 'orkas' before comparing, yielding the user-expected
+        // mixed-script ordering ('agent < 悲(b) < 本(b) < claude < 乐(l)
+        // < orkas < 全(q)'). Without this, the backend's listAgents
+        // internal sort (by agent_id, a 12-char nanoid) feels random to
+        // users. The override here fixes that.
+        const sortedAgents = (data.agents || []).map((a) => ({
+          ...a,
+          source: _agentSource(a.source),
+        })).sort((a, b) => {
+          if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
+          const ka = pinyinSortKey(a.name || a.agent_id || '');
+          const kb = pinyinSortKey(b.name || b.agent_id || '');
+          return ka < kb ? -1 : ka > kb ? 1 : 0;
+        });
+        _agentsCache = sortedAgents;
+        if (typeof refreshAllChatComposers === 'function') refreshAllChatComposers();
+        _agentsCacheIsSummary = summary;
+        if (typeof _renderRecipientChip === 'function') {
+          _renderRecipientChip();
+        } else if (typeof _syncComposerModelChipAvailability === 'function') {
+          _syncComposerModelChipAvailability();
+        }
+        // Boot order is loadConversations → loadAgents; re-render the sidebar
+        // list + projects section once the agent cache exists so any
+        // agent-derived chrome elsewhere in these views stays consistent.
+        if (typeof renderConversationList === 'function') renderConversationList();
+        if (typeof renderProjectsSection === 'function') renderProjectsSection();
+        if (summary) return;
+        await _refreshCommanderAgentState();
+        renderAgentsList(_agentsCache);
+        // Backfill avatars to disk when older specs lack them — derive
+        // from the seed for cross-device consistency (the same agent_id
+        // produces the same icon/color combination on every machine, so
+        // cloud sync won't see two ends writing different values and
+        // colliding). Entries that already have icon + color are
+        // skipped, so repeated loadAgents calls don't re-write.
+        // Asynchronous so it doesn't block rendering — the render layer
+        // also seeds an avatar fallback whose value matches what we
+        // backfill, so the user sees no visual change.
+        _backfillMissingAvatars(_agentsCache).catch((e) => {
+          _agentsLog.warn('avatar backfill failed', e);
+        });
+      }
+    } catch (e) {
+      _agentsLog.error('load agents failed', e);
+      return false;
+    } finally {
+      _agentsLoadInFlight = null;
+    }
+  })();
+  return _agentsLoadInFlight;
+}
+
+/** Merge a freshly saved Agent into the renderer registry without dropping
+ * identity fields used by chat avatars. Clearing the entire registry creates
+ * a visible race: a reply arriving before the next list load falls back to the
+ * generic bot avatar because conversation member snapshots contain only id /
+ * name, not icon / color. */
+function _mergeAgentIntoCache(agent) {
+  if (!agent || !agent.agent_id || !Array.isArray(_agentsCache)) return false;
+  const index = _agentsCache.findIndex((entry) => entry?.agent_id === agent.agent_id);
+  if (index < 0) return false;
+  const previous = _agentsCache[index];
+  _agentsCache[index] = {
+    ...previous,
+    ...agent,
+    source: _agentSource(agent.source || previous.source),
+  };
+  return true;
+}
+
+async function _backfillMissingAvatars(agents) {
+  const missing = (agents || []).filter(
+    (a) => a.source === 'custom' && (!a.icon || !a.color),
+  );
+  if (!missing.length) return;
+  for (const a of missing) {
+    const seedAvatar = avatarFromSeed(a.agent_id);
+    const updates = {};
+    if (!a.icon) updates.icon = seedAvatar.icon;
+    if (!a.color) updates.color = seedAvatar.color;
+    try {
+      const res = await window.orkas.invoke('agents.update', {
+        agent_id: a.agent_id, updates,
+      });
+      if (res?.ok && res.agent) {
+        a.icon = res.agent.icon;
+        a.color = res.agent.color;
+      }
+    } catch (e) {
+      // Failure here doesn't matter — the render layer's seed-based
+      // fallback still produces the same combination, and the next
+      // loadAgents call will retry.
+      _agentsLog.warn(`backfill ${a.agent_id} failed`, e);
+    }
+  }
+  _agentsLog.info(`avatar backfill: ${missing.length} agent(s)`);
+}
+
+function renderAgentsList(agents) { renderAgentsGrid(agents); }
+
+// Active category-chip selection for the Agents page. Empty string = "All";
+// matches `_mpState.category` semantics in marketplace.js. Persists across
+// re-renders within a session; defaults to All on each load.
+let _agentsActiveCategory = '';
+
+let _agentCardHighlight = null;
+let _agentCardNavigationEpoch = 0;
+function clearAgentCardHighlights() {
+  _agentCardNavigationEpoch += 1;
+  if (_agentCardHighlight?.timer) clearTimeout(_agentCardHighlight.timer);
+  _agentCardHighlight = null;
+  document.querySelectorAll('.agent-card.is-highlighted').forEach(card => card.classList.remove('is-highlighted'));
+}
+function _applyAgentCardHighlights() {
+  const target = _agentCardHighlight;
+  if (!target) return;
+  if (target.userId !== globalThis.currentUserId || currentView !== 'agents' || Date.now() >= target.deadline) {
+    clearAgentCardHighlights(); return;
+  }
+  const cards = Array.from(document.querySelectorAll('#agents-grid .agent-card'))
+    .filter(card => target.ids.includes(card.dataset.id));
+  cards.forEach(card => card.classList.add('is-highlighted'));
+  if (cards.length && !target.scrolled) {
+    target.scrolled = true;
+    cards[0].scrollIntoView({ block: 'center', behavior: 'instant' });
+    cards[0].setAttribute('tabindex', '-1');
+    cards[0].focus({ preventScroll: true });
+  }
+}
+async function showAgentCards(ids) {
+  const safeIds = Array.from(new Set(Array.isArray(ids) ? ids.filter(id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(id)) : [])).slice(0, 5);
+  if (!safeIds.length) return;
+  const userId = globalThis.currentUserId;
+  clearAgentCardHighlights();
+  const epoch = _agentCardNavigationEpoch;
+  _agentsActiveCategory = '';
+  _showAgentsGridView();
+  setView('agents');
+  const loaded = await loadAgents(true);
+  if (globalThis.currentUserId !== userId || currentView !== 'agents' || epoch !== _agentCardNavigationEpoch) return;
+  if (loaded === false) { await uiAlert(t('agents.load_failed')); return; }
+  if (!Array.from(document.querySelectorAll('#agents-grid .agent-card')).some(card => safeIds.includes(card.dataset.id))) {
+    await uiAlert(t('agents.agent_not_found')); return;
+  }
+  _agentCardHighlight = { ids: safeIds, userId, deadline: Date.now() + 2500, scrolled: false };
+  _agentCardHighlight.timer = setTimeout(clearAgentCardHighlights, 2500);
+  _applyAgentCardHighlights();
+}
+window.showAgentCards = showAgentCards;
+
+function renderAgentsGrid(agents) {
+  // Commander is a synthetic renderer-owned row, not part of `_agentsCache`.
+  // Keep the merge at the lowest rendering boundary because category/i18n
+  // refreshes also repaint the grid directly from that cache.  If callers
+  // have to remember to add Commander first, any asynchronous repaint can
+  // replace the complete grid with agent-only markup and make its card appear
+  // to disappear after the user enters AI Team.
+  agents = _withCommanderAgent(agents);
+  const emptyEl = document.getElementById('agents-empty');
+  const chipsHost = document.getElementById('agents-categories');
+  const gridEl = document.getElementById('agents-grid');
+  if (!gridEl) return;
+
+  if (!agents.length) {
+    if (chipsHost) chipsHost.innerHTML = '';
+    gridEl.classList.remove('is-sectioned');
+    gridEl.innerHTML = '';
+    if (emptyEl) {
+      if (typeof _mpUpdateInstallingEmptyStates === 'function') _mpUpdateInstallingEmptyStates();
+      else emptyEl.textContent = t('agents.empty');
+      emptyEl.style.display = '';
+    }
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const useTitle = escapeHtml(t('agents.use_tooltip'));
+  const useLabel = escapeHtml(t('agents.use'));
+  const moreTitle = escapeHtml(t('agents.more_actions'));
+  const lang = getLang();
+  const customChipLabel = t('agents.custom_group');
+  const marketplaceGroupLabel = (() => {
+    const raw = t('agents.builtin_group');
+    return (raw && raw !== 'agents.builtin_group') ? raw : t('agents.source_marketplace');
+  })();
+  const allLabel = (() => {
+    const raw = t('marketplace.all');
+    return (raw && raw !== 'marketplace.all') ? raw : 'All';
+  })();
+
+  // Build the chip strip from the marketplace category cache. Missing categories
+  // and non-registry category codes are treated as General.
+  // If the active selection no longer matches any agent (rare — agent moved
+  // between categories mid-session), fall back to All so the body isn't empty.
+  const canonicalCategoryCode = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  const cats = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const knownCodes = _knownCategoryCodes(cats);
+  const rawCodesPresent = new Set(agents.map((a) => canonicalCategoryCode(a && a.category)));
+  const unknownCodes = [...rawCodesPresent].filter((c) => c && !knownCodes.has(c)).sort();
+  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
+    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  }
+  const codesPresent = new Set([...rawCodesPresent].map((c) => _effectiveCategoryCode(c, knownCodes)));
+  const chipCodes = [];
+  const chipCodeSeen = new Set();
+  for (const c of cats) {
+    const code = canonicalCategoryCode(c && c.code);
+    if (!code || !codesPresent.has(code) || chipCodeSeen.has(code)) continue;
+    chipCodes.push({ code, label: pickLocalizedName(c, lang) || code });
+    chipCodeSeen.add(code);
+  }
+  if (codesPresent.has('general') && !chipCodeSeen.has('general')) {
+    chipCodes.push({ code: 'general', label: _generalCategoryLabel(lang) });
+    chipCodeSeen.add('general');
+  }
+  if (_agentsActiveCategory === '__uncategorized__' || _agentsActiveCategory === '__unknown__') {
+    _agentsActiveCategory = codesPresent.has('general') ? 'general' : '';
+  }
+  if (_agentsActiveCategory && !chipCodes.some((c) => c.code === _agentsActiveCategory)) {
+    _agentsActiveCategory = '';
+  }
+
+  if (chipsHost) {
+    const allActive = _agentsActiveCategory === '' ? ' is-active' : '';
+    const chipsHtml = [
+      `<button type="button" class="marketplace-chip${allActive}" data-agents-cat="">${escapeHtml(allLabel)}</button>`,
+      ...chipCodes.map((c) => {
+        const active = _agentsActiveCategory === c.code ? ' is-active' : '';
+        return `<button type="button" class="marketplace-chip${active}" data-agents-cat="${escapeHtml(c.code)}">${escapeHtml(c.label)}</button>`;
+      }),
+    ].join('');
+    chipsHost.innerHTML = chipsHtml;
+    chipsHost.querySelectorAll('[data-agents-cat]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        _agentsActiveCategory = btn.dataset.agentsCat || '';
+        // Only the user re-renders here — backend cache (`_agentsCache`) is
+        // unchanged, so we pass it back through the same code path.
+        if (_agentsCache) renderAgentsList(_agentsCache);
+      });
+    });
+  }
+
+  const filtered = agents.filter((a) => {
+    if (_agentsActiveCategory === '') return true;
+    return _effectiveCategoryCode(a && a.category, knownCodes) === _agentsActiveCategory;
+  });
+
+  const cardHtml = (a) => {
+    const enabled = a.enabled !== false;
+    const isMock = _isAgentProfileMock(a);
+    const isCommander = _isCommanderAgent(a);
+    const desc = _agentSummary(a, lang);
+    const metaHtml = _agentCardMetaHtml(a, lang);
+    const memoryEntries = _agentMemoryEntries(a);
+    const memoryCount = memoryEntries.length;
+    const skillCount = Array.isArray(a.skill_list) ? a.skill_list.length : 0;
+    const deliveryCount = _agentDeliveryCount(a);
+    const descClass = desc ? 'agent-card-desc' : 'agent-card-desc is-empty';
+    const descText = desc || t('agents.placeholder_unset');
+    const moreBtn = (isMock || isCommander) ? '' : `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
+    const avatarHtml = renderAvatarHtml(a.icon, a.color, { size: 32, seed: a.agent_id, extraClass: 'agent-card-avatar' });
+    // CLI brand chip on the bottom row, shared with the play button.
+    const cliChip = (a.runtime && a.runtime.kind === 'cli')
+      ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
+      : '';
+    // Source provenance chips on the bottom row. Version/category now live
+    // in the subtitle line under the card title, so marketplace only keeps
+    // review status here when that UI is enabled.
+    const provenanceChips = _isAgentPlatformSource(a.source) ? _agentPlatformStatusChipsHtml(a) : '';
+    return `
+      <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${escapeHtml(a.source || '')}">
+        <div class="agent-card-header">
+          ${avatarHtml}
+          <div class="agent-card-title">
+            <span class="agent-card-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
+            ${metaHtml ? `<span class="agent-card-meta">${metaHtml}</span>` : ''}
+          </div>
+          ${moreBtn}
+        </div>
+        <div class="${descClass}">${escapeHtml(descText)}</div>
+        <div class="agent-card-actions">
+          ${cliChip}${provenanceChips}
+          ${_agentDeliveryChip(deliveryCount)}
+          ${_agentExplicitCountChip(_agentLabel('agents.card_memory_count', '{n} 记忆', '{n} memory', '{n} 記憶'), memoryCount)}
+          ${_agentExplicitCountChip(_agentLabel('agents.card_skill_count', '{n} 技能', '{n} skills', '{n} スキル'), skillCount)}
+          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}" ${enabled && !isMock ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>
+            ${useLabel}
+          </button>
+        </div>
+      </div>
+    `;
+  };
+
+  const groups = { commander: [], custom: [], marketplace: [] };
+  for (const a of filtered) {
+    const source = _agentSource(a?.source);
+    if (_isCommanderAgent(a)) groups.commander.push(a);
+    else if (source === 'marketplace') groups.marketplace.push(a);
+    else groups.custom.push(a);
+  }
+  const sectionHtml = (label, list, opts = {}) => {
+    if (!list.length) return '';
+    const headHtml = opts.hideHead ? '' : `
+        <div class="agents-source-section-head">
+          <span>${escapeHtml(label)}</span>
+          <span class="agents-source-section-count">${list.length}</span>
+        </div>`;
+    return `
+      <section class="agents-source-section">
+        ${headHtml}
+        <div class="agents-source-section-grid">
+          ${list.map(cardHtml).join('')}
+        </div>
+      </section>
+    `;
+  };
+  gridEl.classList.add('is-sectioned');
+  gridEl.innerHTML = sectionHtml('', groups.commander, { hideHead: true })
+    + sectionHtml(customChipLabel, groups.custom)
+    + sectionHtml(marketplaceGroupLabel, groups.marketplace);
+
+  for (const card of gridEl.querySelectorAll('.agent-card')) {
+    const id = card.dataset.id;
+    const source = card.dataset.source;
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('[data-agent-use]')) {
+        e.stopPropagation();
+        if (!card.classList.contains('is-disabled')) useAgent(id);
+        return;
+      }
+      if (e.target.closest('[data-agent-more]')) {
+        e.stopPropagation();
+        _toggleAgentRowMenu(e.target.closest('[data-agent-more]'), id, source);
+        return;
+      }
+      openAgentDetail(id);
+    });
+  }
+  _applyAgentCardHighlights();
+}
+
+/** Flip an agent's enabled override (used by both the ⋯ menu's toggle item
+ *  and the detail-page enable/disable button). On failure, alerts; on
+ *  success, refreshes the grid + detail page. */
+async function _flipAgentEnabled(agentId, nextEnabled) {
+  if (_isCommanderAgent(agentId)) return false;
+  let res;
+  try {
+    res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
+  } catch (err) {
+    await uiAlert(t('component.toggle_failed'));
+    return false;
+  }
+  if (!res || !res.ok) {
+    await uiAlert(t('component.toggle_failed'));
+    return false;
+  }
+  const cached = _agentsCache?.find((a) => a.agent_id === agentId);
+  if (cached) cached.enabled = nextEnabled;
+  try {
+    await loadAgents(true);
+    if (_selectedAgent?.id === agentId) {
+      _renderAgentEnabledButton({ id: agentId, enabled: nextEnabled });
+    }
+  } catch (_) {
+    _agentsLog.warn('agent toggle refresh failed', { error_code: 'refresh_failed' });
+  }
+  return true;
+}
+
+// ─── View switching: entry page ↔ detail ────────────────────────────────
+
+function _normalizeAgentDetailReturnTarget(target) {
+  const view = typeof target?.view === 'string' ? target.view.trim() : '';
+  if (!view || view === 'agents') return { view: 'agents' };
+  if (view === 'conversation') {
+    const id = typeof target?.id === 'string' ? target.id.trim() : '';
+    return id ? { view, id } : { view: 'agents' };
+  }
+  if (view === 'project') {
+    const id = typeof target?.id === 'string' ? target.id.trim() : '';
+    return id ? { view, id } : { view: 'agents' };
+  }
+  return { view };
+}
+
+function _captureAgentDetailReturnTarget() {
+  const view = (typeof currentView === 'string' && currentView) ? currentView : 'agents';
+  if (view === 'conversation') {
+    const id = (typeof currentCid === 'string') ? currentCid : '';
+    return _normalizeAgentDetailReturnTarget({ view, id });
+  }
+  if (view === 'project') {
+    const id = (typeof _projectDetailPid !== 'undefined' && typeof _projectDetailPid === 'string')
+      ? _projectDetailPid
+      : '';
+    return _normalizeAgentDetailReturnTarget({ view, id });
+  }
+  return _normalizeAgentDetailReturnTarget({ view });
+}
+
+function _showAgentsGridView() {
+  const grid = document.getElementById('agents-grid-view');
+  const detail = document.getElementById('agents-detail-view');
+  document.getElementById('panel-agents')?.classList.remove('resource-detail-overlay');
+  if (_agentEditing) {
+    // Defer to async cleanup so any pending field save flushes.
+    _exitAgentEditMode().catch(() => {});
+  }
+  if (grid) grid.style.display = 'flex';
+  if (detail) detail.style.display = 'none';
+  _selectedAgent = null;
+  _closeAgentRowMenu();
+  const detailContent = document.getElementById('agents-detail-content');
+  if (detailContent) detailContent.style.display = 'none';
+}
+
+async function openAgentDetail(agentId, options = {}) {
+  const hasExplicitReturnTarget = Object.prototype.hasOwnProperty.call(options, 'returnTarget');
+  _agentDetailReturnTarget = hasExplicitReturnTarget
+    ? _normalizeAgentDetailReturnTarget(options.returnTarget)
+    : _captureAgentDetailReturnTarget();
+  const panel = document.getElementById('panel-agents');
+  panel?.classList.toggle('resource-detail-overlay', _agentDetailReturnTarget.view !== 'agents');
+  const opened = await _showAgentsDetailView(agentId);
+  if (opened === false) {
+    _agentDetailReturnTarget = null;
+    _showAgentsGridView();
+    return false;
+  }
+  return true;
+}
+
+window.openAgentDetail = openAgentDetail;
+
+function _isAgentDetailReturnTargetCurrent(target) {
+  if (!target || target.view !== currentView) return false;
+  if (target.view === 'conversation') return target.id === currentCid;
+  if (target.view === 'project') {
+    return typeof _projectDetailPid !== 'undefined' && target.id === _projectDetailPid;
+  }
+  return true;
+}
+
+function _returnFromAgentsDetailView() {
+  const target = _normalizeAgentDetailReturnTarget(_agentDetailReturnTarget);
+  const wasOverlay = document.getElementById('panel-agents')?.classList.contains('resource-detail-overlay') === true;
+  _agentDetailReturnTarget = null;
+  _showAgentsGridView();
+  // Overlay entry never changed the real route: removing it reveals the
+  // exact page underneath without reloading history or losing scroll state.
+  if (wasOverlay && _isAgentDetailReturnTargetCurrent(target)) return;
+  if (target.view === 'agents' || typeof setView !== 'function') return;
+  if (target.view === 'conversation' || target.view === 'project') {
+    setView(target.view, target.id);
+    return;
+  }
+  setView(target.view);
+}
+
+function _resetAgentsDetailForNavigation() {
+  const detail = document.getElementById('agents-detail-view');
+  const panel = document.getElementById('panel-agents');
+  const isOpen = detail && detail.style.display !== 'none';
+  if (!isOpen && !panel?.classList.contains('resource-detail-overlay')) return;
+  _agentDetailReturnTarget = null;
+  _showAgentsGridView();
+}
+
+async function _showAgentsDetailView(agentId) {
+  const grid = document.getElementById('agents-grid-view');
+  const detail = document.getElementById('agents-detail-view');
+  if (grid) grid.style.display = 'none';
+  if (detail) detail.style.display = 'flex';
+  // Detail has a target-scoped API below. Do not refresh/enrich the complete
+  // Agent catalog merely to open one agent.json.
+  return selectAgent(agentId, { refreshCliOptions: true });
+}
+
+async function refreshSelectedAgentDetail() {
+  if (_agentEditing || !_selectedAgent?.id) return;
+  const detail = document.getElementById('agents-detail-view');
+  if (!detail || detail.style.display === 'none') return;
+  await selectAgent(_selectedAgent.id);
+}
+
+// ─── Per-row "⋯" menu (edit / delete) ─────────────────────────────────────
+
+function _positionRowMenu(menuEl, anchorEl) {
+  menuEl.style.display = 'block';
+  menuEl.style.left = '-9999px';
+  menuEl.style.top = '-9999px';
+  const rect = anchorEl.getBoundingClientRect();
+  const menuRect = menuEl.getBoundingClientRect();
+  const margin = 8;
+  const gap = 4;
+  // Right-align to the anchor by default; clamp to viewport.
+  let left = rect.right - menuRect.width;
+  if (left < margin) left = margin;
+  if (left + menuRect.width > window.innerWidth - margin) {
+    left = window.innerWidth - menuRect.width - margin;
+  }
+  // Below if there's room, otherwise above.
+  const below = rect.bottom + gap + menuRect.height <= window.innerHeight - margin;
+  const top = below ? rect.bottom + gap : Math.max(margin, rect.top - menuRect.height - gap);
+  menuEl.style.left = left + 'px';
+  menuEl.style.top = top + 'px';
+}
+
+function _closeAgentRowMenu() {
+  const menu = document.getElementById('agent-row-menu');
+  if (menu) {
+    menu.style.display = 'none';
+    delete menu.dataset.agentId;
+    delete menu.dataset.anchorTs;
+  }
+  // Drop the "keep ⋯ visible" sticky class from whichever row had the open menu.
+  for (const el of document.querySelectorAll('.agent-item.is-menu-open')) {
+    el.classList.remove('is-menu-open');
+  }
+}
+
+function _toggleAgentRowMenu(anchorBtn, agentId, source = '') {
+  if (_isCommanderAgent(agentId)) return;
+  const menu = document.getElementById('agent-row-menu');
+  if (!menu) return;
+  // Toggle off if already open for this same anchor.
+  if (menu.style.display !== 'none' && menu.dataset.agentId === agentId) {
+    _closeAgentRowMenu();
+    return;
+  }
+  // Reset any prior sticky row before marking the new one.
+  for (const el of document.querySelectorAll('.agent-card.is-menu-open')) {
+    el.classList.remove('is-menu-open');
+  }
+  anchorBtn.closest('.agent-card')?.classList.add('is-menu-open');
+  menu.dataset.agentId = agentId;
+  menu.dataset.agentSource = source || '';
+  // Re-render menu items per-open: builtin gets only enable/disable, custom
+  // gets edit / delete / enable-disable. Per-row state (enabled?) drives the
+  // toggle item label. Done as innerHTML rebuild because there are only
+  // ~3 items max and binding cost is negligible.
+  _renderAgentRowMenuItems(menu, agentId, source);
+  _positionRowMenu(menu, anchorBtn);
+  if (!menu.dataset.bound) {
+    menu.dataset.bound = '1';
+    document.addEventListener('click', (e) => {
+      if (menu.style.display === 'none') return;
+      if (menu.contains(e.target)) return;
+      if (e.target.closest('.agent-card-more')) return;
+      _closeAgentRowMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menu.style.display !== 'none') _closeAgentRowMenu();
+    });
+    window.addEventListener('scroll', _closeAgentRowMenu, true);
+    window.addEventListener('resize', _closeAgentRowMenu);
+    window.addEventListener('i18n-change', _closeAgentRowMenu);
+  }
+}
+
+// Re-render the agent grid + currently selected detail page when the UI
+// language changes — descriptions are bilingual now, and `pickDesc`
+// returns a different string after the locale flip. Detail re-render goes
+// through `selectAgent` so it re-fetches the full agent (the cached
+// `_selectedAgent` only holds id/name/source).
+window.addEventListener('i18n-change', () => {
+  if (_agentsCache && !_agentsCacheIsSummary) renderAgentsList(_agentsCache);
+  if (_selectedAgent?.id) {
+    selectAgent(_selectedAgent.id).catch(() => { /* ignore */ });
+  }
+});
+
+function _resetAgentDetailScroll() {
+  const detailContent = document.getElementById('agents-detail-content');
+  if (detailContent) detailContent.scrollTop = 0;
+  for (const sel of ['.agents-detail-body', '#agents-detail-desc', '#agents-detail-workflow']) {
+    const el = document.querySelector(sel);
+    if (el) el.scrollTop = 0;
+  }
+}
+
+async function _renderCommanderAgentDetail(editing = false) {
+  await _refreshCommanderAgentState();
+  const agent = _buildCommanderAgent();
+  _selectedAgent = { id: agent.agent_id, name: agent.name, source: agent.source };
+  _renderAgentDetail(agent, editing);
+}
+
+async function refreshAgentsAfterMarketplaceReconcile() {
+  await loadAgents(true);
+  if (_agentEditing) return;
+  if (_selectedAgent?.id && _isAgentPlatformSource(_selectedAgent.source)) {
+    await selectAgent(_selectedAgent.id);
+  }
+}
+
+// Marketplace convergence can finish before its lazy browse UI is loaded.
+// This eager owner also covers the full catalog cached by the composer picker.
+async function _refreshMarketplaceCatalogsAfterChange() {
+  const jobs = [];
+  if (_agentsCache || _agentsLoadInFlight) {
+    jobs.push(['agents', () => refreshAgentsAfterMarketplaceReconcile()]);
+  }
+  if (typeof refreshSkillsAfterMarketplaceReconcile === 'function'
+      && ((typeof _skillsCache !== 'undefined' && _skillsCache)
+        || (typeof _skillsLoadInFlight !== 'undefined' && _skillsLoadInFlight))) {
+    jobs.push(['skills', () => refreshSkillsAfterMarketplaceReconcile()]);
+  }
+  if (typeof refreshMarketplaceAfterContentChange === 'function') {
+    jobs.push(['marketplace', () => refreshMarketplaceAfterContentChange()]);
+  }
+  await Promise.all(jobs.map(async ([kind, refresh]) => {
+    try { await refresh(); }
+    catch (_) { _agentsLog.warn('marketplace content refresh failed', { resource_kind: kind }); }
+  }));
+}
+
+if (typeof window.orkas?.onPushEvent === 'function') {
+  window.orkas.onPushEvent('marketplace:content-changed', () => {
+    _refreshMarketplaceCatalogsAfterChange();
+  });
+}
+
+/** Render the per-row "⋯" menu items based on the target agent's source +
+ *  enabled state. Called fresh on each open so the toggle label is right
+ *  and builtin agents see only the enable/disable item. */
+function _renderAgentRowMenuItems(menu, agentId, source = '') {
+  if (_isCommanderAgent(agentId)) {
+    menu.innerHTML = '';
+    return;
+  }
+  const normalizedSource = _agentSource(source);
+  const a = _agentsCache?.find((x) => x.agent_id === agentId && (!normalizedSource || _agentSource(x.source) === normalizedSource))
+    || _agentsCache?.find((x) => x.agent_id === agentId);
+  const enabled = a ? a.enabled !== false : true;
+  const isMock = _isAgentProfileMock(a || agentId);
+  const isCustom = a?.source === 'custom' && !isMock;
+  const canEditDefinition = !isMock && isCustom;
+  const canEdit = canEditDefinition || _canEditAgentMemory(a);
+  const toggleLabel = enabled ? t('component.disable') : t('component.enable');
+  const items = [];
+  if (canEdit) {
+    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
+  }
+  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). the open-source build
+  // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
+  // and the menu item simply doesn't appear — no isDevMode check needed (and would be banned
+  // by the open-source build's strip-rules anyway).
+  if (typeof openMarketplaceUpload === 'function') {
+    items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
+  }
+  if (!isMock) items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
+  if (canEditDefinition) {
+    const removeLabel = _isAgentPlatformSource(a?.source) ? t('agents.uninstall') : t('agents.delete');
+    items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(removeLabel)}</div>`);
+  }
+  menu.innerHTML = items.join('');
+  for (const item of menu.querySelectorAll('.agent-row-menu-item')) {
+    item.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const action = item.dataset.action;
+      const aid = menu.dataset.agentId;
+      const source = menu.dataset.agentSource || a?.source || '';
+      _closeAgentRowMenu();
+      if (!aid) return;
+      if (action === 'edit') {
+        await openAgentDetail(aid);
+        if (!_agentEditing) await toggleAgentEditMode();
+      } else if (action === 'delete') {
+        if (_selectedAgent?.id !== aid) await selectAgent(aid);
+        await deleteSelectedAgent();
+      } else if (action === 'upload-marketplace') {
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('agent', aid, source);
+      } else if (action === 'toggle-enabled') {
+        await _flipAgentEnabledFromMenu(aid);
+      }
+    });
+  }
+}
+
+async function _flipAgentEnabledFromMenu(agentId) {
+  if (_isCommanderAgent(agentId)) return;
+  if (_isAgentProfileMock(agentId)) return;
+  const cached = _agentsCache?.find((x) => x.agent_id === agentId);
+  const next = !(cached?.enabled !== false);
+  await _flipAgentEnabled(agentId, next);
+}
+
+async function selectAgent(agentId, { refreshCliOptions = false } = {}) {
+  // Discard any uncommitted edit state when switching agents.
+  if (_agentEditing && _selectedAgent && _selectedAgent.id !== agentId) {
+    await _exitAgentEditMode();
+  }
+  if (_isCommanderAgent(agentId)) {
+    await _renderCommanderAgentDetail(false);
+    _resetAgentDetailScroll();
+    return true;
+  }
+  try {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
+    const data = await res.json();
+    if (!data.ok || !data.agent) return false;
+    data.agent.source = _agentSource(data.agent.source);
+    await _maybeLoadAgentSkillNames(_agentSkillIds(data.agent), data.agent.agent_id, { refresh: false });
+    _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
+    _renderAgentDetail(data.agent, false, { refreshCliOptions });
+    // Reset every nested scroll container — `.agents-detail-content` and
+    // `.agents-detail-body` are the outer two, and `.agents-detail-desc` /
+    // `.agents-detail-workflow` each have `overflow-y: auto` of their own
+    // (style.css:4190). Without resetting the inner two the previous
+    // agent's mid-scroll position bleeds into the next agent's view.
+    _resetAgentDetailScroll();
+    return true;
+  } catch (e) {
+    _agentsLog.error('load agent failed', e);
+    return false;
+  }
+}
+
+// Render the header meta strip for a single agent / skill detail. Custom items
+// mount an editable category select beside these static chips.
+function _renderSourceMetaHtml(item) {
+  if (!item) return '';
+  if (_isCommanderAgent(item)) return '';
+  const parts = [];
+  if (item.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(item.version));
+    parts.push(`<span class="agents-detail-source is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  if (_agentSource(item.source) !== 'custom') {
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    const label = _resolveCategoryLabel(item.category, lang);
+    parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
+  }
+  return parts.join('');
+}
+
+async function _detailCategoryOptions(currentValue = '') {
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  const canonical = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  const stateCats = (typeof _mpState !== 'undefined' && Array.isArray(_mpState?.categories)) ? _mpState.categories : [];
+  const cacheCats = (typeof _mpCategoriesCache !== 'undefined' && Array.isArray(_mpCategoriesCache)) ? _mpCategoriesCache : [];
+  let categories = stateCats.length ? stateCats : cacheCats;
+  if (!categories.length && typeof window !== 'undefined' && window.orkas?.invoke) {
+    try {
+      const res = await window.orkas.invoke('marketplace.categories', { local_only: true });
+      const list = Array.isArray(res?.list) ? res.list : [];
+      if (list.length) {
+        categories = list;
+        if (typeof _mpCategoriesCache !== 'undefined') _mpCategoriesCache = list;
+        if (typeof _mpState !== 'undefined' && _mpState) _mpState.categories = list;
+        if (typeof _mpPersistCategoriesCache === 'function') _mpPersistCategoriesCache(list);
+      }
+    } catch (_) {
+      // The current value / General fallback below keeps the control usable.
+    }
+  }
+
+  const seen = new Set();
+  const options = [];
+  for (const category of categories) {
+    const code = canonical(category && category.code);
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    options.push({
+      value: code,
+      label: (typeof pickLocalizedName === 'function' ? pickLocalizedName(category, lang) : '') || code,
+    });
+  }
+
+  const current = canonical(currentValue || 'general') || 'general';
+  if (current && !seen.has(current)) {
+    options.unshift({
+      value: current,
+      label: _resolveCategoryLabel(current, lang) || current,
+    });
+    seen.add(current);
+  }
+  if (!options.length) options.push({ value: 'general', label: _generalCategoryLabel(lang) });
+  return options;
+}
+
+async function _mountDetailCategorySelect(host, { value = 'general', onChange, readonly = false } = {}) {
+  if (!host) return null;
+  const current = (typeof _mpCanonicalCategoryCode === 'function')
+    ? _mpCanonicalCategoryCode(value || 'general')
+    : String(value || 'general').trim();
+  const mount = document.createElement('div');
+  mount.className = 'ai-select detail-category-select';
+  host.appendChild(mount);
+  const options = await _detailCategoryOptions(current);
+  let api;
+  api = _aiSelectMount(mount, {
+    options,
+    value: current || 'general',
+    onChange: async (nextValue) => {
+      if (readonly) {
+        api.setValue(current || 'general');
+        return;
+      }
+      if (typeof onChange === 'function') await onChange(nextValue || 'general', api);
+    },
+  });
+  if (readonly) {
+    mount.classList.add('is-readonly');
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) {
+      trigger.setAttribute('disabled', '');
+      trigger.setAttribute('aria-disabled', 'true');
+    }
+  }
+  return api;
+}
+
+function _renderAgentHeaderCategory(agent) {
+  const sourceEl = document.getElementById('agents-detail-source');
+  if (!sourceEl || _isCommanderAgent(agent) || _agentSource(agent?.source) !== 'custom') return;
+  const agentId = agent?.agent_id;
+  const isMock = _isAgentProfileMock(agent);
+  _mountDetailCategorySelect(sourceEl, {
+    value: agent?.category || 'general',
+    readonly: isMock,
+    onChange: async (category, api) => {
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agentId,
+          updates: { category: category || 'general' },
+        });
+        if (!res || !res.ok) {
+          api.setValue(agent?.category || 'general');
+          uiAlert((res && res.error) || t('agents.update_failed'));
+          return;
+        }
+        agent.category = res.agent?.category || category || 'general';
+        await loadAgents(true);
+        if (_selectedAgent?.id === agentId && !_agentEditing) await selectAgent(agentId);
+      } catch (err) {
+        api.setValue(agent?.category || 'general');
+        uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  }).catch((err) => _agentsLog.warn('render agent category select failed', err));
+}
+
+function _agentProfileChipHtml(text, extraClass) {
+  return text ? `<span class="agents-profile-chip${extraClass ? ' ' + extraClass : ''}">${escapeHtml(text)}</span>` : '';
+}
+
+function _agentDetailListIconHtml(kind) {
+  if (kind === 'memory') {
+    return '<svg viewBox="0 0 24 24" fill="none"><path d="M7 4.5h10a1.5 1.5 0 0 1 1.5 1.5v14l-6.5-3.6L5.5 20V6A1.5 1.5 0 0 1 7 4.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
+  }
+  if (kind === 'standard') {
+    return '<svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4.2 4.2L19 6.8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  }
+  return '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="7.5" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" stroke-width="2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+}
+
+function _agentMemoryListItemHtml(text, editable) {
+  if (!text) return '';
+  const removeTitle = _agentLabel('agents.memory_remove', '删除记忆', 'Remove memory', 'メモリを削除');
+  const editTitle = _agentLabel('agents.memory_edit', '修改记忆', 'Edit memory', 'メモリを編集');
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-memory" aria-hidden="true">${_agentDetailListIconHtml('memory')}</span>
+      ${editable
+        ? `<button type="button" class="agents-detail-list-text is-action" data-agent-memory-edit="${escapeHtml(text)}" title="${escapeHtml(editTitle)}">${escapeHtml(text)}</button>`
+        : `<span class="agents-detail-list-text">${escapeHtml(text)}</span>`}
+      ${editable ? `<button type="button" class="agents-memory-chip-remove" data-agent-memory-remove="${escapeHtml(text)}" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>` : ''}
+    </div>
+  `;
+}
+
+function _agentEditableListItemHtml(text, index, key) {
+  if (!text) return '';
+  const editTitle = _agentLabel('agents.tag_edit', '修改', 'Edit', '編集');
+  const removeTitle = _agentLabel('agents.tag_remove', '删除', 'Remove', '削除');
+  const iconKind = key === 'standards' ? 'standard' : 'ability';
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-${escapeHtml(iconKind)}" aria-hidden="true">${_agentDetailListIconHtml(iconKind)}</span>
+      <button type="button" class="agents-detail-list-text is-action" data-agent-list-edit="${escapeHtml(key)}" data-agent-list-index="${index}" title="${escapeHtml(editTitle)}">${escapeHtml(text)}</button>
+      <button type="button" class="agents-memory-chip-remove" data-agent-list-remove="${escapeHtml(key)}" data-agent-list-index="${index}" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>
+    </div>
+  `;
+}
+
+function _agentReadonlyListItemHtml(text, key) {
+  if (!text) return '';
+  const iconKind = key === 'standards' ? 'standard' : 'ability';
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-${escapeHtml(iconKind)}" aria-hidden="true">${_agentDetailListIconHtml(iconKind)}</span>
+      <span class="agents-detail-list-text">${escapeHtml(text)}</span>
+    </div>
+  `;
+}
+
+function _agentWorkflowMarkdown(steps) {
+  if (!steps.length) return '';
+  return steps.map((step, idx) => {
+    const title = normalizeDisplayText(step.title || step.description);
+    const desc = normalizeDisplayText(step.description);
+    const tool = normalizeDisplayText(step.tool);
+    const line = `${idx + 1}. ${title}${tool ? `（${tool}）` : ''}`;
+    return desc && desc !== title ? `${line}\n${desc}` : line;
+  }).join('\n\n');
+}
+
+function _agentProfileEntryTags(entries) {
+  return entries
+    .map((entry) => entry.title || entry.description)
+    .map(normalizeDisplayText)
+    .filter(Boolean);
+}
+
+function _agentTextList(agent, key) {
+  return _agentProfileEntryTags(_agentProfileEntries(_agentProfile(agent)[key])).slice(0, 20);
+}
+
+function _canEditAgentDefinition(agent) {
+  const source = _agentSource(agent && agent.source);
+  return !!agent && !_isAgentProfileMock(agent)
+    && source === 'custom';
+}
+
+function _canEditAgentMemory(agent) {
+  const source = _agentSource(agent && agent.source);
+  return !!agent
+    && !_isAgentProfileMock(agent)
+    && _agentSupportsMemory(agent)
+    && (_isCommanderAgent(agent) || source === 'custom' || _isAgentPlatformSource(source));
+}
+
+function _canEnterAgentEditMode(agent) {
+  return _isCommanderAgent(agent) || _canEditAgentDefinition(agent) || _canEditAgentMemory(agent);
+}
+
+async function _saveAgentTextList(agent, key, values) {
+  if (!agent || !_canEditAgentDefinition(agent)) return false;
+  const clean = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const text = normalizeDisplayText(raw);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    clean.push(text);
+    if (clean.length >= 20) break;
+  }
+  try {
+    const res = await window.orkas.invoke('agents.update', {
+      agent_id: agent.agent_id,
+      updates: { [key]: clean },
+    });
+    if (!res || !res.ok) {
+      await uiAlert((res && res.error) || t('agents.update_failed'));
+      return false;
+    }
+    await loadAgents(true);
+    await _refreshAgentDetail(agent.agent_id);
+    return true;
+  } catch (err) {
+    await uiAlert((err && err.message) || t('agents.update_failed'));
+    return false;
+  }
+}
+
+async function _refreshAgentDetail(agentId) {
+  if (!agentId) return;
+  if (_isCommanderAgent(agentId)) {
+    await _renderCommanderAgentDetail(!!_agentEditing);
+    return;
+  }
+  const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
+  const data = await res.json();
+  if (!data.ok || !data.agent) return;
+  data.agent.source = _agentSource(data.agent.source);
+  await _maybeLoadAgentSkillNames(_agentSkillIds(data.agent), data.agent.agent_id, { refresh: false });
+  _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
+  _renderAgentDetail(data.agent, !!_agentEditing);
+}
+
+async function _promptAgentTextListValue(kind, current = '') {
+  const label = kind === 'standards'
+    ? _agentLabel(
+        'agents.standard_prompt',
+        '输入交付标准：明确可验收的预期结果',
+        'Enter a delivery standard: an expected, verifiable result',
+        '納品基準を入力：検証できる期待結果',
+      )
+    : _agentLabel('agents.knowhow_prompt', '输入擅长的任务或领域', 'Enter a task or area of expertise', '得意なタスクや分野を入力');
+  const value = typeof uiPrompt === 'function'
+    ? await uiPrompt(label, current)
+    : window.prompt(label, current);
+  return normalizeDisplayText(value);
+}
+
+function _renderEditableTagList(host, agent, key, tags, editing) {
+  const canEdit = !!editing && _canEditAgentDefinition(agent);
+  if (!host) return;
+  host.innerHTML = canEdit
+    ? tags.map((tag, idx) => _agentEditableListItemHtml(tag, idx, key)).join('')
+    : tags.map((tag) => _agentReadonlyListItemHtml(tag, key)).join('');
+  if (!canEdit) return;
+  host.querySelectorAll('[data-agent-list-edit]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const idx = Number(btn.getAttribute('data-agent-list-index'));
+      if (!Number.isInteger(idx) || idx < 0 || idx >= tags.length) return;
+      const next = await _promptAgentTextListValue(key, tags[idx]);
+      if (!next || next === tags[idx]) return;
+      const values = tags.slice();
+      values[idx] = next;
+      await _saveAgentTextList(agent, key, values);
+    });
+  });
+  host.querySelectorAll('[data-agent-list-remove]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const idx = Number(btn.getAttribute('data-agent-list-index'));
+      if (!Number.isInteger(idx) || idx < 0 || idx >= tags.length) return;
+      const ok = typeof uiConfirm === 'function'
+        ? await uiConfirm({
+            message: _agentLabel('agents.tag_remove_confirm', '确认删除这一项？', 'Remove this item?', 'この項目を削除しますか？'),
+            okLabel: _agentLabel('agents.memory_remove_ok', '删除', 'Delete', '削除'),
+            cancelLabel: _agentLabel('common.cancel', '取消', 'Cancel', 'キャンセル'),
+          })
+        : false;
+      if (!ok) return;
+      const values = tags.filter((_, i) => i !== idx);
+      await _saveAgentTextList(agent, key, values);
+    });
+  });
+}
+
+function _mountAgentListAddButton(section, agent, key, tags, editing) {
+  const title = section?.querySelector('.agents-detail-label, .agents-detail-subtitle');
+  if (!title) return;
+  title.querySelector('[data-agent-list-add]')?.remove();
+  if (!editing || !_canEditAgentDefinition(agent)) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'agents-memory-add';
+  btn.dataset.agentListAdd = key;
+  btn.textContent = _agentLabel('agents.tag_add', '添加', 'Add', '追加');
+  title.appendChild(btn);
+  btn.addEventListener('click', async (e) => {
+    e.preventDefault();
+    const next = await _promptAgentTextListValue(key, '');
+    if (!next) return;
+    await _saveAgentTextList(agent, key, [...tags, next]);
+  });
+}
+
+function _agentInputRefs(agent) {
+  const cleanInputTitle = (value) => normalizeDisplayText(value)
+    .replace(/\s*[（(]\s*(可选|选填|optional)\s*[）)]\s*$/i, '')
+    .replace(/\s*[（(]\s*(必填|required)\s*[）)]\s*$/i, '')
+    .trim();
+  return Array.isArray(agent.inputs)
+    ? agent.inputs.map((input) => ({
+        title: cleanInputTitle(input.label || input.id || ''),
+        description: normalizeDisplayText(input.description || input.type || ''),
+        required: input.required === true,
+      })).filter((input) => input.title)
+    : [];
+}
+
+function _agentInputChipHtml(input) {
+  if (!input || !input.title) return '';
+  const state = input.required
+    ? _agentLabel('agents.input_required', '必填', 'Required', '必須')
+    : _agentLabel('agents.input_optional', '可选', 'Optional', '任意');
+  return `
+    <span class="agents-profile-chip agents-input-chip" title="${escapeHtml(input.description || '')}">
+      <span>${escapeHtml(input.title)}</span>
+      <small>${escapeHtml(state)}</small>
+    </span>
+  `;
+}
+
+function _renderAgentDetailStats(agent, editing = false) {
+  const section = document.getElementById('agents-detail-stats-section');
+  const host = document.getElementById('agents-detail-stats');
+  if (!host) return;
+  const runtime = _agentRuntimeStats(agent);
+  if (runtime.deliveries <= 0) {
+    if (section) section.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  const stats = _agentDetailStats(agent).slice(0, 4);
+  if (section) section.style.display = stats.length ? '' : 'none';
+  const statsHtml = stats.map((s) => `
+    <div class="agents-detail-stat${s.kind === 'memory' ? ' is-memory' : ''}">
+      <div class="agents-detail-stat-value">${escapeHtml(s.value)}${s.unit ? `<small>${escapeHtml(s.unit)}</small>` : ''}</div>
+      <div class="agents-detail-stat-label">${escapeHtml(s.key)}</div>
+    </div>
+  `).join('');
+  host.innerHTML = statsHtml;
+}
+
+function _renderAgentDetailMemory(agent, editing = false) {
+  const section = document.getElementById('agents-detail-memory-section');
+  const host = document.getElementById('agents-detail-memory');
+  if (!section || !host) return;
+  const memoryTags = _agentMemoryEntries(agent)
+    .map((entry) => entry.title || entry.description)
+    .filter(Boolean)
+    .slice(0, 20);
+  const canEditMemory = !!editing && _canEditAgentMemory(agent);
+  section.style.display = (memoryTags.length || canEditMemory) ? '' : 'none';
+  section.querySelector('[data-agent-memory-add]')?.remove();
+  const title = section.querySelector('.agents-detail-label');
+  if (title && canEditMemory) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'agents-memory-add';
+    btn.dataset.agentMemoryAdd = '';
+    btn.textContent = _agentLabel('agents.memory_add', '添加', 'Add', '追加');
+    title.appendChild(btn);
+  }
+  host.innerHTML = memoryTags.map((tag) => _agentMemoryListItemHtml(tag, canEditMemory)).join('');
+  if (canEditMemory) _wireAgentMemoryControls(section, agent);
+}
+
+// A full store is refused with model-facing guidance; users get the
+// localized full message, which does not ask them to clean up entries.
+function _agentMemoryFailureText(res, fallback) {
+  const error = String((res && res.error) || '');
+  if (/^memory full/i.test(error)) return t('memory.error_full');
+  return fallback;
+}
+
+async function _agentMemoryAdd(agent, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.add', { target: 'agent', agentId: _COMMANDER_AGENT_ID, content: text });
+  }
+  return window.orkas.invoke('agents.memory.add', { agent_id: agent.agent_id, content: text });
+}
+
+async function _agentMemoryUpdate(agent, oldText, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.replace', { target: 'agent', agentId: _COMMANDER_AGENT_ID, oldText, content: text });
+  }
+  return window.orkas.invoke('agents.memory.update', { agent_id: agent.agent_id, old_text: oldText, content: text });
+}
+
+async function _agentMemoryRemove(agent, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.remove', { target: 'agent', agentId: _COMMANDER_AGENT_ID, oldText: text });
+  }
+  return window.orkas.invoke('agents.memory.remove', { agent_id: agent.agent_id, old_text: text });
+}
+
+async function _applyAgentMemoryChange(agent, write) {
+  let res;
+  try {
+    res = await write();
+  } catch (_) {
+    uiAlert(t('memory.error_generic'));
+    return false;
+  }
+  if (!res || res.ok === false) {
+    uiAlert(_agentMemoryFailureText(res, t('memory.error_generic')));
+    return false;
+  }
+  try {
+    await loadAgents(true);
+    await _refreshAgentDetail(agent.agent_id);
+  } catch (_) {
+    _agentsLog.warn('agent memory refresh failed', { error_code: 'refresh_failed' });
+  }
+  return true;
+}
+
+function _wireAgentMemoryControls(host, agent) {
+  host.querySelectorAll('[data-agent-memory-add]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const label = _agentLabel('agents.memory_add_prompt', '请输入要添加的记忆', 'Enter memory to add', '追加するメモリを入力');
+      const content = typeof uiPrompt === 'function'
+        ? await uiPrompt(label, '')
+        : window.prompt(label, '');
+      const text = (content || '').trim();
+      if (!text) return;
+      await _applyAgentMemoryChange(agent, () => _agentMemoryAdd(agent, text));
+    });
+  });
+  host.querySelectorAll('[data-agent-memory-edit]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const oldText = btn.getAttribute('data-agent-memory-edit') || '';
+      if (!oldText) return;
+      const label = _agentLabel('agents.memory_edit_prompt', '修改记忆', 'Edit memory', 'メモリを編集');
+      const content = typeof uiPrompt === 'function'
+        ? await uiPrompt(label, oldText)
+        : window.prompt(label, oldText);
+      const text = (content || '').trim();
+      if (!text || text === oldText) return;
+      await _applyAgentMemoryChange(agent, () => _agentMemoryUpdate(agent, oldText, text));
+    });
+  });
+  host.querySelectorAll('[data-agent-memory-remove]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const text = btn.getAttribute('data-agent-memory-remove') || '';
+      if (!text) return;
+      const confirmText = _agentLabel('agents.memory_remove_confirm', '确认删除这条记忆？', 'Remove this memory?', 'このメモリを削除しますか？');
+      const ok = typeof uiConfirm === 'function'
+        ? await uiConfirm({
+            message: confirmText,
+            okLabel: _agentLabel('agents.memory_remove_ok', '删除', 'Delete', '削除'),
+            cancelLabel: _agentLabel('common.cancel', '取消', 'Cancel', 'キャンセル'),
+          })
+        : false;
+      if (!ok) return;
+      await _applyAgentMemoryChange(agent, () => _agentMemoryRemove(agent, text));
+    });
+  });
+}
+
+function _renderAgentDetailKnowhow(agent, editing = false) {
+  const section = document.getElementById('agents-detail-knowhow-section');
+  const host = document.getElementById('agents-detail-knowhow');
+  if (!section || !host) return;
+  if (_isExternalCliAgent(agent)) {
+    section.style.display = 'none';
+    host.innerHTML = '';
+    _mountAgentListAddButton(section, agent, 'knowhow', [], false);
+    return;
+  }
+  const tags = _agentTextList(agent, 'knowhow');
+  const canEdit = !!editing && _canEditAgentDefinition(agent);
+  section.style.display = (tags.length || canEdit) ? '' : 'none';
+  _mountAgentListAddButton(section, agent, 'knowhow', tags, editing);
+  _renderEditableTagList(host, agent, 'knowhow', tags, editing);
+}
+
+function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) {
+  agent = { ...agent, source: _agentSource(agent.source) };
+  const isCommander = _isCommanderAgent(agent);
+  const canEditDefinition = _canEditAgentDefinition(agent);
+  document.getElementById('agents-detail-content').style.display = '';
+
+  const nameEl = document.getElementById('agents-detail-name');
+  const nameInput = document.getElementById('agents-detail-name-input');
+  const sourceEl = document.getElementById('agents-detail-source');
+  const descEl = document.getElementById('agents-detail-desc');
+  const workflowEl = document.getElementById('agents-detail-workflow');
+  const editBtn = document.getElementById('agent-edit-btn');
+
+  const lang = getLang();
+  nameEl.textContent = agent.name || '';
+  if (nameInput) nameInput.value = agent.name || '';
+  // Header chips: custom items mount an editable category dropdown;
+  // marketplace-installed items show version + category as static chips.
+  sourceEl.className = 'agents-detail-source-row';
+  sourceEl.innerHTML = _renderSourceMetaHtml(agent);
+  _renderAgentHeaderCategory(agent);
+  // Runtime slot lives at the top of the body now (not the header):
+  // an always-editable dropdown so the user can flip Orkas ↔ local CLI
+  // without entering edit mode. The header chip was removed because
+  // it duplicated information the dropdown already exposes.
+  _renderAgentDetailRuntime(agent);
+  _renderAgentDetailCliSettings(agent, { refresh: refreshCliOptions });
+  void renderCliAccountUsage(agent);
+  _renderAgentDetailProjectDir(agent);
+  const localizedDesc = _agentSummary(agent, lang);
+  descEl.textContent = localizedDesc;
+  descEl.classList.toggle('is-empty', !localizedDesc);
+
+  _renderAgentDetailAvatar(agent);
+  _renderAgentDetailStats(agent, editing);
+  _renderAgentDetailMemory(agent, editing);
+  _renderAgentDetailKnowhow(agent, editing);
+
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // external CLI brings its own behavior. Hide the entire workflow
+  // section so the detail page doesn't show an empty editor block.
+  const workflowSection = document.querySelector('.agents-detail-section-workflow');
+  const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
+  const structuredWorkflow = _agentWorkflowSteps(agent);
+  const hasWorkflowToShow = structuredWorkflow.length || !!String(agent.workflow || '').trim();
+  if (workflowSection) workflowSection.style.display = (isCliRuntime && !hasWorkflowToShow) ? 'none' : '';
+
+  const unsetHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
+  // Workflow renders markdown in readonly mode; raw text in edit mode so user
+  // can edit source directly.
+  if (editing && !isCommander && canEditDefinition) {
+    workflowEl.textContent = agent.workflow || '';
+  } else {
+    const workflowMarkdown = structuredWorkflow.length
+      ? _agentWorkflowMarkdown(structuredWorkflow)
+      : String(agent.workflow || '').trim();
+    workflowEl.innerHTML = workflowMarkdown ? renderMarkdownFull(workflowMarkdown) : unsetHtml;
+  }
+  if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
+
+  // Detail header actions, fixed order:
+  //   use (icon) / edit / enable-disable / delete
+  // Edit mode hides everything except the "done" button (the relabeled
+  // "edit" button).
+  const useBtn = document.getElementById('agent-use-btn');
+  const enableBtn = document.getElementById('agent-enabled-btn');
+  const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
+  const delBtn = document.getElementById('agent-delete-btn');
+  const isMock = _isAgentProfileMock(agent);
+  const isCustom = agent.source === 'custom' && !isMock;
+  const canEdit = isCommander || canEditDefinition || _canEditAgentMemory(agent);
+  if (useBtn) {
+    useBtn.style.display = editing ? 'none' : '';
+    useBtn.disabled = isMock || agent.enabled === false;
+    useBtn.setAttribute('aria-disabled', (isMock || agent.enabled === false) ? 'true' : 'false');
+  }
+  if (enableBtn && isCommander) {
+    enableBtn.style.display = 'none';
+    enableBtn.disabled = true;
+  } else if (enableBtn && isMock) {
+    enableBtn.style.display = editing ? 'none' : '';
+    enableBtn.disabled = true;
+    enableBtn.textContent = t('component.disable');
+  } else if (enableBtn) {
+    enableBtn.style.display = editing ? 'none' : '';
+    enableBtn.disabled = false;
+  }
+  // Upload button visibility: gated by marketplace_dev.js's presence (the open-source build lacks it).
+  if (uploadBtn) {
+    uploadBtn.style.display = isCommander
+      ? 'none'
+      : (isMock ? (editing ? 'none' : '') : ((typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none'));
+    uploadBtn.disabled = isCommander || isMock;
+  }
+  if (delBtn) {
+    delBtn.style.display = (!isCommander && (canEditDefinition || isMock) && !editing) ? '' : 'none';
+    delBtn.disabled = isCommander || isMock;
+    delBtn.textContent = _isAgentPlatformSource(agent.source) ? t('agents.uninstall') : t('agents.delete');
+  }
+  if (editBtn) {
+    editBtn.style.display = (canEdit || isMock) ? '' : 'none';
+    editBtn.disabled = isMock && !isCommander;
+    editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
+  }
+  if (!isMock && !isCommander) _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
+
+  _renderAgentOutputFormatSection(agent, editing);
+
+  _toggleAgentFieldEditable(editing && !isCommander && canEditDefinition);
+}
+
+/** Render the output-format preference dropdown (auto / text /
+ *  dashboard / artifact). Always editable (no edit-mode gating — same convention as the
+ *  runtime selector); persists via `agents.update({ output_format })`. Hidden
+ *  for CLI agents — those run an external coding CLI and ignore the in-process
+ *  system-prompt hint entirely.
+ *
+ *  Legacy on-disk values map for display: `'markdown_only'` → `'text'`,
+ *  `'allow_artifacts'` → `'artifact'`; `'auto'` / missing → `'auto'`
+ *  (the default). */
+function _renderAgentOutputFormatSection(agent, editing = false) {
+  const section = document.getElementById('agents-detail-input-output-section');
+  const slot = document.getElementById('agents-detail-output-format');
+  const standardsSection = document.getElementById('agents-detail-output-standards-section');
+  const standardsHost = document.getElementById('agents-detail-output-standards');
+  const formatSection = document.getElementById('agents-detail-output-format-control');
+  const inputRow = document.getElementById('agents-detail-inputs-row');
+  const inputHost = document.getElementById('agents-detail-inputs');
+  if (!section || !slot) return;
+  const isCommander = _isCommanderAgent(agent);
+  const isExternalCli = _isExternalCliAgent(agent);
+  const standardTags = (isExternalCli) ? [] : _agentTextList(agent, 'standards');
+  const isMock = _isAgentProfileMock(agent);
+  const canShowFormatControl = !isExternalCli && !isCommander;
+  const canEditStandards = !isExternalCli && !isCommander && !!editing && _canEditAgentDefinition(agent);
+  const inputRefs = (isExternalCli || isCommander) ? [] : _agentInputRefs(agent);
+
+  if (standardsSection && standardsHost) {
+    standardsSection.style.display = (standardTags.length || canEditStandards) ? '' : 'none';
+    _mountAgentListAddButton(standardsSection, agent, 'standards', standardTags, editing);
+    _renderEditableTagList(standardsHost, agent, 'standards', standardTags, editing);
+  }
+  if (inputRow && inputHost) {
+    inputRow.style.display = inputRefs.length ? '' : 'none';
+    inputHost.innerHTML = inputRefs.map(_agentInputChipHtml).join('');
+  }
+  if (formatSection) formatSection.style.display = canShowFormatControl ? '' : 'none';
+  if (!inputRefs.length && !canShowFormatControl) {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    return;
+  }
+  section.style.display = '';
+  if (!canShowFormatControl) {
+    slot.innerHTML = '';
+    return;
+  }
+
+  const canEdit = !isMock && agent.source === 'custom';
+
+  slot.innerHTML = '';
+  const mount = document.createElement('div');
+  mount.className = 'ai-select';
+  slot.appendChild(mount);
+
+  const options = [
+    { value: 'auto',           label: t('agents.output_format_auto'),          hint: t('agents.output_format_auto_hint') },
+    { value: 'text',           label: t('agents.output_format_text'),          hint: t('agents.output_format_text_hint') },
+    { value: 'dashboard',      label: t('agents.output_format_dashboard'),     hint: t('agents.output_format_dashboard_hint') },
+    { value: 'artifact',       label: t('agents.output_format_artifact'),      hint: t('agents.output_format_artifact_hint') },
+  ];
+  // Map legacy on-disk values to the current 4-option display.
+  let current;
+  switch (agent.output_format) {
+    case 'auto':                                current = 'auto';          break;
+    case 'text':
+    case 'markdown_only':                       current = 'text';          break;
+    case 'dashboard':                           current = 'dashboard';     break;
+    case 'artifact':
+    case 'allow_artifacts':                     current = 'artifact';      break;
+    default:                                    current = 'auto';          break;
+  }
+
+  const api = _aiSelectMount(mount, {
+    options,
+    value: current,
+    onChange: async (val) => {
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id,
+          updates: { output_format: val },
+        });
+        if (!res || !res.ok) {
+          api.setValue(current);
+          uiAlert((res && res.error) || t('agents.update_failed'));
+        } else if (res.agent) {
+          agent.output_format = res.agent.output_format;
+          current = val;
+        } else {
+        }
+      } catch (err) {
+        api.setValue(current);
+        uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  });
+  if (!canEdit) {
+    // Disable the trigger — read-only display for builtin agents in
+    // non-dev mode (mirrors the runtime row pattern).
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) { trigger.setAttribute('disabled', ''); trigger.style.pointerEvents = 'none'; trigger.style.opacity = '0.6'; }
+  }
+}
+
+/** Render the runtime control in the detail body.
+ *
+ *  The runtime "kind" is locked at create time:
+ *  - `in_process` (Orkas) agents → never show the selector here. The
+ *    runtime row stays hidden; user has no need to see it.
+ *  - `cli` agents → show a selector with **CLI options only** (no
+ *    Orkas / in_process option). User can swap which CLI backs the
+ *    agent at any time, but can't revert to Orkas — that would
+ *    invalidate the description and inputs which were authored
+ *    specifically for a CLI runtime.
+ *
+ *  Reuses `_aiSelectMount` (see CLAUDE.md "Reuse UI components") and
+ *  persists each change via `agents.update({ runtime })`. */
+async function _renderAgentDetailRuntime(agent) {
+  const section = document.getElementById('agents-detail-runtime-section');
+  const slot = document.getElementById('agents-detail-runtime');
+  if (!slot || !section) return;
+  const previousRuntimeKey = slot.dataset.runtimeKey;
+  const previousUpgradeControl = slot.querySelector('.local-cli-upgrade-control');
+  slot.innerHTML = '';
+
+  // In-process agents: section stays hidden. No selector, no
+  // information to surface.
+  if (agent.runtime?.kind !== 'cli') {
+    section.style.display = 'none';
+    delete slot.dataset.runtimeKey;
+    return;
+  }
+
+  const currentType = agent.runtime.cli;
+  const runtimeKey = `${agent.agent_id}::${currentType}`;
+  const baseLabel = t('agent_modal.runtime_cli_' + currentType);
+  const labelText = (baseLabel && baseLabel !== 'agent_modal.runtime_cli_' + currentType)
+    ? baseLabel : currentType;
+
+  // Do not hold the entire section behind asynchronous CLI discovery. The
+  // persisted runtime is already enough to render a stable first frame; the
+  // selector is replaced with versions and other available CLIs once discovery
+  // settles.
+  section.style.display = '';
+  slot.dataset.runtimeKey = runtimeKey;
+  const pendingMount = document.createElement('div');
+  pendingMount.className = 'ai-select agents-detail-runtime-select';
+  slot.appendChild(pendingMount);
+  _aiSelectMount(pendingMount, {
+    options: [{ value: `cli:${currentType}`, label: labelText }],
+    value: `cli:${currentType}`,
+  });
+  const pendingTrigger = pendingMount.querySelector('.ai-select-trigger');
+  if (pendingTrigger) {
+    pendingTrigger.disabled = true;
+    pendingTrigger.setAttribute('aria-disabled', 'true');
+    pendingTrigger.setAttribute('aria-busy', 'true');
+  }
+  // Keep feedback mounted while discovery is pending so overlapping refreshes
+  // and locale updates retain the same control and its current upgrade state.
+  if (previousRuntimeKey === runtimeKey && previousUpgradeControl) {
+    slot.appendChild(previousUpgradeControl);
+  }
+
+  // Share the process-lifetime discovery cache with the create panel.
+  // Opening a detail must not synchronously force the same version processes
+  // to run again; entering the External create panel owns explicit refreshes.
+  let entries = [];
+  try {
+    entries = (typeof loadLocalCliEntries === 'function')
+      ? await loadLocalCliEntries()
+      : [];
+  } catch (err) {
+    _agentsLog.warn('load local CLI entries for Agent detail failed', {
+      error_type: err && err.name ? String(err.name) : typeof err,
+    });
+  }
+  if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== runtimeKey
+      || pendingMount.parentElement !== slot) return;
+  slot.innerHTML = '';
+
+  const available = entries.filter(e => e.available);
+  const seen = new Set(available.map(e => e.type));
+  const currentEntry = entries.find(e => e.type === currentType);
+
+  // Build CLI-only options: every detected CLI + the bound one if it's
+  // missing (with a warning suffix so the user can flip away in one
+  // click). Orkas / in_process is intentionally absent — see fn doc.
+  const options = [];
+  for (const e of available) {
+    options.push({
+      value: `cli:${e.type}`,
+      label: `${t('agent_modal.runtime_cli_' + e.type)}${e.version ? ` (${e.version})` : ''}`,
+    });
+  }
+  if (!seen.has(currentType)) {
+    options.push({
+      value: `cli:${currentType}`,
+      label: labelText,
+      hint: (typeof window.getLocalCliUnavailableHint === 'function')
+        ? window.getLocalCliUnavailableHint(currentEntry)
+        : t('agent.cli_not_found'),
+      iconName: 'warning',
+    });
+  }
+  if (options.length === 0) {
+    // Defensive — shouldn't happen since we always add the bound CLI
+    // above. Hide the row instead of rendering an empty dropdown.
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  const mount = document.createElement('div');
+  mount.className = 'ai-select agents-detail-runtime-select';
+  slot.appendChild(mount);
+  if (typeof window.createLocalCliUpgradeControl === 'function') {
+    slot.appendChild(previousRuntimeKey === runtimeKey && previousUpgradeControl
+      ? previousUpgradeControl : window.createLocalCliUpgradeControl({ type: currentType }));
+  }
+  _aiSelectMount(mount, {
+    options, value: `cli:${currentType}`,
+    onChange: async (next) => {
+      const m = /^cli:(.+)$/.exec(next);
+      if (!m) return;
+      const newCli = m[1];
+      // Mirror the create-modal behaviour: if the user's current name /
+      // description are still the defaults of the previous CLI (or empty),
+      // follow the new CLI's defaults. Otherwise, leave their edits alone.
+      const updates = { runtime: { kind: 'cli', cli: newCli } };
+      const lang = (typeof getLang === 'function') ? getLang() : 'en';
+      const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
+      const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
+      const prevDescLocal = prev ? pickDesc(prev, lang) : '';
+      const curName = (agent.name || '').trim();
+      const curDescLocal = pickDesc(agent, lang).trim();
+      // Same default-like detection as the create modal: bare default OR
+      // dedup-style "<default> 2" / "(2)" suffixes count as untouched.
+      const nameUntouched = _isDefaultlikeName(curName, prev?.name);
+      const descUntouched = !curDescLocal || (prev && curDescLocal === prevDescLocal);
+      if (next2 && nameUntouched) updates.name = next2.name;
+      if (next2) {
+        if (descUntouched) {
+          updates.description_zh = next2.description_zh;
+          updates.description_en = next2.description_en;
+        }
+      }
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id, updates,
+        });
+        if (res?.ok && res.agent) {
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (!data.ok || !data.agent) throw new Error('invalid_response');
+          _renderAgentDetail(data.agent, _agentEditing);
+        } else if (res?.code === 'E_AGENT_NAME_TAKEN') {
+          // Name we tried to auto-apply already belongs to another
+          // agent. Re-issue the update without the name override so
+          // the runtime swap still goes through.
+          const safeUpdates = { ...updates };
+          delete safeUpdates.name;
+          const fallback = await window.orkas.invoke('agents.update', {
+            agent_id: agent.agent_id, updates: safeUpdates,
+          });
+          if (!fallback?.ok) throw new Error(fallback?.code || 'update_failed');
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (!data.ok || !data.agent) throw new Error('invalid_response');
+          _renderAgentDetail(data.agent, _agentEditing);
+        } else {
+          throw new Error(res?.code || 'update_failed');
+        }
+      } catch (err) {
+      }
+    },
+  });
+}
+
+function _agentCliRuntimeOptionsKey(agent) {
+  return `${String(agent?.agent_id || '')}::${String(agent?.runtime?.cli || '')}`;
+}
+
+function _loadAgentCliRuntimeOptions(agent, { force = false } = {}) {
+  const cacheKey = _agentCliRuntimeOptionsKey(agent);
+  const requestKey = `${cacheKey}::${force ? 'refresh' : 'cached'}`;
+  const existing = _agentCliRuntimeOptionsInFlight.get(requestKey);
+  if (existing) return existing;
+  const payload = { agent_id: agent.agent_id };
+  if (force) payload.force = true;
+  const request = window.orkas.invoke('localAgents.runtimeOptions', payload).then((response) => {
+    const options = response?.options;
+    if (!options || typeof options !== 'object') throw new Error('runtime options unavailable');
+    const previous = _agentCliRuntimeOptionsCache.get(cacheKey);
+    const hasFreshModels = Array.isArray(options.models) && options.models.length > 0;
+    // A transient refresh failure must not blank a useful cached list. Ready
+    // responses and partial responses carrying a real catalog still replace it.
+    if (!previous || options.status === 'ready' || hasFreshModels) {
+      _agentCliRuntimeOptionsCache.set(cacheKey, options);
+    }
+    return _agentCliRuntimeOptionsCache.get(cacheKey) || options;
+  }).finally(() => {
+    _agentCliRuntimeOptionsInFlight.delete(requestKey);
+  });
+  _agentCliRuntimeOptionsInFlight.set(requestKey, request);
+  return request;
+}
+
+/** Model/thinking/permission controls for the selected external CLI. Values
+ * are saved as per-Agent runtime overrides; an empty value keeps the CLI's
+ * native default. */
+async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly = false } = {}) {
+  const section = document.getElementById('agents-detail-cli-settings-section');
+  const slot = document.getElementById('agents-detail-cli-settings');
+  if (!section || !slot) return;
+  if (agent.runtime?.kind !== 'cli') {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    delete slot.dataset.runtimeKey;
+    return;
+  }
+  section.style.display = '';
+  slot.dataset.agentId = agent.agent_id;
+  const cacheKey = _agentCliRuntimeOptionsKey(agent);
+  slot.dataset.runtimeKey = cacheKey;
+  _agentCliRuntimeSnapshots.set(cacheKey, agent);
+  const cachedInfo = _agentCliRuntimeOptionsCache.get(cacheKey);
+  if (!cachedInfo) {
+    slot.innerHTML = `<div class="agents-detail-cli-loading">${escapeHtml(t('agents.cli_settings_loading'))}</div>`;
+  }
+
+  const canEdit = agent.source === 'custom';
+  let response;
+  if (cachedInfo) {
+    response = { options: cachedInfo };
+    if (refresh && !cacheOnly) {
+      void _loadAgentCliRuntimeOptions(agent, { force: true }).then((nextInfo) => {
+        if (nextInfo === cachedInfo) return;
+        if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== cacheKey) return;
+        const latestAgent = _agentCliRuntimeSnapshots.get(cacheKey);
+        if (latestAgent) void _renderAgentDetailCliSettings(latestAgent, { cacheOnly: true });
+      }).catch((err) => {
+        _agentsLog.warn('refresh Agent CLI runtime options failed', {
+          error_type: err && err.name ? String(err.name) : typeof err,
+        });
+      });
+    }
+  } else {
+    try {
+      response = { options: await _loadAgentCliRuntimeOptions(agent, { force: refresh }) };
+    } catch (err) {
+      if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== cacheKey) return;
+      slot.innerHTML = `<div class="agents-detail-cli-note is-warning">${escapeHtml(t('agents.cli_settings_unavailable'))}</div>`;
+      return;
+    }
+  }
+  if (_selectedAgent?.id !== agent.agent_id || slot.dataset.runtimeKey !== cacheKey) return;
+  const info = response?.options || {};
+  const CUSTOM_MODEL = '__orkas_custom_model__';
+  const CUSTOM_THINKING = '__orkas_custom_thinking__';
+  const runtime = agent.runtime || { kind: 'cli', cli: '' };
+  const currentModel = String(runtime.model_override || '');
+  const currentThinking = String(runtime.thinking_level || '');
+  const currentPermission = String(runtime.permission_policy || '');
+  const models = Array.isArray(info.models) ? info.models : [];
+  const observedModel = info.last_resolved_model && typeof info.last_resolved_model === 'object'
+    ? info.last_resolved_model
+    : null;
+  const observedModelForCurrentSelection = observedModel
+    && String(observedModel.cli || '') === String(runtime.cli || '')
+    && String(observedModel.requested_model || '') === currentModel
+    && String(observedModel.resolved_model || '').trim()
+      ? String(observedModel.resolved_model).trim()
+      : '';
+
+  const advertisedDefaultModel = models.find(model => model?.is_default);
+  const defaultModelId = String(info.default_model || advertisedDefaultModel?.id || '').trim();
+  const modelOptions = [];
+  const seenModelIds = new Set();
+  for (const model of models) {
+    const id = String(model?.id || '').trim();
+    if (!id || seenModelIds.has(id)) continue;
+    seenModelIds.add(id);
+    const isDefault = id === defaultModelId;
+    const isAlias = model?.is_alias === true;
+    // The catalog states what this row runs right now; a model observed on the
+    // last run only covers the current selection and can be older, so it is the
+    // fallback for CLIs whose catalog omits the resolution.
+    const resolvedModel = String(model?.resolved_model || '').trim()
+      || (id === currentModel ? observedModelForCurrentSelection : '');
+    const label = String(model.label || id);
+    const hints = [];
+    if (isDefault) hints.push(t('agents.cli_default'));
+    if (isAlias) hints.push(t('agents.cli_model_alias_hint'));
+    modelOptions.push({
+      // The real default model doubles as the "inherit CLI default" action.
+      // Keep its empty persisted value without adding a synthetic first row.
+      value: isDefault ? '' : id,
+      // Name the model this row runs; for an alias the hint adds that the
+      // choice follows later CLI updates. A label that already is the model id,
+      // or a row with no known resolution, appends nothing.
+      label: resolvedModel && resolvedModel !== label ? `${label} · ${resolvedModel}` : label,
+      hint: hints.join(' · '),
+    });
+  }
+  if (defaultModelId && !seenModelIds.has(defaultModelId)) {
+    modelOptions.unshift({
+      value: '',
+      label: defaultModelId,
+      hint: t('agents.cli_default'),
+    });
+    seenModelIds.add(defaultModelId);
+  }
+  // An empty override already means "use the CLI default"; represent that as a
+  // real selected option instead of the misleading generic "Please select"
+  // placeholder. This also gives users a way to clear a previously saved
+  // override. CLIs that name the model their default resolves to today show it
+  // here, so the row says which model the default actually runs.
+  if (!modelOptions.some(option => option.value === '')) {
+    const resolvedDefault = String(info.default_model_resolved || '').trim();
+    modelOptions.unshift({
+      value: '',
+      label: resolvedDefault
+        ? `${t('agents.cli_default')} · ${resolvedDefault}`
+        : t('agents.cli_default'),
+    });
+  }
+  if (currentModel && !seenModelIds.has(currentModel)) {
+    modelOptions.push({ value: currentModel, label: currentModel });
+  }
+  if (info.allow_custom_model) {
+    modelOptions.push({ value: CUSTOM_MODEL, label: t('agents.cli_custom_model') });
+  }
+  const selectedModelValue = !currentModel || currentModel === defaultModelId ? '' : currentModel;
+
+  const activeModelId = currentModel || defaultModelId;
+  const activeModel = models.find(model => String(model?.id || '') === activeModelId);
+  const thinkingUnsupported = activeModel?.supports_thinking === false;
+  const rawThinkingLevels = Array.isArray(activeModel?.thinking_levels) && activeModel.thinking_levels.length
+    ? activeModel.thinking_levels
+    : (Array.isArray(info.thinking_levels) ? info.thinking_levels : []);
+  const defaultThinking = String(
+    activeModel?.default_thinking_level || info.default_thinking_level || '',
+  ).trim();
+  const thinkingOptions = [];
+  const seenThinkingIds = new Set();
+  for (const level of rawThinkingLevels) {
+    const id = String(level?.id || '').trim();
+    if (!id || seenThinkingIds.has(id)) continue;
+    seenThinkingIds.add(id);
+    const isDefault = id === defaultThinking;
+    thinkingOptions.push({
+      value: isDefault ? '' : id,
+      label: String(level.label || id),
+      hint: isDefault ? t('agents.cli_default') : '',
+    });
+  }
+  if (defaultThinking && !seenThinkingIds.has(defaultThinking)) {
+    thinkingOptions.unshift({
+      value: '',
+      label: defaultThinking,
+      hint: t('agents.cli_default'),
+    });
+    seenThinkingIds.add(defaultThinking);
+  }
+  // A missing explicit effort has the same inheritance semantics as a missing
+  // model override. Keep the control visibly selected and make the inherited
+  // default recoverable after a user experiments with another level.
+  if (!thinkingOptions.some(option => option.value === '')) {
+    thinkingOptions.unshift({ value: '', label: t('agents.cli_default') });
+  }
+  if (currentThinking && !seenThinkingIds.has(currentThinking)) {
+    thinkingOptions.push({ value: currentThinking, label: currentThinking });
+  }
+  if (info.allow_custom_thinking) {
+    thinkingOptions.push({ value: CUSTOM_THINKING, label: t('agents.cli_custom_thinking') });
+  }
+  // A model the CLI says takes no thinking level must not inherit the levels
+  // its siblings advertise. A value saved before the model changed stays
+  // listed so it remains clearable.
+  if (thinkingUnsupported) {
+    thinkingOptions.length = 0;
+    thinkingOptions.push({ value: '', label: t('agents.cli_thinking_unsupported') });
+    if (currentThinking) thinkingOptions.push({ value: currentThinking, label: currentThinking });
+  }
+  const selectedThinkingValue = !currentThinking || currentThinking === defaultThinking
+    ? ''
+    : currentThinking;
+  const advertisedPermissionPolicies = Array.isArray(info.permission_policies)
+    ? info.permission_policies.map(value => String(value || '')).filter(Boolean)
+    : ['inherit'];
+  const permissionOptions = advertisedPermissionPolicies.map((policy) => ({
+    value: policy === 'inherit' ? '' : policy,
+    label: t(`agents.cli_permission_${policy}`),
+  }));
+  if (!permissionOptions.some(option => option.value === '')) {
+    permissionOptions.unshift({ value: '', label: t('agents.cli_permission_inherit') });
+  }
+  if (currentPermission && !permissionOptions.some(option => option.value === currentPermission)) {
+    permissionOptions.push({ value: currentPermission, label: currentPermission });
+  }
+  if (info.can_select_permission === false && !currentPermission) {
+    permissionOptions.length = 0;
+    permissionOptions.push({ value: '', label: t('agents.cli_permission_managed') });
+  }
+  const hidePermissionControl = String(info.fixed_permission_policy || '') === 'full_access';
+  const statusNote = info.status === 'ready'
+    ? ''
+    : `<div class="agents-detail-cli-note is-warning">${escapeHtml(
+      info.status === 'partial'
+        ? t('agents.cli_settings_partial')
+        : t('agents.cli_settings_unavailable'),
+    )}</div>`;
+  // Claude Code shows model information in the picker only. Other CLIs keep
+  // the note for a saved override the catalog does not list at all.
+  const selectedModelIsListed = models.some(model => String(model?.id || '') === currentModel);
+  const observedModelNote = runtime.cli !== 'claude'
+    && observedModelForCurrentSelection
+    && !selectedModelIsListed
+    && observedModelForCurrentSelection !== currentModel
+    ? `<div class="agents-detail-cli-note agents-detail-cli-model-observed">${escapeHtml(
+      t('agents.cli_model_recent', { model: observedModelForCurrentSelection }),
+    )}</div>`
+    : '';
+  slot.innerHTML = `
+    <div class="agents-detail-cli-grid">
+      <div class="agents-detail-cli-field">
+        <div class="agents-detail-cli-field-label">${escapeHtml(t('agents.cli_model'))}</div>
+        <div class="ai-select agents-detail-cli-select" data-role="model"></div>
+      </div>
+      <div class="agents-detail-cli-field">
+        <div class="agents-detail-cli-field-label">${escapeHtml(t('agents.cli_thinking'))}</div>
+        <div class="ai-select agents-detail-cli-select" data-role="thinking"></div>
+      </div>
+      ${hidePermissionControl ? '' : `<div class="agents-detail-cli-field">
+        <div class="agents-detail-cli-field-label">${escapeHtml(t('agents.cli_permission'))}</div>
+        <div class="ai-select agents-detail-cli-select" data-role="permission"></div>
+      </div>`}
+    </div>
+    ${observedModelNote}
+    ${statusNote}`;
+
+  const disableSelect = (mount, disabled) => {
+    if (!disabled) return;
+    mount.classList.add('is-readonly');
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) {
+      trigger.setAttribute('disabled', '');
+      trigger.setAttribute('aria-disabled', 'true');
+    }
+  };
+  const saveRuntime = async (patch) => {
+    try {
+      const nextRuntime = { ...runtime, ...patch };
+      if (!nextRuntime.model_override) delete nextRuntime.model_override;
+      if (!nextRuntime.thinking_level) delete nextRuntime.thinking_level;
+      if (!nextRuntime.permission_policy) delete nextRuntime.permission_policy;
+      const saved = await window.orkas.invoke('agents.update', {
+        agent_id: agent.agent_id,
+        updates: { runtime: nextRuntime },
+      });
+      if (!saved?.agent) throw new Error(saved?.code || t('agents.update_failed'));
+      if (!_mergeAgentIntoCache(saved.agent)) {
+        // Detail normally opens from the registry, so this is only a cold-cache
+        // fallback. Await it before returning control to the composer.
+        await loadAgents(true, { summary: true });
+      }
+      _renderAgentDetail(saved.agent, _agentEditing);
+    } catch (error) {
+      throw error;
+    }
+  };
+
+  const modelMount = slot.querySelector('[data-role="model"]');
+  let modelApi;
+  modelApi = _aiSelectMount(modelMount, {
+    options: modelOptions,
+    value: selectedModelValue,
+    onChange: async (value) => {
+      let next = value;
+      if (value === CUSTOM_MODEL) {
+        next = await uiPrompt(t('agents.cli_model_prompt'), currentModel);
+        if (next === null) {
+          modelApi.setValue(selectedModelValue);
+          return;
+        }
+        next = String(next).trim();
+        if (!next) {
+          modelApi.setValue(selectedModelValue);
+          return;
+        }
+      }
+      try {
+        // Thinking levels are often model-specific; reset to that model's CLI
+        // default rather than carrying an incompatible value across models.
+        await saveRuntime({ model_override: next, thinking_level: undefined });
+      } catch (err) {
+        modelApi.setValue(selectedModelValue);
+        await uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  });
+  // A persisted override must remain clearable after a CLI downgrade or
+  // temporary discovery failure, even when new selections are unavailable.
+  disableSelect(modelMount, !canEdit || (!info.can_select_model && !currentModel));
+
+  const thinkingMount = slot.querySelector('[data-role="thinking"]');
+  let thinkingApi;
+  thinkingApi = _aiSelectMount(thinkingMount, {
+    options: thinkingOptions,
+    value: selectedThinkingValue,
+    onChange: async (value) => {
+      let next = value;
+      if (value === CUSTOM_THINKING) {
+        next = await uiPrompt(t('agents.cli_thinking_prompt'), currentThinking);
+        if (next === null) {
+          thinkingApi.setValue(selectedThinkingValue);
+          return;
+        }
+        next = String(next).trim();
+        if (!next) {
+          thinkingApi.setValue(selectedThinkingValue);
+          return;
+        }
+      }
+      try {
+        await saveRuntime({ thinking_level: next });
+      } catch (err) {
+        thinkingApi.setValue(selectedThinkingValue);
+        await uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  });
+  disableSelect(
+    thinkingMount,
+    !canEdit || ((!info.can_select_thinking || thinkingUnsupported) && !currentThinking),
+  );
+
+  if (!hidePermissionControl) {
+    const permissionMount = slot.querySelector('[data-role="permission"]');
+    let permissionApi;
+    permissionApi = _aiSelectMount(permissionMount, {
+      options: permissionOptions,
+      value: currentPermission,
+      onChange: async (value) => {
+        const next = String(value || '');
+        if (next === 'full_access') {
+          const confirmed = await uiConfirm(t('agents.cli_permission_full_access_warning'));
+          if (!confirmed) {
+            permissionApi.setValue(currentPermission);
+            return;
+          }
+        }
+        try {
+          await saveRuntime({ permission_policy: next });
+        } catch (err) {
+          permissionApi.setValue(currentPermission);
+          await uiAlert((err && err.message) || t('agents.update_failed'));
+        }
+      },
+    });
+    disableSelect(permissionMount, !canEdit || (info.can_select_permission === false && !currentPermission));
+  }
+
+}
+
+/** Project directory setting for external coding agents.
+ *  Stored in a local-only main-process config; each conversation copies
+ *  the effective value on its first coding-agent dispatch. */
+async function _renderAgentDetailProjectDir(agent) {
+  const section = document.getElementById('agents-detail-project-dir-section');
+  const slot = document.getElementById('agents-detail-project-dir');
+  if (!section || !slot) return;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const supportsProjectDir = typeof cliIsCodingAgent === 'function' && cliIsCodingAgent(cli);
+  if (!supportsProjectDir) {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    return;
+  }
+  section.style.display = '';
+  slot.dataset.agentId = agent.agent_id;
+
+  const canEdit = agent.source === 'custom';
+
+  const renderInfo = (info) => {
+    if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
+    const mode = info?.mode === 'custom' ? 'custom' : 'workspace';
+    const missing = mode === 'custom' && info.exists === false;
+    const pathText = String(info?.path || info?.workspace_path || '');
+    const badge = mode === 'custom'
+      ? t('agents.project_dir_custom')
+      : t('agents.project_dir_workspace');
+    const status = missing ? t('agents.project_dir_missing') : badge;
+    const cardClass = [
+      'agent-project-dir-card',
+      mode === 'workspace' ? 'is-workspace' : 'is-custom',
+      missing ? 'is-missing' : '',
+      canEdit ? '' : 'is-disabled',
+    ].filter(Boolean).join(' ');
+    slot.innerHTML = `
+      <div class="${cardClass}">
+        ${_agentUiIconHtml(missing ? 'warning' : 'folder-open', 'agent-project-dir-icon')}
+        <div class="agent-project-dir-main">
+          <div class="agent-project-dir-path" title="${escapeHtml(pathText)}">${escapeHtml(pathText)}</div>
+          <div class="agent-project-dir-mode">${escapeHtml(status)}</div>
+        </div>
+        <div class="agent-project-dir-actions">
+          <button type="button" class="btn btn-sm" data-act="pick" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('input.dir.change'))}</button>
+          ${mode === 'custom' ? `<button type="button" class="btn btn-sm" data-act="reset" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('agents.project_dir_use_workspace'))}</button>` : ''}
+        </div>
+      </div>`;
+    const pickBtn = slot.querySelector('[data-act="pick"]');
+    const resetBtn = slot.querySelector('[data-act="reset"]');
+    const pick = async () => {
+      if (!canEdit) return;
+      try {
+        const picked = await window.orkas.invoke('common.pickDirectory', {
+          title: t('agents.label_project_dir'),
+        });
+        if (!picked || picked.cancelled || !picked.path) return;
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: picked.path,
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    };
+    pickBtn?.addEventListener('click', (e) => { e.stopPropagation(); pick(); });
+    resetBtn?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!canEdit) return;
+      try {
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: '',
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    });
+  };
+
+  slot.innerHTML = `<div class="agent-project-dir-card is-loading">${_agentUiIconHtml('folder-open', 'agent-project-dir-icon')}<div class="agent-project-dir-main"><div class="agent-project-dir-path">${escapeHtml(t('common.loading'))}</div></div></div>`;
+  try {
+    const res = await window.orkas.invoke('agents.cliProjectDir.get', { agent_id: agent.agent_id });
+    if (!res || !res.ok || !res.info) throw new Error(res?.error || 'failed');
+    renderInfo(res.info);
+  } catch (err) {
+    _agentsLog.warn('load agent project dir failed', err);
+    slot.innerHTML = `<div class="agents-detail-placeholder">${escapeHtml(t('agents.project_dir_load_failed'))}</div>`;
+  }
+}
+
+/** Render the detail-page avatar slot. Custom agents get a clickable avatar
+ *  that opens the picker; builtin agents just show theirs read-only. Each
+ *  picker change is sent as an `agents.update` IPC and the local cache is
+ *  refreshed so the card grid reflects the new combo on next render. */
+function _renderAgentDetailAvatar(agent) {
+  const slot = document.getElementById('agents-detail-avatar');
+  if (!slot) return;
+  const isCommander = _isCommanderAgent(agent);
+  const isCustom = agent.source === 'custom' && !_isAgentProfileMock(agent);
+  const clickable = isCustom || isCommander;
+  const avatarHtml = renderAvatarHtml(agent.icon, agent.color, {
+    size: 32,
+    seed: agent.agent_id,
+    clickable,
+    extraClass: 'agents-detail-avatar',
+  });
+  slot.innerHTML = clickable
+    ? `<span class="agents-detail-avatar-edit-wrap">${avatarHtml}<span class="agents-detail-avatar-edit-badge" aria-hidden="true">${_agentUiIconHtml('edit-pencil', 'agents-detail-avatar-edit-icon')}</span></span>`
+    : avatarHtml;
+  if (!clickable) return;
+  const trigger = slot.querySelector('.avatar-circle');
+  if (!trigger) return;
+  trigger.title = t('avatar.change');
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (isAvatarPickerOpenFor(trigger)) { closeAvatarPicker(); return; }
+    const commanderIcon = (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT?.icon) || 'crown';
+    const cur = isCommander
+      ? { icon: commanderIcon, color: agent.color }
+      : { icon: agent.icon, color: agent.color };
+    const pickerOpts = isCommander
+      ? { allowCommanderCombo: true, hideIcons: true, colorLabelKey: 'avatar.background_label' }
+      : {};
+    openAvatarPicker(trigger, cur, pickerOpts, async (next) => {
+      // Optimistic in-place update — keeps the trigger element (and its
+      // click handler) intact so the picker stays interactive.
+      const nextIcon = isCommander ? commanderIcon : next.icon;
+      agent.icon = nextIcon;
+      agent.color = next.color;
+      applyAvatarToElement(trigger, nextIcon, next.color, agent.agent_id);
+      try {
+        if (isCommander) {
+          const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon: nextIcon, color: next.color });
+          if (res?.ok && res.avatar) {
+            _commanderAgentAvatar = { icon: nextIcon, color: res.avatar.color };
+            if (typeof setCommanderAvatarCache === 'function') setCommanderAvatarCache({ icon: nextIcon, color: res.avatar.color });
+            if (_agentsCache) renderAgentsList(_agentsCache);
+            if (typeof renderConversationList === 'function') renderConversationList();
+            if (typeof renderProjectsSection === 'function') renderProjectsSection();
+          } else throw new Error(res?.code || 'avatar_update_failed');
+        } else {
+          const res = await window.orkas.invoke('agents.update', {
+            agent_id: agent.agent_id,
+            updates: { icon: next.icon, color: next.color },
+          });
+          if (res?.ok && res.agent) {
+            const cached = _agentsCache?.find((a) => a.agent_id === agent.agent_id);
+            if (cached) { cached.icon = next.icon; cached.color = next.color; }
+            if (_agentsCache) renderAgentsList(_agentsCache);
+          } else throw new Error(res?.code || 'avatar_update_failed');
+        }
+      } catch (err) {
+      }
+    });
+  });
+}
+
+/** Per-agent enable / disable button in the detail header.
+ *  Clone-replace to drop any prior click handler bound to a stale
+ *  agent id. The button label flips between "enable" and "disable"
+ *  (whichever the click would do). */
+function _renderAgentEnabledButton(agent) {
+  const oldBtn = document.getElementById('agent-enabled-btn');
+  if (!oldBtn) return;
+  const enabled = agent.enabled !== false;
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+  btn.disabled = false;
+  btn.textContent = enabled ? t('component.disable') : t('component.enable');
+  btn.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try { await _flipAgentEnabled(agent.id, !enabled); }
+    finally { btn.disabled = false; }
+  });
+}
+
+function _toggleAgentFieldEditable(on) {
+  const nameEl = document.getElementById('agents-detail-name');
+  const nameInput = document.getElementById('agents-detail-name-input');
+  const descEl = document.getElementById('agents-detail-desc');
+  const workflowEl = document.getElementById('agents-detail-workflow');
+  if (nameEl) {
+    nameEl.setAttribute('contenteditable', 'false');
+    nameEl.classList.remove('is-editing');
+    nameEl.hidden = !!on;
+  }
+  if (nameInput) {
+    nameInput.hidden = !on;
+    nameInput.classList.toggle('is-editing', on);
+    nameInput.readOnly = !on;
+    nameInput.setAttribute('aria-label', t('agent_modal.name'));
+  }
+  for (const el of [descEl, workflowEl]) {
+    if (!el) continue;
+    el.setAttribute('contenteditable', on ? 'plaintext-only' : 'false');
+    el.classList.toggle('is-editing', on);
+  }
+}
+
+async function toggleAgentEditMode() {
+  if (!_selectedAgent) return;
+  if (_isAgentProfileMock(_selectedAgent.id)) return;
+  if (_agentEditing) {
+    await _exitAgentEditMode();
+  } else {
+    await _enterAgentEditMode();
+  }
+}
+
+async function _enterAgentEditMode() {
+  _agentEditing = true;
+  if (_isCommanderAgent(_selectedAgent?.id)) {
+    await _renderCommanderAgentDetail(true);
+    const chatCol = document.getElementById('agents-chat-col');
+    if (chatCol) chatCol.style.display = 'none';
+    return;
+  }
+  // Re-fetch to show raw workflow (not rendered markdown) for editing.
+  const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}`);
+  const data = await res.json();
+  const agent = data.ok && data.agent ? { ...data.agent, source: _agentSource(data.agent.source) } : null;
+  if (!agent) {
+    _agentEditing = false;
+    return;
+  }
+  if (!_canEnterAgentEditMode(agent)) {
+    _agentEditing = false;
+    return;
+  }
+  _renderAgentDetail(agent, true);
+  // External agents have no LLM-driven authoring. Marketplace installs in
+  // the open-source build are memory-only edits. Both hide the edit chat.
+  const isExternal = !!(agent.runtime?.kind === 'cli');
+  const isMemoryOnly = !_canEditAgentDefinition(agent) && _canEditAgentMemory(agent);
+  const chatCol = document.getElementById('agents-chat-col');
+  if (chatCol) chatCol.style.display = (isExternal || isMemoryOnly) ? 'none' : '';
+  if (!isExternal && !isMemoryOnly) {
+    await _loadAgentChatHistory(_selectedAgent.id);
+    setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
+  } else if (isExternal) {
+    setTimeout(() => document.getElementById('agents-detail-name-input')?.focus(), 50);
+  }
+  // Wire field blur-save (one-time attach)
+  _bindAgentFieldSave();
+}
+
+async function _exitAgentEditMode() {
+  _agentEditing = false;
+  // Abort any in-flight reply so the "done" button stops the stream immediately. The
+  // agent chat controller is a singleton; leaving it pending also leaks the
+  // streaming-button state into the next agent's edit panel.
+  try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
+  if (_isCommanderAgent(_selectedAgent?.id)) {
+    clearTimeout(_agentFieldSaveTimer);
+    _agentFieldSaveTimer = null;
+    _pendingAgentField = null;
+    document.getElementById('agents-chat-col').style.display = 'none';
+    await _renderCommanderAgentDetail(false);
+    await loadAgents(true);
+    return;
+  }
+  // Flush any pending save and then re-render in readonly mode.
+  // The Done button is the explicit commit point — validate name here so
+  // a bad value alerts + reverts rather than silently lingering.
+  await _flushAgentFieldSave({ validate: true });
+  document.getElementById('agents-chat-col').style.display = 'none';
+  const aid = _selectedAgent?.id;
+  if (aid) {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
+    const data = await res.json();
+    if (data.ok && data.agent) _renderAgentDetail(data.agent, false);
+  }
+  await loadAgents(true);
+}
+
+function _bindAgentFieldSave() {
+  const fields = [
+    ['agents-detail-name-input', 'name', (el) => el.value],
+    ['agents-detail-desc', 'description', (el) => el.innerText],
+    ['agents-detail-workflow', 'workflow', (el) => el.innerText],
+  ];
+  for (const [id, field, readValue] of fields) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (el.dataset.bound === '1') continue;
+    el.dataset.bound = '1';
+    if (field === 'name' && typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(el);
+    el.addEventListener('input', () => _scheduleAgentFieldSave(field, readValue(el)));
+    el.addEventListener('blur', () => _flushAgentFieldSave());
+  }
+}
+
+function _restoreAgentNameField() {
+  const next = _selectedAgent?.name || '';
+  const nameEl = document.getElementById('agents-detail-name');
+  const nameInput = document.getElementById('agents-detail-name-input');
+  if (nameEl) nameEl.textContent = next;
+  if (nameInput) nameInput.value = next;
+}
+
+function _scheduleAgentFieldSave(field, value) {
+  if (!_selectedAgent) return;
+  if (_isAgentPlatformSource(_selectedAgent.source)) return;
+  _pendingAgentField = { field, value };
+  clearTimeout(_agentFieldSaveTimer);
+  _agentFieldSaveTimer = setTimeout(_flushAgentFieldSave, 800);
+}
+
+let _pendingAgentField = null;
+// `validate` is only true when the user explicitly commits (clicks "done" →
+// `_exitAgentEditMode`). Typing-debounced and blur-triggered flushes pass
+// false: a bad name silently skips the save (the DOM keeps the user's
+// in-progress text) instead of popping a uiAlert mid-keystroke.
+async function _flushAgentFieldSave({ validate = false } = {}) {
+  clearTimeout(_agentFieldSaveTimer);
+  _agentFieldSaveTimer = null;
+  if (!_pendingAgentField || !_selectedAgent) return;
+  const { field, value } = _pendingAgentField;
+  if (field === 'name') {
+    const blank = !String(value || '').trim();
+    const hasWhitespace = /\s/.test(String(value || ''));
+    const reserved = !hasWhitespace && _isReservedAgentName(value);
+    const invalid = hasWhitespace || (!reserved && !_isValidAgentNameCharset(value));
+    if (blank || reserved || invalid) {
+      if (!validate) return;
+      _pendingAgentField = null;
+      await uiAlert(t(reserved ? 'agents.name_reserved' : 'agents.name_invalid'));
+      _restoreAgentNameField();
+      return;
+    }
+  }
+  _pendingAgentField = null;
+  try {
+    const body = { [field]: value };
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      // Surface duplicate-name / reserved-name with their localised messages
+      // instead of the raw English server text.
+      const localised = _agentCreateErrorMessage(data);
+      throw new Error(localised || data.error || 'save failed');
+    }
+    if (field === 'name') {
+      const nextName = data.agent?.name || String(value || '').trim();
+      _selectedAgent = { ..._selectedAgent, name: nextName };
+      const nameEl = document.getElementById('agents-detail-name');
+      const nameInput = document.getElementById('agents-detail-name-input');
+      if (nameEl) nameEl.textContent = nextName;
+      if (nameInput) nameInput.value = nextName;
+    }
+    // Eagerly refresh — name changes feed the chat-bubble @-mention regex
+    // (`_buildMentionRe` reads `_agentsCache`); leaving the cache null until
+    // the next picker open means freshly-typed `@<multi-word-name>` only
+    // gets the fallback char class, which stops at the first whitespace.
+    await loadAgents(true);
+    // Repaint the input-box recipient chip if it's bound to this agent —
+    // its `name` field is a localStorage snapshot taken at picker time, so
+    // without an explicit re-render the chip keeps showing the old name
+    // until the next view switch.
+    if (field === 'name' && typeof _renderRecipientChip === 'function') {
+      try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+    }
+  } catch (e) {
+    _agentsLog.warn('save agent field failed', e);
+    if (field === 'name') {
+      await uiAlert(e.message || t('agents.create_failed'));
+      _restoreAgentNameField();
+    }
+  }
+}
+
+// ─── Create agent (modal-first, two tabs: Create / External) ───
+//
+// "Create" (default tab) — manual authoring of an in-process agent.
+// The LLM-driven edit chat opens immediately on save so the workflow
+// can be refined.
+//
+// "External" — bind a local CLI as the runtime. The CLI selector sits
+// at the top and defaults to the first available CLI, which auto-fills
+// name + description from
+// CLI_DEFAULTS. The user can override either; subsequent CLI swaps
+// only re-fill fields that still match the previous CLI's defaults
+// (so a user-edited value is never clobbered).
+//
+// Track the last-applied CLI defaults so that "switch CLI → fields
+// follow" can detect "did the user touch this field?". `null` =
+// nothing applied yet (untouched-default state, or the "create" tab).
+
+function _switchAgentTab(tab) {
+  _agentModalActiveTab = tab;
+  const tabs = document.querySelectorAll('#agent-modal-tabs [data-agent-tab]');
+  tabs.forEach((el) => el.classList.toggle('is-active', el.dataset.agentTab === tab));
+  const panels = document.querySelectorAll('#agent-modal [data-agent-panel]');
+  panels.forEach((el) => el.classList.toggle('is-active', el.dataset.agentPanel === tab));
+  const msgEl = document.getElementById('agent-form-msg');
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
+  _syncAgentCreateSaveButton(tab);
+  setTimeout(() => {
+    const focusId = tab === 'external' ? 'agent-modal-ext-cli-select' : 'agent-name-input';
+    const el = document.getElementById(focusId);
+    const modal = document.getElementById('agent-modal');
+    const activeEl = document.activeElement;
+    // Opening the modal is asynchronous. If the user has already moved into
+    // another field, do not let this deferred initial-focus task steal focus
+    // and redirect their keystrokes back into the name input.
+    if (modal && activeEl && modal.contains(activeEl) && activeEl !== el) return;
+    // ai-select wrapper isn't focusable directly; just leave it alone.
+    if (el && typeof el.focus === 'function' && el.tagName !== 'DIV') el.focus();
+  }, 30);
+  // CLI discovery is process-heavy and belongs only to the External flow.
+  // Start it when that panel actually becomes visible, not whenever the
+  // default in-process create modal opens.
+  if (tab === 'external' && typeof mountExternalCliSelect === 'function') {
+    mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
+  }
+}
+window._switchAgentTab = _switchAgentTab;
+
+// Track which CLI defaults are currently reflected in the External-tab
+// inputs. When a user types over a default, the field key drops out of
+// this set so subsequent CLI swaps don't overwrite the typed value.
+let _extActiveCli = null;
+let _extDefaultFieldsAtMount = { name: false, desc: false };
+let _agentModalReturnFocusId = '';
+let _agentModalEntryPoint = '';
+let _agentModalSourceView = '';
+let _agentModalReturnTarget = null;
+let _agentModalOpenedAt = 0;
+let _externalAgentCreateAvailable = false;
+let _agentModalActiveTab = 'create';
+
+function _syncAgentCreateSaveButton(tab = '') {
+  const activeTab = tab
+    || _agentModalActiveTab;
+  const saveButton = document.getElementById('agent-save-btn');
+  if (saveButton) {
+    saveButton.disabled = activeTab === 'external' && !_externalAgentCreateAvailable;
+  }
+}
+
+function setExternalAgentCreateAvailability(available) {
+  _externalAgentCreateAvailable = available === true;
+  _syncAgentCreateSaveButton();
+}
+window.setExternalAgentCreateAvailability = setExternalAgentCreateAvailability;
+
+/** Decide whether a current `name` value still counts as "the default
+ *  for `defaultName`" — meaning a CLI swap should overwrite it. We
+ *  recognise the bare default plus the dedup-style suffixes a user
+ *  is likely to add when fighting the name-taken error: "ClaudeCode",
+ *  "ClaudeCode2", "ClaudeCode-2", "ClaudeCode(2)", etc. Anything
+ *  with non-digit text after the default ("ClaudeCodePro") counts as
+ *  user-edited and is kept. */
+function _isDefaultlikeName(value, defaultName) {
+  if (!value) return true;
+  if (!defaultName) return false;
+  if (value === defaultName) return true;
+  const escaped = defaultName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp('^' + escaped + '\\s*(?:[-_]\\s*)?(?:\\(\\s*\\d+\\s*\\)|\\d+)$');
+  return re.test(value);
+}
+
+function _nextDefaultAgentNameSuffix(value, defaultName) {
+  if (!_isDefaultlikeName(value, defaultName)) return null;
+  if (value === defaultName) return 2;
+  const suffix = String(value).slice(defaultName.length).match(/\d+/);
+  const current = suffix ? Number.parseInt(suffix[0], 10) : 1;
+  return Number.isFinite(current) ? Math.max(2, current + 1) : 2;
+}
+
+function _applyExternalCliDefaults(cliType, { force = false } = {}) {
+  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cliType) : null;
+  const nameEl = document.getElementById('agent-ext-name-input');
+  const descEl = document.getElementById('agent-ext-desc-input');
+  if (!nameEl || !descEl) return;
+
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  const localizedDesc = defaults ? pickDesc(defaults, lang) : '';
+  const targetName = defaults ? defaults.name : '';
+  const targetDesc = localizedDesc;
+
+  // Decide per field whether to overwrite. The two checks are independent —
+  // a user who edits the name but leaves the description alone keeps their
+  // name and gets a refreshed description. "Default-like name" also covers
+  // dedup suffixes like "ClaudeCode2" (added to dodge name-taken errors).
+  const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
+  const prevDescLocalized = prev ? pickDesc(prev, lang) : '';
+
+  const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
+  const descUntouched = force
+    || descEl.value === ''
+    || (prev && descEl.value === prevDescLocalized);
+
+  if (cliType === null) {
+    // Reverted to "not selected" — only clear fields that still hold
+    // the previous CLI's defaults. Keep user-typed text.
+    if (nameUntouched) nameEl.value = '';
+    if (descUntouched) descEl.value = '';
+  } else {
+    if (nameUntouched) nameEl.value = targetName;
+    if (descUntouched) descEl.value = targetDesc;
+  }
+  _extActiveCli = cliType;
+}
+
+function openAgentModal(options = {}) {
+  const requestedTab = typeof options === 'string' ? options : options?.initialTab;
+  const initialTab = requestedTab === 'external' ? 'external' : 'create';
+  const externalOnly = typeof options === 'object' && options?.externalOnly === true;
+  _agentModalReturnFocusId = typeof options === 'object'
+    ? String(options?.returnFocusId || '')
+    : '';
+  _agentModalEntryPoint = typeof options === 'object'
+    ? String(options?.entryPoint || '')
+    : '';
+  _agentModalSourceView = typeof options === 'object'
+    ? String(options?.sourceView || '')
+    : '';
+  _agentModalReturnTarget = _captureAgentDetailReturnTarget();
+  _agentModalOpenedAt = performance.now();
+  _externalAgentCreateAvailable = false;
+  const modal = document.getElementById('agent-modal');
+  const msgEl = document.getElementById('agent-form-msg');
+  msgEl.textContent = '';
+  msgEl.className = 'form-msg';
+
+  // The external-only entry binds a CLI that already exists, so "New agent"
+  // misdescribes it. Swap the key rather than the rendered string, so a later
+  // language change re-renders the title this dialog is actually showing.
+  const titleEl = document.getElementById('agent-modal-title');
+  if (titleEl?.dataset) {
+    titleEl.dataset.i18n = externalOnly ? 'agent_modal.title_connect' : 'agent_modal.title';
+    titleEl.textContent = t(titleEl.dataset.i18n);
+  }
+
+  // Reset both panels' inputs.
+  const nameInput = document.getElementById('agent-name-input');
+  const descInput = document.getElementById('agent-desc-input');
+  const extName = document.getElementById('agent-ext-name-input');
+  const extDesc = document.getElementById('agent-ext-desc-input');
+  if (nameInput) nameInput.value = '';
+  if (descInput) descInput.value = '';
+  if (extName) extName.value = '';
+  if (extDesc) extDesc.value = '';
+  _extActiveCli = null;
+  _extDefaultFieldsAtMount = { name: true, desc: true };
+  if (typeof setExternalCliValue === 'function') setExternalCliValue(null);
+  if (typeof window.bindNameLimitControl === 'function') {
+    window.bindNameLimitControl(nameInput);
+    window.bindNameLimitControl(extName);
+  }
+
+  // Wire tabs (idempotent).
+  const tabBar = document.getElementById('agent-modal-tabs');
+  if (tabBar) tabBar.hidden = externalOnly;
+  if (tabBar && !tabBar.dataset.wired) {
+    tabBar.querySelectorAll('[data-agent-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => _switchAgentTab(btn.dataset.agentTab));
+    });
+    tabBar.dataset.wired = '1';
+  }
+  _switchAgentTab(initialTab);
+
+  modal.classList.add('open');
+}
+window.openAgentModal = openAgentModal;
+
+function closeAgentModal(options = {}) {
+  const restoreFocus = options?.restoreFocus === true;
+  const returnFocusId = _agentModalReturnFocusId;
+  _agentModalReturnFocusId = '';
+  document.getElementById('agent-modal').classList.remove('open');
+  _agentModalOpenedAt = 0;
+  _agentModalEntryPoint = '';
+  _agentModalSourceView = '';
+  _agentModalReturnTarget = null;
+  _agentModalActiveTab = 'create';
+  if (restoreFocus && returnFocusId) {
+    setTimeout(() => document.getElementById(returnFocusId)?.focus(), 0);
+  }
+}
+window.closeAgentModal = closeAgentModal;
+
+function cancelAgentModal() {
+  closeAgentModal({ restoreFocus: true });
+}
+window.cancelAgentModal = cancelAgentModal;
+
+async function saveAgentModal() {
+  const msgEl = document.getElementById('agent-form-msg');
+  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
+  if (activeTab === 'external') return _saveExternalAgent({ msgEl });
+  return _saveCreateAgent({ msgEl });
+}
+window.saveAgentModal = saveAgentModal;
+
+async function _saveCreateAgent({ msgEl }) {
+  const startedAt = performance.now();
+  const rawName = document.getElementById('agent-name-input').value;
+  const name = rawName.trim();
+  const description = document.getElementById('agent-desc-input').value.trim();
+  if (!name) {
+    msgEl.textContent = t('agents.input_name_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-name-input').focus();
+    return;
+  }
+  const hasWhitespace = /\s/.test(rawName);
+  const reserved = !hasWhitespace && _isReservedAgentName(name);
+  if (hasWhitespace || (!reserved && !_isValidAgentNameCharset(rawName))) {
+    msgEl.textContent = t('agents.name_invalid');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-name-input').focus();
+    return;
+  }
+  if (reserved) {
+    msgEl.textContent = t('agents.name_reserved');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-name-input').focus();
+    return;
+  }
+  if (!description) {
+    msgEl.textContent = t('agents.input_desc_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-desc-input').focus();
+    return;
+  }
+
+  try {
+    // Leave the icon unset so the immediately-started agent authoring model
+    // can choose semantically from the controlled catalog. The renderer's
+    // legacy seed fallback covers the brief pre-authoring state.
+    const body = { name, description, category: 'general' };
+    const res = await apiFetch('/api/agents/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.agent) {
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
+      msgEl.className = 'form-msg err';
+      return;
+    }
+    const detailReturnTarget = _agentModalReturnTarget;
+    closeAgentModal();
+    await loadAgents(true);
+    await openAgentDetail(data.agent.agent_id, { returnTarget: detailReturnTarget });
+    await _enterAgentEditMode();
+    const seed = t('agents.seed_workflow_model', { name, description });
+    await _autoSendAgentChat(t('agents.seed_workflow'), { model_text: seed });
+  } catch (e) {
+    msgEl.textContent = t('agents.network_error', { reason: e.message || e });
+    msgEl.className = 'form-msg err';
+  }
+}
+
+async function _saveExternalAgent({ msgEl }) {
+  const startedAt = performance.now();
+  const cli = (typeof getExternalCliValue === 'function') ? getExternalCliValue() : null;
+  const cliWarning = (typeof getExternalCliSelectionWarning === 'function')
+    ? getExternalCliSelectionWarning()
+    : '';
+  const nameEl = document.getElementById('agent-ext-name-input');
+  const descEl = document.getElementById('agent-ext-desc-input');
+  const originalName = nameEl.value;
+  const rawName = originalName.replace(/\s+/g, '');
+  if (rawName !== originalName) nameEl.value = rawName;
+  let name = rawName.trim();
+  let desc = descEl.value.trim();
+  const cliDefaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
+  if (!desc && cliDefaults) {
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    desc = String(pickDesc(cliDefaults, lang) || '').trim();
+    if (desc) descEl.value = desc;
+  }
+  if (!cli) {
+    msgEl.textContent = t('agents.ext_cli_needed');
+    msgEl.className = 'form-msg err';
+    return;
+  }
+  if (cliWarning) {
+    msgEl.textContent = cliWarning;
+    msgEl.className = 'form-msg err';
+    return;
+  }
+  if (!name) {
+    msgEl.textContent = t('agents.input_name_needed');
+    msgEl.className = 'form-msg err';
+    nameEl.focus();
+    return;
+  }
+  const hasWhitespace = /\s/.test(rawName);
+  const reserved = !hasWhitespace && _isReservedAgentName(name);
+  if (hasWhitespace || (!reserved && !_isValidAgentNameCharset(rawName))) {
+    msgEl.textContent = t('agents.name_invalid');
+    msgEl.className = 'form-msg err';
+    nameEl.focus();
+    return;
+  }
+  if (reserved) {
+    msgEl.textContent = t('agents.name_reserved');
+    msgEl.className = 'form-msg err';
+    nameEl.focus();
+    return;
+  }
+  if (!desc) {
+    msgEl.textContent = t('agents.input_desc_needed');
+    msgEl.className = 'form-msg err';
+    descEl.focus();
+    return;
+  }
+
+  try {
+    const defaultName = cliDefaults?.name || '';
+    let nextSuffix = _nextDefaultAgentNameSuffix(name, defaultName);
+    let data = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const body = {
+        name,
+        description: desc,
+        // CLI-backed agents do not run the LLM authoring pass, so use the
+        // stable role-specific coding avatar instead of a random pair.
+        icon: 'code', color: 'sage',
+        runtime: { kind: 'cli', cli },
+        category: 'general',
+      };
+      const res = await apiFetch('/api/agents/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      data = await res.json();
+      if (data.ok && data.agent) break;
+      if (data.code !== 'E_AGENT_NAME_TAKEN' || nextSuffix === null || attempt === 19) break;
+      name = `${defaultName}-${nextSuffix}`;
+      nextSuffix += 1;
+      nameEl.value = name;
+    }
+    if (!data.ok || !data.agent) {
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
+      msgEl.className = 'form-msg err';
+      return;
+    }
+    const detailReturnTarget = _agentModalReturnTarget;
+    closeAgentModal();
+    await loadAgents(true);
+    // External agents go straight to the detail view but skip the LLM
+    // edit-chat — there's nothing to author. The user can still rename
+    // or reword the description through the inline name/desc editors.
+    await openAgentDetail(data.agent.agent_id, { returnTarget: detailReturnTarget });
+  } catch (e) {
+    msgEl.textContent = t('agents.network_error', { reason: e.message || e });
+    msgEl.className = 'form-msg err';
+  }
+}
+
+/** Normalise IPC-shim error replies into a user-facing message. The
+ *  backend tags duplicate-name / reserved-name failures with a `code`
+ *  so we surface the localised string instead of the raw "agent name
+ *  ... is already in use" English text. */
+function _agentCreateErrorMessage(data) {
+  if (!data) return '';
+  const code = data.code;
+  if (code === 'E_AGENT_NAME_TAKEN') return t('agents.name_taken');
+  if (code === 'E_AGENT_NAME_RESERVED') return t('agents.name_reserved');
+  if (code === 'E_AGENT_NAME_INVALID') return t('agents.name_invalid');
+  if (code === 'E_AGENT_NAME_TOO_LONG') return t('agents.name_too_long');
+  return data.error || '';
+}
+
+async function _autoSendAgentChat(content, extraBody) {
+  if (!_selectedAgent) return;
+  const container = document.getElementById('agents-chat-messages');
+  if (!container) return;
+  // Only auto-seed when the chat is empty (fresh agent).
+  const existing = container.querySelectorAll('.chat-message');
+  if (existing.length > 0) return;
+  _ensureAgentChatController();
+  await _agentChatCtrl.send(content, extraBody);
+}
+
+async function deleteSelectedAgent() {
+  if (!_selectedAgent) return;
+  if (_isCommanderAgent(_selectedAgent.id)) return;
+  if (_isAgentProfileMock(_selectedAgent.id)) return;
+  const isMarketplace = _isAgentPlatformSource(_selectedAgent.source);
+  if (isMarketplace) return;
+  const agentId = _selectedAgent.id;
+  const confirmKey = isMarketplace ? 'agents.uninstall_confirm' : 'agents.delete_confirm';
+  const failedKey = isMarketplace ? 'agents.uninstall_failed' : 'agents.delete_failed';
+  const failedWithKey = isMarketplace ? 'agents.uninstall_failed_with' : 'agents.delete_failed_with';
+  if (!(await uiConfirm(t(confirmKey, { name: _selectedAgent.name || agentId })))) return;
+  let data;
+  try {
+    data = isMarketplace
+      ? await window.orkas.invoke('agents.builtin.delete', { agent_id: agentId })
+      : await (await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' })).json();
+  } catch (e) {
+    await uiAlert(t(failedWithKey, { reason: e.message || e }));
+    return;
+  }
+  if (!data || !data.ok) {
+    await uiAlert(t(failedWithKey, { reason: data?.error || t(failedKey) }));
+    return;
+  }
+  _selectedAgent = null; _agentEditing = false;
+  document.getElementById('agents-chat-col').style.display = 'none';
+  document.getElementById('agents-detail-content').style.display = 'none';
+  _showAgentsGridView();
+  try {
+    await loadAgents(true);
+    await loadConversations();
+  } catch (_) {
+    _agentsLog.warn('agent delete refresh failed', { error_code: 'refresh_failed' });
+  }
+}
+
+// ─── Agent inline edit chat ───
+
+let _agentChatCtrl = null;
+let _agentEditAttachmentsBound = false;
+
+function _agentEditAttachmentCid(agentId) {
+  return agentId ? `agent-edit-${agentId}` : '';
+}
+
+function _bindAgentEditAttachments() {
+  if (_agentEditAttachmentsBound) return;
+  _agentEditAttachmentsBound = true;
+  const btn = document.getElementById('agents-chat-attach-btn');
+  const area = document.querySelector('.agents-chat-input-area');
+  const input = document.getElementById('agents-chat-input');
+  const currentCid = () => _agentEditAttachmentCid(_selectedAgent?.id || '');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      const cid = currentCid();
+      if (cid) await _chatAttachPickAndUpload(cid, 'picker');
+    });
+  }
+  if (area) {
+    area.addEventListener('dragover', (e) => {
+      const hasFiles = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length;
+      const hasInternal = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes(ORKAS_FILE_DRAG_MIME);
+      if (!hasFiles && !hasInternal) return;
+      e.preventDefault();
+      area.classList.add('drag-over');
+    });
+    area.addEventListener('dragleave', () => area.classList.remove('drag-over'));
+    area.addEventListener('drop', async (e) => {
+      const cid = currentCid();
+      if (!cid) return;
+      const internal = _chatAttachInternalDragItems(e.dataTransfer);
+      if (internal.length) {
+        e.preventDefault();
+        area.classList.remove('drag-over');
+        await _chatAttachImportPaths(cid, internal, 'internal_drop');
+        return;
+      }
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        e.preventDefault();
+        area.classList.remove('drag-over');
+        await _chatAttachUpload(cid, e.dataTransfer.files, 'drop');
+      }
+    });
+  }
+  if (input) {
+    input.addEventListener('paste', async (e) => {
+      if (!e.clipboardData || !e.clipboardData.files || !e.clipboardData.files.length) return;
+      const cid = currentCid();
+      if (!cid) return;
+      e.preventDefault();
+      await _chatAttachUpload(cid, e.clipboardData.files, 'paste');
+    });
+  }
+}
+
+async function _buildAgentEditChatExtraBody(_content, agentId, state) {
+  const cid = _agentEditAttachmentCid(agentId);
+  const items = _chatAttachList(cid);
+  if (!items.length) return undefined;
+  if (items.some((a) => a.status === 'uploading')) {
+    await uiAlert(t('chat.attach_still_uploading'));
+    return null;
+  }
+  const attachments = items.filter((a) => a.status !== 'error').map((a) => a.name);
+  if (!attachments.length) return undefined;
+  if (state && (state.pending || state.hasQueue)) {
+    await uiAlert(t('chat.attach_queue_blocked'));
+    return null;
+  }
+  _chatAttachClear(cid);
+  return { attachments, attachment_cid: cid };
+}
+
+function _ensureAgentChatController() {
+  if (_agentChatCtrl) return _agentChatCtrl;
+  _bindAgentEditAttachments();
+  _agentChatCtrl = createChatController({
+    historyEl: 'agents-chat-messages',
+    inputEl: 'agents-chat-input',
+    sendBtnEl: 'agents-chat-send-btn',
+    getCurrentId: () => _selectedAgent?.id || null,
+    historyEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat`,
+    streamEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat/send/stream`,
+    clearEndpoint: (id) => `/api/agents/${encodeURIComponent(id)}/chat`,
+    features: { archive: false, scrollPin: true, queue: true, messageActions: 'errors-only' },
+    queue: {
+      keyPrefix: 'agent',
+      panelId: 'agents-chat-queue',
+      listId: 'agents-chat-queue-list',
+      countId: 'agents-chat-queue-count',
+    },
+    hooks: {
+      buildExtraBody: _buildAgentEditChatExtraBody,
+      async onFinal(ev, msgEl, id) {
+        // Agent edit chat may have rewritten name / description / workflow;
+        // the `updated` object on the final event carries the diff.
+        if (ev.updated && Object.keys(ev.updated).length) {
+          try {
+            const freshRes = await apiFetch(`/api/agents/${encodeURIComponent(id)}`);
+            const freshData = await freshRes.json();
+            if (freshData.ok && freshData.agent && _selectedAgent?.id === id) {
+              _selectedAgent.name = freshData.agent.name;
+              _renderAgentDetail(freshData.agent, true);
+              _agentsCache = null;
+              await loadAgents(true);
+              // Repaint the chat input recipient chip in case its bound
+              // agent was the one just renamed by the edit chat.
+              if (typeof _renderRecipientChip === 'function') {
+                try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+              }
+            }
+          } catch (e) {
+            _agentsLog.warn('refresh after updated fields failed', e);
+          }
+        }
+      },
+    },
+  });
+  return _agentChatCtrl;
+}
+
+async function _loadAgentChatHistory(agentId) {
+  _ensureAgentChatController();
+  await _agentChatCtrl.loadHistory();
+  await _chatAttachRefreshFromServer(_agentEditAttachmentCid(agentId));
+  // Custom empty-state message for fresh agents — controller's default is
+  // "no messages..."; replace it with an agent-specific prompt when empty.
+  const container = document.getElementById('agents-chat-messages');
+  const empty = container?.querySelector('.empty');
+  const defaultEmptyText = t('chat.empty');
+  if (empty && (empty.textContent === defaultEmptyText || empty.textContent.includes('无对话记录') || empty.textContent.includes('No messages'))) {
+    empty.textContent = t('agents.edit_chat_empty');
+  }
+}
+
+async function clearAgentChat() {
+  if (!_selectedAgent) return;
+  if (!(await uiConfirm(t('agents.clear_confirm')))) return;
+  _ensureAgentChatController();
+  await _agentChatCtrl.clear();
+}
+
+// ─── "Use" flow: preselect in the Commander composer ───
+
+/**
+ * Select an agent in the Commander tab and wait for the user's next message.
+ */
+async function useAgent(agentId) {
+  if (_isAgentProfileMock(agentId)) return;
+  if (_isCommanderAgent(agentId)) {
+    _agentsLog.info('use commander');
+    setView('new-chat');
+    if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
+    if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
+    setTimeout(() => {
+      document.getElementById('new-chat-input')?.focus();
+    }, 50);
+    return;
+  }
+  if (_agentsCache?.some((a) => a.agent_id === agentId && a.enabled === false)) return;
+  try {
+    const aRes = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
+    const aData = await aRes.json();
+    if (!aData.ok || !aData.agent) throw new Error(aData.error || t('agents.agent_not_found'));
+    const agent = aData.agent;
+    if (agent.enabled === false) return;
+
+    _agentsLog.info('use agent', { agent_id: agentId });
+
+    setView('new-chat');
+    setChatRecipient('new-chat', {
+      kind: 'agent',
+      id: agentId,
+      name: agent.name || agent.agent_id,
+    });
+    if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
+    setTimeout(() => {
+      document.getElementById('new-chat-input')?.focus();
+    }, 50);
+  } catch (e) {
+    await uiAlert(t('agents.launch_failed', { reason: e.message || e }));
+  }
+}
+
+async function useSkill(skillId, skillName, skillSource) {
+  if (typeof _skillsCache !== 'undefined'
+      && _skillsCache?.some((s) => s.id === skillId && s.enabled === false)) return;
+  // Open-tier skills (external packages / global folders) live in their own
+  // cache; a disabled one must not run from its card's play button either.
+  if (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache)
+      && _openSkillsCache.some((s) => s.id === skillId && s.enabled === false)) return;
+  // Skill "use" flow: navigate to the new-chat page with the skill
+  // pre-selected and wait for user input.
+  _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
+  setView('new-chat');
+  if (typeof setChatRecipient === 'function') {
+    setChatRecipient('new-chat', { kind: 'commander' });
+  }
+  setChatUseSelection('new-chat', {
+    kind: 'skill',
+    id: skillId,
+    name: skillName || skillId,
+    ...(['marketplace', 'custom', 'external', 'global'].includes(skillSource)
+      ? { source: skillSource }
+      : {}),
+  });
+  setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
+}
+
+// ─── Agent picker (one-shot, works on both new-chat and conversation) ───
+// Selecting an agent immediately fires a send with the agent's workflow
+// auto-injected on the backend. The selection does NOT persist — the user
+// picks an agent each time they need one.
+
+// When a dropdown must flip upward, place it above the **input area** (not
+// just the anchor button) so it never covers the textarea. Downward remains
+// the standard first choice shared by every anchored dropdown.
+const _INPUT_AREA_CLASS_RE = /(?:^|\s)(?:chat|new-chat|skills-chat|agents-chat)-input-(?:wrapper|area)(?:\s|$)/;
+function _findInputAreaTop(anchorEl) {
+  let cur = anchorEl;
+  while (cur && cur !== document.body) {
+    const cls = cur.className;
+    if (typeof cls === 'string' && _INPUT_AREA_CLASS_RE.test(cls)) {
+      return cur.getBoundingClientRect().top;
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+function _positionPopoverAboveOrBelow(popover, anchorEl) {
+  // Make invisible but laid out so we can measure it before positioning.
+  popover.style.display = 'flex';
+  popover.style.left = '-9999px';
+  popover.style.top = '-9999px';
+  popover.style.maxHeight = '';
+  const rect = anchorEl.getBoundingClientRect();
+  const popRect = popover.getBoundingClientRect();
+  const margin = 12;
+  const gap = 8;
+  // Reference top for "above" computation: top of the whole input area
+  // when the anchor lives in the chat composer; otherwise the anchor's
+  // own top. This keeps the popover from overlapping the textarea on
+  // chat panels while still working for any other future anchor.
+  const aboveRef = _findInputAreaTop(anchorEl);
+  const refTop = aboveRef !== null ? aboveRef : rect.top;
+  const placement = _dropdownVerticalPlacement(
+    rect,
+    popRect.height,
+    window.innerHeight,
+    { edge: margin, gap, aboveReferenceTop: refTop },
+  );
+
+  let left = rect.left;
+  if (left + popRect.width > window.innerWidth - margin) {
+    left = window.innerWidth - popRect.width - margin;
+  }
+  if (left < margin) left = margin;
+
+  if (popRect.height > placement.availableHeight) {
+    popover.style.maxHeight = placement.availableHeight + 'px';
+  }
+  popover.style.left = left + 'px';
+  popover.style.top = placement.top + 'px';
+  popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
+}
+
+// Expose so skills.js can reuse the same positioning math (DRY across the
+// two pickers; behaviour must stay identical so users get consistent UX).
+if (typeof window !== 'undefined') {
+  window.positionPickerPopover = _positionPopoverAboveOrBelow;
+}
+
+// Project scope state for the active picker session: when the anchor's
+// active context (commander tab / current conv) belongs to a project, the
+// picker collapses to that project's bound agents. `null` = no project
+// scope active (orphan conv / no project picked) → unrestricted listing.
+// Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
+// the search-input change handler so live filtering stays scoped.
+let _pickerBoundAgentIds = null;
+let _pickerProjectId = '';
+let _pickerLibraryRows = null;
+let _pickerLibraryLoading = null;
+let _pickerLibraryRenderSeq = 0;
+let _agentPickerTab = 'agents';
+let _agentPickerOpenSeq = 0;
+let _agentPickerLoadedTabs = new Set();
+const _agentPickerTabLoads = new Map();
+let _pickerProjectContextLoading = false;
+let _pickerProjectContextSeq = 0;
+const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors', 'library'];
+const _AGENT_PICKER_TABS = new Set(_AGENT_PICKER_TAB_ORDER);
+
+function _normalizeAgentPickerTab(tab) {
+  return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
+}
+
+function _agentPickerAllowsLibrary(anchorId) {
+  return anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip'
+    || anchorId === 'auto-recipient-chip';
+}
+
+/** Composer anchors that may offer the coding-CLI entry. The automation
+ *  dialog is excluded on purpose: it is a `.ui-dialog-overlay` (z-index 13000)
+ *  and `openAgentModal` opens a plain `.modal-overlay` (z-index 100), so the
+ *  create dialog would open behind the task the user is still filling in. */
+function _agentPickerAllowsCliEntry(anchorId) {
+  return anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
+}
+
+function _agentPickerVisibleTabs(anchorId) {
+  // Skills and connectors use the same visible picker surface for commander
+  // and agent recipients; runtime capability gates live in the main process.
+  return _AGENT_PICKER_TAB_ORDER.filter((tab) => tab !== 'library' || _agentPickerAllowsLibrary(anchorId));
+}
+
+function _agentPickerSearchPlaceholder() {
+  if (_agentPickerTab === 'skills') return t('agent_picker.search_skills_placeholder');
+  if (_agentPickerTab === 'connectors') return t('agent_picker.search_connectors_placeholder');
+  if (_agentPickerTab === 'library') return t('agent_picker.search_library_placeholder');
+  return t('agent_picker.search_placeholder');
+}
+
+function _updateAgentPickerChrome() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker) return;
+  const visibleTabs = new Set(_agentPickerVisibleTabs(picker.dataset.anchorId || ''));
+  picker.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    const tab = btn.dataset.agentPickerTab || 'agents';
+    const visible = visibleTabs.has(tab);
+    btn.style.display = visible ? '' : 'none';
+    const active = visible && tab === _agentPickerTab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const tabsEl = picker.querySelector('.skill-picker-tabs');
+  if (tabsEl) tabsEl.style.gridTemplateColumns = `repeat(${Math.max(1, visibleTabs.size)}, minmax(0, 1fr))`;
+  const search = document.getElementById('agent-picker-search');
+  if (search) search.placeholder = _agentPickerSearchPlaceholder();
+  // Picking an agent and connecting a new CLI are different jobs, so the entry
+  // sits below the roster instead of in it, and only where it applies: the
+  // Agents tab of a composer picker.
+  const cliFooter = document.getElementById('agent-picker-cli-footer');
+  if (cliFooter) {
+    cliFooter.hidden = _agentPickerTab !== 'agents'
+      || !_agentPickerAllowsCliEntry(picker.dataset.anchorId || '');
+  }
+}
+
+function _setAgentPickerTab(tab, opts = {}) {
+  const picker = document.getElementById('agent-picker');
+  const visibleTabs = _agentPickerVisibleTabs(picker?.dataset.anchorId || '');
+  const normalized = _normalizeAgentPickerTab(tab);
+  _agentPickerTab = visibleTabs.includes(normalized) ? normalized : 'agents';
+  const search = document.getElementById('agent-picker-search');
+  if (search && !opts.keepSearch) search.value = '';
+  _updateAgentPickerChrome();
+  _renderAgentPickerList(search ? search.value : '');
+  _ensureAgentPickerTabData(_agentPickerTab, _agentPickerOpenSeq);
+  if (opts.focusSearch !== false) setTimeout(() => search?.focus(), 0);
+}
+
+function _ensureAgentPickerTabData(tab, openSeq) {
+  const normalized = _normalizeAgentPickerTab(tab);
+  if (normalized === 'library' || _agentPickerLoadedTabs.has(normalized)) {
+    return Promise.resolve();
+  }
+  const existing = _agentPickerTabLoads.get(normalized);
+  if (existing) {
+    const joined = existing.then(() => {
+      if (openSeq !== _agentPickerOpenSeq) return;
+      _agentPickerLoadedTabs.add(normalized);
+      const picker = document.getElementById('agent-picker');
+      if (!picker || picker.style.display === 'none' || _agentPickerTab !== normalized) return;
+      const search = document.getElementById('agent-picker-search');
+      _renderAgentPickerList(search ? search.value : '');
+    });
+    joined.catch(() => {});
+    return joined;
+  }
+  const run = (async () => {
+    if (normalized === 'skills') {
+      const loader = typeof loadRendererFeature === 'function'
+        ? loadRendererFeature
+        : window.loadRendererFeature;
+      if (typeof loadSkills !== 'function' && typeof loader === 'function') {
+        await loader('skills');
+      }
+      if (typeof loadSkills === 'function') await loadSkills(false);
+    } else if (normalized === 'connectors') {
+      if (typeof loadConnectors === 'function') await loadConnectors();
+    } else {
+      // A summary catalog is enough for the first frame. `loadAgents(false)`
+      // upgrades it once and then reuses the validated full cache.
+      await loadAgents(false);
+    }
+    if (openSeq === _agentPickerOpenSeq) _agentPickerLoadedTabs.add(normalized);
+  })().catch((err) => {
+    _agentsLog.warn('picker tab load failed', {
+      tab: normalized,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }).finally(() => {
+    if (_agentPickerTabLoads.get(normalized) === run) _agentPickerTabLoads.delete(normalized);
+    const picker = document.getElementById('agent-picker');
+    if (openSeq !== _agentPickerOpenSeq || !picker || picker.style.display === 'none') return;
+    if (_agentPickerTab !== normalized) return;
+    const search = document.getElementById('agent-picker-search');
+    _renderAgentPickerList(search ? search.value : '');
+  });
+  _agentPickerTabLoads.set(normalized, run);
+  // Tab clicks are UI events; contain failures here so they never create an
+  // unhandled rejection. Re-selecting the tab retries because the map clears.
+  run.catch(() => {});
+  return run;
+}
+
+function _moveAgentPickerTab(delta) {
+  const picker = document.getElementById('agent-picker');
+  const tabs = _agentPickerVisibleTabs(picker?.dataset.anchorId || '');
+  const cur = tabs.indexOf(_agentPickerTab);
+  const idx = cur >= 0 ? cur : 0;
+  const next = (idx + delta + tabs.length) % tabs.length;
+  _setAgentPickerTab(tabs[next]);
+}
+
+function _agentPickerProjectExists(projectId) {
+  const pid = String(projectId || '');
+  if (!pid) return false;
+  try {
+    if (typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache)) {
+      return _projectsCache.some((p) => p && p.project_id === pid);
+    }
+  } catch (_) { /* no project cache in this renderer/test context */ }
+  return true;
+}
+
+function _agentPickerValidProjectId(projectId) {
+  const pid = String(projectId || '');
+  return pid && _agentPickerProjectExists(pid) ? pid : '';
+}
+
+function _resolveActiveProjectId(anchorId) {
+  if (anchorId === 'new-chat-recipient-chip') {
+    // Empty-state composer creates orphan conversations; no project scope.
+    return '';
+  }
+  if (anchorId === 'project-chat-recipient-chip') {
+    return _agentPickerValidProjectId(
+      (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '',
+    );
+  }
+  if (anchorId === 'chat-recipient-chip') {
+    if (typeof currentCid !== 'undefined' && currentCid
+        && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
+      const conv = conversations.find((c) => c && c.conversation_id === currentCid);
+      return _agentPickerValidProjectId((conv && conv.project_id) || '');
+    }
+  }
+  if (anchorId === 'auto-recipient-chip') {
+    // The auto modal sets this when it opens so picker results scope
+    // to the task's project (if any). See modules/auto.js.
+    const pid = (typeof window !== 'undefined' && typeof window._autoGetProjectId === 'function')
+      ? (window._autoGetProjectId() || '')
+      : '';
+    return _agentPickerValidProjectId(pid);
+  }
+  return '';
+}
+
+async function _refreshAgentPickerProjectContext(anchorId) {
+  const refreshSeq = ++_pickerProjectContextSeq;
+  _pickerBoundAgentIds = null;
+  _pickerProjectId = _resolveActiveProjectId(anchorId) || '';
+  _pickerProjectContextLoading = !!_pickerProjectId;
+  _pickerLibraryRows = null;
+  _pickerLibraryLoading = null;
+  _pickerLibraryRenderSeq += 1;
+  if (_pickerProjectId) {
+    try {
+      const res = await window.orkas.invoke('projects.bindings.list', { projectId: _pickerProjectId });
+      if (refreshSeq === _pickerProjectContextSeq && res?.ok) {
+        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+        const target = _targetFromPickerAnchor(anchorId);
+        if (target !== 'auto' && typeof validateRecipientAgainstProject === 'function') {
+          await validateRecipientAgainstProject(target, _pickerProjectId, [..._pickerBoundAgentIds]);
+        }
+      }
+    } catch (_) { /* keep Library project scope; backend/file-tree handles stale ids */ }
+    finally {
+      if (refreshSeq === _pickerProjectContextSeq) _pickerProjectContextLoading = false;
+    }
+  }
+}
+
+async function refreshAgentPickerContext(anchorId) {
+  const picker = document.getElementById('agent-picker');
+  if (!picker || picker.style.display === 'none') return;
+  if (anchorId && picker.dataset.anchorId !== anchorId) return;
+  const activeAnchorId = picker.dataset.anchorId || anchorId || '';
+  await _refreshAgentPickerProjectContext(activeAnchorId);
+  const search = document.getElementById('agent-picker-search');
+  _renderAgentPickerList(search ? search.value : '');
+}
+
+async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
+  const picker = document.getElementById('agent-picker');
+  if (!anchorBtn || !picker) return;
+  if (typeof _closeOtherComposerPopovers === 'function') {
+    _closeOtherComposerPopovers('recipient');
+  }
+  if (anchorBtn.id === 'new-chat-recipient-chip') {
+  }
+  const previousAnchorId = picker.dataset.anchorId || '';
+  if (previousAnchorId && previousAnchorId !== anchorBtn.id) {
+    _setAgentPickerAnchorOpen(document.getElementById(previousAnchorId), false);
+  }
+  picker.dataset.anchorId = anchorBtn.id;
+  _setAgentPickerAnchorOpen(anchorBtn, true);
+  const openSeq = ++_agentPickerOpenSeq;
+  _agentPickerLoadedTabs = new Set();
+  // Reset project scope synchronously before painting. For project-bound
+  // composers this flips the list to a loading shell immediately, so stale
+  // unrestricted rows from the previous picker session are never clickable
+  // while the fresh binding request is in flight.
+  const projectContextPromise = _refreshAgentPickerProjectContext(anchorBtn.id);
+  // Paint the cached Agent shell in the same interaction frame. Other tabs
+  // own their script/data loads and cannot delay this first frame.
+  _setAgentPickerTab('agents', { focusSearch: false });
+  _positionPopoverAboveOrBelow(picker, anchorBtn);
+  setTimeout(() => {
+    if (openSeq === _agentPickerOpenSeq && picker.style.display !== 'none') {
+      document.getElementById('agent-picker-search')?.focus();
+    }
+  }, 30);
+  // Project bindings affect Agent visibility, so refresh them independently
+  // and repaint only if this picker session is still current.
+  projectContextPromise.then(() => {
+    if (openSeq !== _agentPickerOpenSeq || picker.style.display === 'none') return;
+    if (_agentPickerTab !== 'agents') return;
+    const search = document.getElementById('agent-picker-search');
+    _renderAgentPickerList(search ? search.value : '');
+  }).catch(() => {});
+}
+
+function _setAgentPickerAnchorOpen(anchor, open) {
+  if (!anchor) return;
+  anchor.classList.toggle('is-open', !!open);
+  anchor.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function _closeAgentPicker({ preserveAtKey = false } = {}) {
+  const picker = document.getElementById('agent-picker');
+  if (picker) {
+    _setAgentPickerAnchorOpen(document.getElementById(picker.dataset.anchorId || ''), false);
+    picker.style.display = 'none';
+  }
+  // A selection closes before routing the selected item, so it preserves the
+  // typed `@` marker just long enough for _triggerPickerItem to consume it.
+  // Every other close path owns cancellation and clears the marker here.
+  if (!preserveAtKey) _atKeyMark = null;
+}
+
+/** Re-anchor the open picker to its current content height. The popover is
+ *  placed from a measurement, so any later list repaint — tab switch, search,
+ *  async project/tab data — must re-run it or the box keeps a `top` computed
+ *  for the previous height and grows past its placement. */
+function _repositionAgentPicker() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker || picker.style.display === 'none') return;
+  const anchor = document.getElementById(picker.dataset.anchorId || '');
+  if (anchor) _positionPopoverAboveOrBelow(picker, anchor);
+}
+
+function _renderAgentPickerList(filterText) {
+  _renderAgentPickerListRows(filterText);
+  _repositionAgentPicker();
+}
+
+function _renderAgentPickerListRows(filterText) {
+  const listEl = document.getElementById('agent-picker-list');
+  const picker = document.getElementById('agent-picker');
+  if (!listEl) return;
+  const anchorId = picker?.dataset.anchorId || '';
+  if (!_agentPickerVisibleTabs(anchorId).includes(_agentPickerTab)) {
+    _agentPickerTab = 'agents';
+  }
+  _updateAgentPickerChrome();
+  _refreshAgentPickerSelection();
+  if (_agentPickerTab === 'skills') {
+    if (typeof loadSkills !== 'function') {
+      listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+      return;
+    }
+    _renderSkillPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  if (_agentPickerTab === 'connectors') {
+    _renderConnectorPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  if (_agentPickerTab === 'library') {
+    _renderLibraryPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  // Disabled agents are filtered out — picker is a "what can I dispatch right
+  // now" UI, and re-enabling lives in the management page (Agents view + ⋯ menu).
+  if (_pickerProjectContextLoading) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+    return;
+  }
+  let agents = (_agentsCache || []).filter((a) => a.enabled !== false);
+  // Project scope: only show agents bound to the active context's project.
+  // Applied AFTER the enabled filter (per CLAUDE.md §6 outer-intersection
+  // rule). `null` = no project scope, full listing.
+  if (_pickerBoundAgentIds) {
+    agents = agents.filter((a) => _pickerBoundAgentIds.has(a.agent_id));
+  }
+  const q = (filterText || '').toLowerCase();
+  // Search matches across the active locale description; cross-language
+  // fallback via pickDesc lets users find a single-locale agent regardless
+  // of which side they typed in.
+  // Match-quality ranking: name-exact (0) < name-prefix (1) < name-substring (2)
+  // < description-only (3). Stable sort within ties preserves the source-group
+  // order computed below. Without this, an agent whose description happens to
+  // mention the query (e.g. "Agent Skill 搜集" mentioning "Claude Code subagents"
+  // in passing) outranks the actual `Claude Code` agent because the original
+  // list is sorted by hex agent_id, not by relevance.
+  const lang = getLang();
+  const matchScore = (a) => {
+    const name = (a.name || '').toLowerCase();
+    if (name === q) return 0;
+    if (name.startsWith(q)) return 1;
+    if (name.includes(q)) return 2;
+    return 3;
+  };
+  const filtered = q
+    ? agents
+        .filter(a => (a.name || '').toLowerCase().includes(q) || pickDesc(a, lang).toLowerCase().includes(q))
+        .sort((a, b) => matchScore(a) - matchScore(b))
+    : agents;
+  // Recipient chip exposes "commander" as a virtual top entry so the user can
+  // switch back without an empty-state. Other anchors keep agent-only listing.
+  const isRecipientPicker = anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip'
+    || anchorId === 'auto-recipient-chip';
+  const commanderName = t('chat.recipient_commander');
+  const commanderMatchesFilter = !q || commanderName.toLowerCase().includes(q);
+  if (!filtered.length && !(isRecipientPicker && commanderMatchesFilter)) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('agents.no_match'))}</div>`;
+    return;
+  }
+  const groups = { custom: [], marketplace: [] };
+  for (const a of filtered) (groups[_agentSource(a.source)] || groups.custom).push(a);
+  const groupHtml = (label, list) => {
+    if (!list.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
+      list.map(a => {
+        const aDesc = pickDesc(a, lang).trim();
+        return `
+        <div class="skill-picker-item" data-kind="agent" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
+          <div class="skill-picker-item-name">${escapeHtml(a.name || t('agents.unnamed'))}</div>
+          ${aDesc ? `<div class="skill-picker-item-desc">${escapeHtml(aDesc)}</div>` : ''}
+        </div>`;
+      }).join('');
+  };
+  const commanderHtml = (isRecipientPicker && commanderMatchesFilter)
+    ? `<div class="skill-picker-item" data-kind="agent" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
+         <div class="skill-picker-item-name">${escapeHtml(commanderName)}</div>
+         <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
+       </div>`
+    : '';
+  // When the active context is a project AND the project has zero agents
+  // bound, surface a hint above the commander entry so the user knows
+  // "this isn't broken — go bind an agent first". Suppressed on user search
+  // (they're explicitly typing) so the search "no match" message owns the
+  // empty rendering.
+  const projectEmptyHint = (!q && _pickerBoundAgentIds && _pickerBoundAgentIds.size === 0)
+    ? `<div class="skill-picker-empty-hint">${escapeHtml(t('agents.no_project_agents'))}</div>`
+    : '';
+  listEl.innerHTML = projectEmptyHint + commanderHtml
+    + groupHtml(t('agents.source_custom'), groups.custom)
+    + groupHtml(t('agents.source_marketplace'), groups.marketplace);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _matchPickerItem(q, name, desc, extra = '') {
+  if (!q) return true;
+  return String(name || '').toLowerCase().includes(q)
+    || String(desc || '').toLowerCase().includes(q)
+    || String(extra || '').toLowerCase().includes(q);
+}
+
+function _pickerMatchScore(q, name) {
+  const n = String(name || '').toLowerCase();
+  if (!q) return 0;
+  if (n === q) return 0;
+  if (n.startsWith(q)) return 1;
+  if (n.includes(q)) return 2;
+  return 3;
+}
+
+function _renderSkillPickerList(listEl, filterText, anchorId) {
+  const lang = getLang();
+  const q = (filterText || '').toLowerCase();
+  const trustedDesc = (s) => pickDesc(s, lang);
+  const openDesc = (s) => s.description || '';
+  const applyFilter = (list, descOf) => q
+    ? list
+        .filter((s) => _matchPickerItem(q, s.name || s.id, descOf(s), s.id))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : list;
+
+  const trusted = applyFilter((_skillsCache || []).filter((s) => s.enabled !== false), trustedDesc);
+  // Global open-tier skills share the same picker surface as trusted skills.
+  // External package internals stay package-scoped in user UI; the agent layer
+  // can still see package-provided SKILL.md files when composing a task.
+  const openRows = (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache))
+    ? applyFilter(_openSkillsCache.filter((s) => s.source === 'global' && s.enabled !== false), openDesc)
+    : [];
+
+  if (!trusted.length && !openRows.length) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
+    return;
+  }
+
+  const groups = { custom: [], marketplace: [] };
+  for (const s of trusted) {
+    const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(s.source) : s.source;
+    (groups[source] || groups.custom).push(s);
+  }
+  const globalRows = openRows.filter((s) => s.source === 'global');
+
+  const groupHtml = (label, list, descOf) => {
+    if (!list.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
+      list.map((s) => {
+        const desc = (descOf(s) || '').trim();
+        const name = s.name || s.id;
+        return `
+        <div class="skill-picker-item" data-kind="skill" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
+          <div class="skill-picker-item-name">${escapeHtml(name)}</div>
+          ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
+        </div>`;
+      }).join('');
+  };
+  listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom, trustedDesc)
+    + groupHtml(t('skills.source_marketplace'), groups.marketplace, trustedDesc)
+    + groupHtml(t('skills.global_group'), globalRows, openDesc);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _renderConnectorPickerList(listEl, filterText, anchorId) {
+  const q = (filterText || '').toLowerCase();
+  const items = (typeof listUsableConnectorsForPicker === 'function')
+    ? listUsableConnectorsForPicker()
+    : [];
+  const filtered = q
+    ? items
+        .filter((c) => _matchPickerItem(q, c.name || c.id, c.description, `${c.id} ${c.account || ''}`))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : items;
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(q ? t('connectors.no_match') : t('connectors.no_connected'))}</div>`;
+    return;
+  }
+  listEl.innerHTML = `<div class="skill-picker-group-label">${escapeHtml(t('connectors.group.connected'))}</div>` +
+    filtered.map((c) => {
+      const descParts = [];
+      if (c.description) descParts.push(c.description);
+      if (c.account) descParts.push(t('connectors.account_label', { account: c.account }));
+      return `
+      <div class="skill-picker-item" data-kind="connector" data-id="${escapeHtml(c.id)}" data-name="${escapeHtml(c.name || c.id)}">
+        <div class="skill-picker-item-name">${escapeHtml(c.name || c.id)}</div>
+        ${descParts.length ? `<div class="skill-picker-item-desc">${escapeHtml(descParts.join(' · '))}</div>` : ''}
+      </div>`;
+    }).join('');
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _agentPickerBasename(rel) {
+  const s = String(rel || '');
+  const i = s.lastIndexOf('/');
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+// Comparable timestamp for ordering; same seconds-or-milliseconds tolerance as
+// `_agentPickerFormatMtime`. Rows without a usable mtime rank last.
+function _agentPickerMtimeRank(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 100000000000 ? n : n * 1000;
+}
+
+function _agentPickerFormatMtime(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const ms = n > 100000000000 ? n : n * 1000;
+  try {
+    const locale = (typeof getLocaleMeta === 'function' && typeof getLang === 'function')
+      ? getLocaleMeta(getLang()).intlLocale
+      : undefined;
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toLocaleString();
+  }
+}
+
+function _flattenLibraryPickerTree(nodes, scope, projectId) {
+  const rows = [];
+  const walk = (items) => {
+    for (const node of items || []) {
+      if (!node) continue;
+      if (node.type === 'dir') {
+        walk(node.children || []);
+        continue;
+      }
+      if (node.type !== 'file') continue;
+      const rel = String(node.relPath || node.path || node.name || '');
+      if (!rel) continue;
+      const name = node.name || _agentPickerBasename(rel);
+      rows.push({
+        scope,
+        projectId: projectId || '',
+        rel,
+        name,
+        group: scope === 'project' ? 'project' : 'global',
+        kind: node.kind || '',
+        bytes: Number(node.bytes || 0),
+        mtime: node.mtime,
+      });
+    }
+  };
+  walk(nodes || []);
+  return rows;
+}
+
+async function _loadLibraryPickerRows(projectId) {
+  const validProjectId = _agentPickerValidProjectId(projectId);
+  const projectPromise = validProjectId
+    ? window.orkas.invoke('projects.files.tree', { projectId: validProjectId }).catch((err) => {
+        _agentsLog.warn('project library picker load failed', err);
+        return null;
+      })
+    : Promise.resolve(null);
+  const globalPromise = apiFetch('/api/contexts/tree')
+    .then((res) => res.json())
+    .catch((err) => {
+      _agentsLog.warn('global library picker load failed', err);
+      return null;
+    });
+  const [projectData, globalData] = await Promise.all([projectPromise, globalPromise]);
+  const rows = [];
+  if (validProjectId && projectData && projectData.ok !== false) {
+    rows.push(..._flattenLibraryPickerTree(projectData.tree || [], 'project', validProjectId));
+  }
+  if (globalData && globalData.ok !== false) {
+    rows.push(..._flattenLibraryPickerTree(globalData.tree || [], 'global', ''));
+  }
+  // Recency-first, like both Library trees — the file you just saved is the one
+  // you are most likely to @-mention. Scope grouping is re-applied at render, so
+  // sorting across scopes here is safe, and the search path's sort is stable so
+  // equally-scored matches keep this order.
+  rows.sort((a, b) => _agentPickerMtimeRank(b?.mtime) - _agentPickerMtimeRank(a?.mtime));
+  return rows;
+}
+
+function _libraryPickerRowHtml(row) {
+  const rel = row.rel || row.name || '';
+  const label = row.name || _agentPickerBasename(rel);
+  const time = _agentPickerFormatMtime(row.mtime);
+  const desc = rel && rel !== label ? rel : '';
+  const id = `${row.scope}:${row.projectId || ''}:${rel}`;
+  return `
+    <div class="skill-picker-item" data-kind="library" data-id="${escapeHtml(id)}"
+         data-name="${escapeHtml(label)}" data-library-scope="${escapeHtml(row.scope)}"
+         data-library-rel="${escapeHtml(rel)}" data-project-id="${escapeHtml(row.projectId || '')}">
+      <div class="skill-picker-item-meta">
+        <div class="skill-picker-item-name">${escapeHtml(label)}</div>
+        ${time ? `<span class="skill-picker-item-time">${escapeHtml(time)}</span>` : ''}
+      </div>
+      ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
+    </div>`;
+}
+
+function _renderLibraryPickerList(listEl, filterText, anchorId) {
+  const q = (filterText || '').toLowerCase();
+  const renderSeq = ++_pickerLibraryRenderSeq;
+  if (!_pickerLibraryRows) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+    if (!_pickerLibraryLoading) {
+      _pickerLibraryLoading = _loadLibraryPickerRows(_pickerProjectId)
+        .then((rows) => {
+          _pickerLibraryRows = rows || [];
+          _pickerLibraryLoading = null;
+        })
+        .catch((err) => {
+          _agentsLog.warn('library picker load failed', err);
+          _pickerLibraryRows = [];
+          _pickerLibraryLoading = null;
+        });
+    }
+    _pickerLibraryLoading.then(() => {
+      if (renderSeq !== _pickerLibraryRenderSeq) return;
+      const picker = document.getElementById('agent-picker');
+      if (!picker || picker.style.display === 'none' || _agentPickerTab !== 'library') return;
+      const search = document.getElementById('agent-picker-search');
+      // Use the shared repaint boundary so placement measures the loaded rows,
+      // not the shorter loading shell that was visible before this response.
+      _renderAgentPickerList(search ? search.value : filterText);
+    });
+    return;
+  }
+
+  const allRows = _pickerLibraryRows || [];
+  const filtered = q
+    ? allRows
+        .filter((row) => _matchPickerItem(q, row.name, row.rel, row.kind))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.rel) - _pickerMatchScore(q, b.name || b.rel))
+    : allRows;
+
+  if (!filtered.length) {
+    const key = allRows.length ? 'agent_picker.library_no_match' : 'agent_picker.library_empty';
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t(key))}</div>`;
+    return;
+  }
+
+  const projectRows = filtered.filter((row) => row.scope === 'project');
+  const globalRows = filtered.filter((row) => row.scope === 'global');
+  const groupHtml = (label, rows) => {
+    if (!rows.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` + rows.map(_libraryPickerRowHtml).join('');
+  };
+  listEl.innerHTML = groupHtml(t('agent_picker.library_group_project'), projectRows)
+    + groupHtml(t('agent_picker.library_group_global'), globalRows);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _bindAgentPickerListItems(listEl, anchorId) {
+  for (const el of listEl.querySelectorAll('[data-id]')) {
+    el.addEventListener('click', async () => {
+      const sourceType = el.dataset.pickerSourceType === 'keyboard' ? 'keyboard' : 'mouse';
+      delete el.dataset.pickerSourceType;
+      const multi = _isMultiRecipientPicker(anchorId) && (el.dataset.kind || 'agent') === 'agent' && !_atKeyMark;
+      if (!multi) _closeAgentPicker({ preserveAtKey: true });
+      await _triggerPickerItem(
+        el.dataset.kind || 'agent',
+        el.dataset.id,
+        el.dataset.name,
+        anchorId,
+        el.dataset,
+        sourceType,
+      );
+      if (multi) {
+        _refreshAgentPickerSelection();
+      }
+    });
+    el.addEventListener('mouseenter', () => {
+      const all = listEl.querySelectorAll('.skill-picker-item[data-id]');
+      const idx = Array.prototype.indexOf.call(all, el);
+      if (idx >= 0) _setAgentPickerActive(idx);
+    });
+  }
+  _setAgentPickerActive(0);
+  _refreshAgentPickerSelection();
+}
+
+function _isMultiRecipientPicker(anchorId) {
+  return ['chat-recipient-chip', 'new-chat-recipient-chip', 'project-chat-recipient-chip'].includes(anchorId);
+}
+
+function _renderAgentPickerSelectionHeader(picker, selected) {
+  const header = document.getElementById('agent-picker-selected');
+  if (!header) return;
+  const entries = selected.map((recipient) => ({
+    id: recipient.kind === 'commander' ? '__commander__' : recipient.id,
+    name: recipient.kind === 'commander' ? t('chat.recipient_commander') : recipient.name || recipient.id,
+  }));
+  const signature = JSON.stringify([picker.dataset.anchorId, t('common.remove'), entries]);
+  if (header.dataset.selection === signature) return;
+  const focusedIndex = Array.from(header.children).indexOf(document.activeElement);
+  header.dataset.selection = signature;
+  header.hidden = !entries.length;
+  header.replaceChildren();
+  entries.forEach(({ id, name }) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chat-recipient-chip recipient-picker-selected-chip';
+    button.dataset.recipientId = id;
+    button.title = `${t('common.remove')}: ${name}`;
+    button.setAttribute('aria-label', button.title);
+    button.innerHTML = `<span class="chat-recipient-name">${escapeHtml(name)}</span>`
+      + (typeof window.uiIconHtml === 'function' ? window.uiIconHtml('x', 'recipient-picker-remove-icon') : '×');
+    button.addEventListener('click', async (event) => {
+      // Updating the draft can replace this button before the document's
+      // outside-click listener runs. Keep that removal inside the picker.
+      event.stopPropagation();
+      // A header removal cancels autocomplete before toggling the recipient;
+      // otherwise the pending @ would insert the name we are removing.
+      _consumeAtKeyChar();
+      await _triggerPickerItem('agent', id, name, picker.dataset.anchorId, {}, event.detail === 0 ? 'keyboard' : 'mouse');
+      _refreshAgentPickerSelection();
+    });
+    button.addEventListener('keydown', (event) => {
+      if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape') return;
+      event.preventDefault();
+      _closeAgentPicker();
+      _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
+    });
+    header.appendChild(button);
+  });
+  if (focusedIndex >= 0) {
+    (header.children[Math.min(focusedIndex, header.children.length - 1)]
+      || document.getElementById('agent-picker-search'))?.focus();
+  }
+  _repositionAgentPicker();
+}
+
+function _refreshAgentPickerSelection() {
+  const picker = document.getElementById('agent-picker');
+  const list = document.getElementById('agent-picker-list');
+  if (!picker || !list) return;
+  const multi = _agentPickerTab === 'agents' && _isMultiRecipientPicker(picker.dataset.anchorId);
+  const selected = multi && typeof _composerSelectedRecipients === 'function'
+    ? _composerSelectedRecipients(_targetFromPickerAnchor(picker.dataset.anchorId)) : [];
+  _renderAgentPickerSelectionHeader(picker, selected);
+  list.querySelectorAll('.skill-picker-item[data-id]').forEach((el) => {
+    if (!multi) return;
+    const checked = selected.some((r) => r.kind === 'commander'
+      ? el.dataset.id === '__commander__' : el.dataset.id === r.id);
+    el.setAttribute('role', 'checkbox');
+    el.setAttribute('aria-checked', String(checked));
+    el.setAttribute('tabindex', '0');
+    el.classList.add('recipient-picker-option');
+    const oldCheck = el.querySelector('.recipient-picker-check');
+    if (checked && !oldCheck) {
+      const check = document.createElement('span');
+      check.className = 'composer-model-menu-check recipient-picker-check';
+      check.setAttribute('aria-hidden', 'true');
+      check.innerHTML = typeof window.uiIconHtml === 'function' ? window.uiIconHtml('check', 'ui-icon') : '✓';
+      el.appendChild(check);
+    } else if (!checked && oldCheck) oldCheck.remove();
+    if (!el.dataset.recipientKeyboardWired) {
+      el.dataset.recipientKeyboardWired = '1';
+      el.addEventListener('keydown', (event) => {
+        if (event.isComposing || event.keyCode === 229) return;
+        if (event.key === ' ' || event.key === 'Enter') {
+          event.preventDefault();
+          el.dataset.pickerSourceType = 'keyboard';
+          el.click();
+          return;
+        }
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          _moveAgentPickerActive(event.key === 'ArrowDown' ? 1 : -1);
+          list.querySelector('.skill-picker-item.active')?.focus();
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          _closeAgentPicker();
+          _focusInput(_composerRecipientInput(_targetFromPickerAnchor(picker.dataset.anchorId)));
+        }
+      });
+    }
+  });
+}
+
+// ── Agent picker keyboard navigation ─────────────────────────────────────
+
+function _setAgentPickerActive(idx) {
+  const listEl = document.getElementById('agent-picker-list');
+  if (!listEl) return;
+  const items = listEl.querySelectorAll('.skill-picker-item[data-id]');
+  if (!items.length) return;
+  const clamped = Math.max(0, Math.min(items.length - 1, idx));
+  items.forEach((el, i) => el.classList.toggle('active', i === clamped));
+  items[clamped].scrollIntoView({ block: 'nearest' });
+}
+
+function _moveAgentPickerActive(delta) {
+  const listEl = document.getElementById('agent-picker-list');
+  if (!listEl) return;
+  const items = listEl.querySelectorAll('.skill-picker-item[data-id]');
+  if (!items.length) return;
+  let cur = -1;
+  items.forEach((el, i) => { if (el.classList.contains('active')) cur = i; });
+  const next = cur < 0 ? 0 : (cur + delta + items.length) % items.length;
+  _setAgentPickerActive(next);
+}
+
+function _targetFromPickerAnchor(anchorId) {
+  if (anchorId === 'new-chat-recipient-chip') return 'new-chat';
+  if (anchorId === 'project-chat-recipient-chip') return 'project';
+  if (anchorId === 'auto-recipient-chip') return 'auto';
+  return 'conversation';
+}
+
+async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset, sourceType = 'unknown') {
+  const target = _targetFromPickerAnchor(anchorId);
+  if (target === 'new-chat') {
+  }
+  if (kind === 'skill') {
+    const skillId = String(itemId || itemName || '');
+    _consumeAtKeyChar();
+    setChatSkill(target, itemId, itemName || itemId);
+    const inputId = target === 'new-chat'
+      ? 'new-chat-input'
+      : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  if (kind === 'connector') {
+    _consumeAtKeyChar();
+    setChatConnector(target, itemId, itemName || itemId);
+    const inputId = target === 'new-chat'
+      ? 'new-chat-input'
+      : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  if (kind === 'library') {
+    await _triggerLibraryFile(dataset || {}, anchorId);
+    return;
+  }
+  await _triggerAgent(itemId, itemName, anchorId);
+}
+
+function _libraryPickerInputIdForTarget(target) {
+  if (target === 'new-chat') return 'new-chat-input';
+  if (target === 'project') return 'project-chat-input';
+  if (target === 'auto') return 'auto-task-input';
+  return 'chat-input';
+}
+
+function _libraryPickerDraftCidFor(anchorId, target, projectId) {
+  if (target === 'new-chat') return window.COMMANDER_DRAFT_CID;
+  if (target === 'project') {
+    if (typeof _projectChatDraftCid === 'function') return _projectChatDraftCid(projectId);
+    return projectId ? `projchat-${projectId}` : '';
+  }
+  if (target === 'conversation') {
+    return (typeof currentCid !== 'undefined') ? (currentCid || '') : '';
+  }
+  return '';
+}
+
+async function _triggerLibraryFile(dataset, anchorId) {
+  const target = _targetFromPickerAnchor(anchorId);
+  const scope = dataset.libraryScope || 'global';
+  const rel = dataset.libraryRel || '';
+  const projectId = dataset.projectId || _resolveActiveProjectId(anchorId);
+  if (!rel) return;
+  if (target === 'auto') {
+    try {
+      if (typeof window._autoAttachLibraryFile !== 'function') throw new Error('auto_attach_unavailable');
+      await window._autoAttachLibraryFile({ scope, rel, projectId });
+      _consumeAtKeyChar();
+      _focusInput(document.getElementById('auto-task-input'));
+    } catch (err) {
+      const reason = String((err && err.message) || err || 'failed');
+      if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
+    }
+    return;
+  }
+  const cid = _libraryPickerDraftCidFor(anchorId, target, projectId);
+  if (!cid) return;
+
+  const channel = scope === 'project' ? 'projects.files.attachToDraft' : 'contexts.attachToDraft';
+  const payload = scope === 'project'
+    ? { projectId, name: rel }
+    : { relPath: rel };
+  const inputId = _libraryPickerInputIdForTarget(target);
+  try {
+    await window.attachKbFileToDraft(
+      channel,
+      payload,
+      cid,
+      () => {
+        if (target === 'new-chat' && typeof setView === 'function') setView('new-chat');
+        else if (target === 'project' && projectId && typeof setView === 'function') setView('project', projectId);
+      },
+    );
+    _consumeAtKeyChar();
+    _focusInput(document.getElementById(inputId));
+  } catch (err) {
+    const reason = String((err && err.message) || err || 'failed');
+    const failure_stage = ['draft_lock', 'ipc_request', 'input_validation', 'source_resolve', 'attachment_import', 'navigation', 'draft_render'].includes(err && err.failure_stage)
+      ? err.failure_stage : 'picker_finalize';
+    const failure_kind = ['not_found', 'permission_denied', 'disk_full'].includes(err && err.failure_kind)
+      ? err.failure_kind : 'operation_failed';
+    _agentsLog.warn('library attachment failed', { target, scope, failure_stage, failure_kind });
+    if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
+  }
+}
+
+// Route an agent selection to the right behaviour based on which button
+// triggered the picker:
+//   - recipient chip / @ picker → update the persistent recipient chip.
+//   - other anchors → spin up a fresh conversation for that agent.
+async function _triggerAgent(agentId, agentName, anchorId) {
+  if (anchorId === 'auto-recipient-chip') {
+    // Auto modal owns its own recipient state; route the picked agent
+    // (or commander) to its registered handler instead of touching any
+    // conversation-scoped chat state.
+    const rec = (agentId === '__commander__')
+      ? { kind: 'commander' }
+      : { kind: 'agent', id: agentId, name: agentName || agentId };
+    const resourceAgentId = rec.kind === 'commander' ? _COMMANDER_AGENT_ID : String(agentId || '');
+    if (typeof window !== 'undefined' && typeof window._autoOnRecipientPicked === 'function') {
+      window._autoOnRecipientPicked(rec);
+    }
+    _consumeAtKeyChar();
+    _focusInput(document.getElementById('auto-task-input'));
+    return;
+  }
+  const isRecipientAnchor = anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
+  if (isRecipientAnchor) {
+    const target = _targetFromPickerAnchor(anchorId);
+    // Autocomplete and panel selections insert at the caret and edit the same
+    // visible recipient markers. Dispatch segmentation stays text-owned.
+    if (_atKeyMark) {
+      _insertInlineMention(agentId === '__commander__' ? 'commander' : (agentName || agentId));
+      return;
+    }
+    _toggleComposerRecipient(target, agentId === '__commander__'
+      ? { kind: 'commander', id: '', name: '' }
+      : { kind: 'agent', id: agentId, name: agentName || agentId });
+    return;
+  }
+  // Sidebar / agent-detail "use" button → spin up a fresh conversation
+  await useAgent(agentId);
+}
+
+// `@`-keystroke bookkeeping so a successful picker selection can remove the
+// `@` the user just typed. Cleared on every open; consumed on selection.
+let _atKeyMark = null; // { inputId, posAfter } | null
+
+// D9 inline mention: complete the `@` the user just typed with the picked
+// display name plus a trailing space, cursor after it. The `@` stays in the
+// text (it IS the dispatch marker); the rich composer turns it into the same
+// atomic chip used for Skills and Connectors through the normal input event.
+function _insertInlineMention(name) {
+  const m = _atKeyMark;
+  _atKeyMark = null;
+  if (!m || !name || (m.snapshot && !m.snapshot.matches())) return;
+  const ta = document.getElementById(m.inputId);
+  if (!ta) return;
+  const atIdx = m.posAfter - 1;
+  if (atIdx < 0 || composerText(ta).charAt(atIdx) !== '@') return;
+  const insert = `${name} `;
+  composerSetText(ta, composerText(ta).slice(0, m.posAfter) + insert + composerText(ta).slice(m.posAfter));
+  const caret = m.posAfter + insert.length;
+  try { composerSetSelection(ta, caret, caret); } catch (_) {}
+  if (typeof autoGrow === 'function') autoGrow(ta, 200);
+  composerNotify(ta);
+  _focusInput(ta);
+}
+
+function _consumeAtKeyChar() {
+  const m = _atKeyMark;
+  _atKeyMark = null;
+  if (!m || (m.snapshot && !m.snapshot.matches())) return null;
+  const ta = document.getElementById(m.inputId);
+  if (!ta) return null;
+  const atIdx = m.posAfter - 1;
+  if (atIdx < 0 || composerText(ta).charAt(atIdx) !== '@') return null;
+  composerSetText(ta, composerText(ta).slice(0, atIdx) + composerText(ta).slice(atIdx + 1));
+  try { composerSetSelection(ta, atIdx, atIdx); } catch (_) {}
+  if (typeof autoGrow === 'function') autoGrow(ta, 200);
+  composerNotify(ta);
+  return ta;
+}
+
+function _focusInput(input) {
+  // Defer to the next tick so the picker's outside-click handler can finish
+  // closing first; otherwise focus jumps back to the picker on some browsers.
+  const active = document.activeElement;
+  const owner = _composerApi(input), epoch = owner?.epoch;
+  setTimeout(() => {
+    // A native key/click may already have focused the editor and moved its
+    // caret before selectionchange reaches the model. Re-focusing would write
+    // the older model selection over that newer native selection.
+    if (document.activeElement === input || owner && owner.epoch !== epoch) return;
+    if (document.activeElement && document.activeElement !== active && document.activeElement !== document.body) return;
+    try {
+      if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(input)) return;
+      input.focus();
+    } catch (_) {}
+  }, 0);
+}
+
+// Recipient chip + composer textarea anchor pairs. Three sticky composers
+// (commander conversation, new-chat landing, project detail) get bound at
+// boot from this table; the auto modal calls `bindRecipientAnchor`
+// directly when it mounts so its DOM ID joins the wiring on the fly.
+const _RECIPIENT_ANCHOR_PAIRS = [
+  { chip: 'chat-recipient-chip',         input: 'chat-input' },
+  { chip: 'new-chat-recipient-chip',     input: 'new-chat-input' },
+  { chip: 'project-chat-recipient-chip', input: 'project-chat-input' },
+];
+
+function _recipientTextareaFromEventTarget(target) {
+  if (!target) return null;
+  const inputId = target.dataset?.richInputId || target.id || '';
+  if (inputId) {
+    const input = document.getElementById(inputId);
+    if (input) return input;
+  }
+  return target;
+}
+
+function _atKeyOpener(chipId) {
+  return (e) => {
+    if (e.key !== '@' || e.isComposing || e.keyCode === 229) return;
+    const btn = document.getElementById(chipId);
+    if (!btn) return;
+    const ta = _recipientTextareaFromEventTarget(e.currentTarget);
+    if (!ta) return;
+    const owner = _composerApi(ta);
+    const epoch = owner?.epoch;
+    setTimeout(() => {
+      if (owner && owner.epoch !== epoch) return;
+      try {
+        if (typeof getChatRichComposerSelection === 'function') getChatRichComposerSelection(ta);
+      } catch (_) {}
+      _atKeyMark = {
+        inputId: ta.id || '',
+        snapshot: composerSnapshot(ta),
+        posAfter: typeof composerSelection(ta).start === 'number' ? composerSelection(ta).start : 0,
+      };
+      _openAgentPicker(btn, 'at_key');
+    }, 0);
+  };
+}
+
+// Wire (chip → click opens picker) + (textarea → `@` opens picker).
+// Chip navigation/deletion is shared with Skills and Connectors. Guarded so calling
+// this twice for the same anchor is a no-op. Called at boot for the three
+// sticky composers AND on demand by `modules/auto.js` when its modal
+// mounts (registers the 4th `'auto-recipient-chip'` anchor).
+function bindRecipientAnchor(chipId, inputId) {
+  const btn = document.getElementById(chipId);
+  if (btn && btn.dataset.bound !== '1') {
+    btn.dataset.bound = '1';
+    btn.setAttribute('aria-haspopup', 'dialog');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      _atKeyMark = null; // chip click is not a `@`-keystroke trigger
+      const picker = document.getElementById('agent-picker');
+      if (picker && picker.style.display !== 'none' && picker.dataset.anchorId === chipId) {
+        _closeAgentPicker();
+      } else {
+        _openAgentPicker(btn, 'recipient_chip');
+      }
+    });
+  }
+  const ta = document.getElementById(inputId);
+  const bindInput = (el) => {
+    if (!el || el.dataset.atBound === '1') return;
+    el.dataset.atBound = '1';
+    el.addEventListener('keydown', _atKeyOpener(chipId));
+  };
+  bindInput(ta);
+  if (typeof getChatRichComposerEditor === 'function') {
+    try {
+      bindInput(getChatRichComposerEditor(inputId));
+    } catch (_) {}
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.bindRecipientAnchor = bindRecipientAnchor;
+  window.refreshAgentPickerContext = refreshAgentPickerContext;
+}
+
+function bindAgentPickers() {
+  // Re-bindable helper: wire the recipient chips on both chat panels +
+  // under anchorIds. Guarded with dataset.bound so a second call is a no-op.
+  document.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _setAgentPickerTab(btn.dataset.agentPickerTab || 'agents');
+    });
+  });
+  // Coding-CLI entry. It leaves the picker rather than selecting from it, so it
+  // closes first and hands off to the external-only dialog the AI Team header
+  // and the old sidebar card both open -- no tab bar, just the CLI flow, so
+  // every entry to it shows one page. Only `entry_point` differs, which keeps
+  // the funnels separable. The modal returns focus to the chip on cancel.
+  const cliEntry = document.getElementById('agent-picker-connect-cli');
+  if (cliEntry && cliEntry.dataset.bound !== '1') {
+    cliEntry.dataset.bound = '1';
+    cliEntry.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const anchorId = document.getElementById('agent-picker')?.dataset.anchorId || '';
+      _closeAgentPicker();
+      if (typeof openAgentModal !== 'function') return;
+      openAgentModal({
+        initialTab: 'external',
+        externalOnly: true,
+        entryPoint: 'agent_picker_connect_cli',
+        sourceView: typeof currentView === 'string' ? currentView : '',
+        returnFocusId: anchorId,
+      });
+    });
+  }
+  const searchInput = document.getElementById('agent-picker-search');
+  searchInput?.addEventListener('input', () => {
+    _renderAgentPickerList(searchInput.value);
+  });
+  searchInput?.addEventListener('keydown', (e) => {
+    // IME composition guard (CLAUDE.md §8): Enter / Arrow keys belong to
+    // the IME while a Chinese / Japanese / Korean candidate is being
+    // composed; without this early-return, pressing Enter to commit an
+    // English candidate would also fire our select-active-item handler.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
+    if ((e.key === 'Backspace' || e.key === 'Delete') && !searchInput.value && _atKeyMark) {
+      const input = _consumeAtKeyChar();
+      _closeAgentPicker();
+      if (input) _focusInput(input);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowRight') { _moveAgentPickerTab(1); e.preventDefault(); return; }
+    if (e.key === 'ArrowLeft')  { _moveAgentPickerTab(-1); e.preventDefault(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      _moveAgentPickerActive(e.key === 'ArrowDown' ? 1 : -1);
+      if (!_atKeyMark) document.querySelector('#agent-picker-list .recipient-picker-option.active')?.focus();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Enter') {
+      const listEl = document.getElementById('agent-picker-list');
+      const active = listEl?.querySelector('.skill-picker-item.active[data-id]')
+        || listEl?.querySelector('.skill-picker-item[data-id]');
+      if (active) {
+        active.dataset.pickerSourceType = 'keyboard';
+        active.click();
+        e.preventDefault();
+      }
+    }
+  });
+  for (const { chip, input } of _RECIPIENT_ANCHOR_PAIRS) {
+    bindRecipientAnchor(chip, input);
+  }
+  // One global click handler is enough — guard with a flag on the picker.
+  const picker = document.getElementById('agent-picker');
+  if (picker && !picker.dataset.outsideBound) {
+    picker.dataset.outsideBound = '1';
+    document.addEventListener('click', (e) => {
+      if (!picker || picker.style.display === 'none') return;
+      if (picker.contains(e.target)) return;
+      const anchorId = picker.dataset.anchorId;
+      const anchorEl = anchorId ? document.getElementById(anchorId) : null;
+      if (anchorEl && anchorEl.contains(e.target)) return;
+      _atKeyMark = null;
+      _closeAgentPicker();
+    });
+    window.addEventListener('i18n-change', () => {
+      _updateAgentPickerChrome();
+      if (picker.style.display !== 'none') {
+        const search = document.getElementById('agent-picker-search');
+        _renderAgentPickerList(search ? search.value : '');
+      }
+    });
+  }
+
+}
+
+window.addEventListener('local-cli-upgraded', async (event) => {
+  _agentCliRuntimeOptionsCache.clear();
+  _agentCliRuntimeSnapshots.clear();
+  const id = _selectedAgent?.id;
+  if (!id) return;
+  try {
+    const response = await window.orkas.invoke('agents.get', { agent_id: id });
+    const agent = response?.agent;
+    if (_selectedAgent?.id !== id || agent?.runtime?.cli !== event.detail?.type) return;
+    await loadLocalCliEntries({ force: true });
+    if (_selectedAgent?.id !== id) return;
+    void _renderAgentDetailRuntime(agent);
+    void _renderAgentDetailCliSettings(agent, { refresh: true });
+    void renderCliAccountUsage(agent, { force: true });
+  } catch (_) {
+    _agentsLog.warn('CLI account details refresh unavailable');
+  }
+});

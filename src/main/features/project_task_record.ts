@@ -1,0 +1,107 @@
+/** Shared compatibility reader for private task imports and local task reads. */
+import * as path from 'node:path';
+import { nowIso } from '../storage';
+import { taskContent } from '../util/project-task-content';
+import type { ProjectTask, TaskStatus } from './project_tasks';
+
+export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
+/** Cleanup deletes the version the user reviewed, never a later edit. */
+export type TaskDeleteExpectation = Pick<ProjectTask, 'content' | 'status' | 'created_at' | 'updated_at'>;
+export function matchesTaskDeleteExpectation(task: ProjectTask | null | undefined, expected: TaskDeleteExpectation): boolean {
+  return !!task && !!expected && typeof expected.content === 'string' && TASK_STATUSES.includes(expected.status)
+    && typeof expected.created_at === 'string' && typeof expected.updated_at === 'string'
+    && task.content === expected.content && task.status === expected.status
+    && task.created_at === expected.created_at && task.updated_at === expected.updated_at;
+}
+const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
+
+/** Reorder only validated members; an order hint cannot add or remove a file. */
+export function orderTaskAttachments(available: string[], preferred?: string[]): string[] {
+  const remaining = new Set(available);
+  const ordered: string[] = [];
+  for (const name of Array.isArray(preferred) ? preferred : []) {
+    if (!remaining.delete(name)) continue;
+    ordered.push(name);
+  }
+  return ordered.concat([...remaining]);
+}
+
+/** Commander is a reserved actor, including legacy name-only task records.
+ * A stable id takes precedence over the display name. */
+export function isCommanderTaskOwner(owner: { owner_agent_id?: string; owner_agent?: string }): boolean {
+  return owner.owner_agent_id === 'commander' || (!owner.owner_agent_id
+    && (owner.owner_agent === 'commander' || owner.owner_agent === 'Commander'));
+}
+
+export function clampStr(v: unknown, max: number): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim();
+  if (!s) return undefined;
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/** Coerce a persisted (possibly hand-edited / synced / older-shape) record into
+ *  a valid ProjectTask, or null if unusable. Never throws on bad input. */
+/** A due date is a local calendar day, `YYYY-MM-DD`, never a time: the user
+ *  asks for "by Friday", and every device reads the same day. */
+const DUE_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+export function isDueDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = DUE_DATE_RE.exec(value);
+  if (!match) return false;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+export function normaliseTask(raw: any): ProjectTask | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = typeof raw.id === 'string' ? raw.id : '';
+  if (!TASK_ID_RE.test(id)) return null;
+  const content = taskContent(raw);
+  if (!content) return null;
+  // Older names retain their stage; retired blocked/cancelled tasks reopen as
+  // todo. Reads preserve the source file; an ordinary edit persists the mapping.
+  const storedStatus = raw.status === 'in_progress' ? 'progress'
+    : raw.status === 'in_review' ? 'review' : raw.status;
+  const status: TaskStatus = TASK_STATUSES.includes(storedStatus) ? storedStatus : 'todo';
+  const now = nowIso();
+  const t: ProjectTask = {
+    id,
+    content,
+    status,
+    created_by: typeof raw.created_by === 'string' && raw.created_by ? raw.created_by : 'user',
+    created_at: typeof raw.created_at === 'string' ? raw.created_at : now,
+    updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : now,
+  };
+  const owner = clampStr(raw.owner_agent, 200);
+  if (owner) t.owner_agent = owner;
+  if (typeof raw.owner_agent_id === 'string' && raw.owner_agent_id) t.owner_agent_id = raw.owner_agent_id;
+  if (Array.isArray(raw.depends_on)) {
+    const depCandidates: string[] = raw.depends_on.filter(
+      (d: unknown): d is string => typeof d === 'string' && TASK_ID_RE.test(d),
+    );
+    const deps = [...new Set(depCandidates)];
+    if (deps.length) t.depends_on = deps;
+  }
+  if (typeof raw.origin_cid === 'string' && raw.origin_cid) t.origin_cid = raw.origin_cid;
+  if (Array.isArray(raw.attachments)) {
+    const names = [...new Set(
+      raw.attachments.map((n: unknown) => sanitiseTaskAttachmentName(n)).filter((n: string): n is string => !!n),
+    )] as string[];
+    if (names.length) t.attachments = names;
+  }
+  if (status === 'done' && typeof raw.done_at === 'string' && raw.done_at) t.done_at = raw.done_at;
+  if (isDueDate(raw.due_at)) t.due_at = raw.due_at;
+  return t;
+}
+
+// Attachment names cross OS boundaries via IPC and cloud-synced task JSON. Treat
+// both separator styles as directory boundaries, take the basename, and reject
+// traversal / dotfiles — host-independent, mirroring auto_tasks._sanitiseFilename.
+export function sanitiseTaskAttachmentName(name: unknown): string {
+  if (typeof name !== 'string') return '';
+  const base = path.posix.basename(name.replace(/\\/g, '/')).trim();
+  if (!base || base === '.' || base === '..' || base.startsWith('.')) return '';
+  return base.length > 200 ? base.slice(0, 200) : base;
+}

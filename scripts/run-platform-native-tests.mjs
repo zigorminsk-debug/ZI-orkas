@@ -1,0 +1,146 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const pcRoot = resolve(here, '..');
+const runner = resolve(here, 'run-tests.mjs');
+
+if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
+  console.log(`[platform-native-tests] skipped: unsupported host ${process.platform}`);
+  process.exit(0);
+}
+
+// Keep system/native tests explicit and serial. This lane intentionally
+// overlaps the general suite: host-specific process, native-module, and OS
+// integration cases must remain visible as a dedicated CI failure instead of
+// being buried among hundreds of platform-neutral tests. Real bundled Whisper
+// runs after dependency provisioning in the platform-specific Windows and
+// Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
+const commonSuites = [
+  'test/main/windows-install-data-root.test.ts',
+  'test/main/util/ensure-dev-dependencies.test.ts',
+  'test/main/util/verify-native-dependencies.test.ts',
+  'test/main/util/ensure-sqlite-electron-abi.test.ts',
+  'test/main/util/inspect-canary-logs.test.ts',
+  'src/core-agent/test/oauth-flow.test.ts',
+  'src/core-agent/test/tools.test.ts',
+  'src/core-agent/test/process-session.test.ts',
+  'src/core-agent/test/workspace-state.test.ts',
+  'src/core-agent/test/sandbox.test.ts',
+  'src/core-agent/test/windows-cleanup-batch.test.ts',
+  'test/main/model/core-agent/file-tools.test.ts',
+  'test/main/model/core-agent/tool-result-tools.test.ts',
+  'test/main/model/core-agent/local-tools.test.ts',
+  'test/main/model/core-agent/html-preview-tool.test.ts',
+  'test/main/features/html_preview.test.ts',
+  'test/main/features/connectors/local-cli.test.ts',
+  'test/main/features/connectors/local-cli-stdio-adapter.test.ts',
+  'test/main/model/local-tools.test.ts',
+  'test/main/model/core-agent/video-timeline-tool.test.ts',
+  'test/main/model/core-agent/image-studio-tool.test.ts',
+  'test/main/model/core-agent/office-tools.test.ts',
+  'test/main/model/core-agent/pdf-tools.test.ts',
+  'test/main/features/office/office_engine.test.ts',
+  'test/main/features/notification_permissions.test.ts',
+  'test/main/features/connectors/mcp-client.test.ts',
+  'test/main/util/shutdown.test.ts',
+  'test/main/features/desktop_background.test.ts',
+  'test/main/features/desktop_shutdown.test.ts',
+  'test/main/features/login_startup_boot.test.ts',
+  'test/main/features/login_startup.test.ts',
+  'test/main/util/app-tray.test.ts',
+  'test/main/features/generation_reference_assets.test.ts',
+  'test/main/index-process.test.ts',
+  'test/main/features/local_agents/base.test.ts',
+  'test/main/features/local_agents/bridge_skill_runner.test.ts',
+  'test/main/features/local_agents/spawn-command.test.ts',
+  'test/main/features/local_agents/version.test.ts',
+  'test/main/features/local_agents/upgrade.test.ts',
+  'test/main/util/bundled-runtime.test.ts',
+  'test/main/util/run-skill.test.ts',
+  'test/main/util/orkas-pkg.test.ts',
+  'test/main/util/sharp-runtime.test.ts',
+  'test/main/features/packages.test.ts',
+  'test/main/util/extract-xls.test.ts',
+  'test/main/util/media_probe.test.ts',
+  'test/main/util/tts-audio.test.ts',
+  'test/main/features/video_studio_native_qa.test.ts',
+  'test/main/features/video_studio_delivery.test.ts',
+  'test/main/paths.test.ts',
+  'test/main/util/migrate-source-data-root.test.ts',
+  'test/main/features/web_assist_passkey.test.ts',
+];
+
+const platformSuites = process.platform === 'win32'
+  ? [
+      'test/main/features/connectors/local-cli-lark-contract.test.ts',
+      'test/main/util/prepare-win-native-deps.test.ts',
+      'test/main/util/fetch-win-vc-runtime.test.ts',
+      'test/main/util/windows-shutdown-processes.test.ts',
+      'test/main/util/windows-installer-processes.test.ts',
+      'test/main/util/nsis-installer-processes.test.ts',
+    ]
+  : process.platform === 'darwin'
+    ? [
+        'test/main/features/platform-foundations.test.ts',
+        'test/main/features/user_workspace.test.ts',
+        'test/main/conversation-files.test.ts',
+        'test/main/native/notification-permissions-darwin.test.ts',
+      ]
+    : [
+        'test/main/util/linux-source-dependencies.test.ts',
+        'test/main/util/officecli-fetch.test.ts',
+        'test/main/util/ensure-dev-dependencies.test.ts',
+      ];
+
+console.log(`[platform-native-tests] host=${process.platform}; suites=${commonSuites.length + platformSuites.length}`);
+const result = spawnSync(process.execPath, [
+  runner,
+  'run',
+  '--maxWorkers=1',
+  ...commonSuites,
+  ...platformSuites,
+], {
+  cwd: pcRoot,
+  env: { ...process.env, ORKAS_PLATFORM_NATIVE_TEST: '1' },
+  stdio: 'inherit',
+  windowsHide: true,
+});
+
+if (result.error) throw result.error;
+if (result.status !== 0) process.exit(result.status ?? 1);
+
+// The suites above run under `ELECTRON_RUN_AS_NODE`, where `BrowserWindow` does
+// not exist. Timeline check/render measures real pixels in a window, so its
+// runtime probe and decoded-frame correctness are
+// unreachable from them and belongs in this lane, which already requires a
+// desktop host. Background browser input needs a page that no automation
+// client keeps painting, which Playwright E2E cannot provide. Each canary is
+// its own step so a rendering regression reads as one rather than being
+// attributed to the Vitest run.
+let status = 0;
+for (const [label, script] of [
+  ['video timeline canary', 'run-video-timeline-canary.mjs'],
+  ['background browser input canary', 'run-web-assist-input-canary.mjs'],
+]) {
+  console.log(`[platform-native-tests] ${label} (GUI Electron)`);
+  const canary = spawnSync(process.execPath, [resolve(pcRoot, 'test', 'gui', script)], {
+    cwd: pcRoot,
+    env: { ...process.env, ORKAS_PLATFORM_NATIVE_TEST: '1' },
+    stdio: 'inherit',
+    windowsHide: true,
+  });
+
+  if (canary.error) throw canary.error;
+  if (canary.status === 2) {
+    // Distinct from a failed case: this host gave the probe no window, so the
+    // lane proved nothing. Fail rather than skip — silence here is what let the
+    // gap live in the first place.
+    console.error(`[platform-native-tests] ${label} could not obtain a window; run it on a desktop session with a display`);
+  }
+  if (canary.status !== 0 && status === 0) status = canary.status ?? 1;
+}
+process.exit(status);

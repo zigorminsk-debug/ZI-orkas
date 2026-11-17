@@ -1,0 +1,316 @@
+/**
+ * OfficeCLI engine wrapper.
+ *
+ * OfficeCLI is a single self-contained native binary (embedded .NET runtime,
+ * no MS Office / LibreOffice needed) vendored under `resources/officecli/` by
+ * `scripts/fetch-officecli.cjs` and shipped via electron-builder
+ * `extraResources`. It is the built-in engine for reading / creating / editing
+ * / rendering docx/xlsx/pptx. This module is the ONLY place that spawns it.
+ *
+ * Resident processes: most OfficeCLI subcommands (create / batch / view / …)
+ * spin up a per-file `__resident-serve__` daemon to keep the document in
+ * memory for faster follow-up commands. That daemon DETACHES and outlives the
+ * command process, so a tool that touches a file MUST `closeOfficeFile()` it
+ * when done (in a finally) or the daemons accumulate. There is no upstream
+ * "close all" — see `closeAllOfficeResidents()` for the app-shutdown sweep
+ * (best-effort; hardening).
+ */
+import { spawn, spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import { officeCliBinaryPath } from '../../paths';
+import { createLogger } from '../../logger';
+import { logErrorSummary, logPathRef } from '../../util/log-redact';
+import { killProcessTree } from '../../../core-agent/src/sandbox/executor';
+
+const log = createLogger('office-engine');
+
+export type OfficeCliResult = { code: number; stdout: string; stderr: string };
+
+export class OfficeCliError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'OfficeCliError';
+    this.code = code;
+  }
+}
+
+export interface RunOfficeCliOpts {
+  /** Working directory for the spawned process. */
+  cwd: string;
+  /** Abort signal — kills the command process (not the detached resident). */
+  signal?: AbortSignal;
+  /** Hard timeout in ms (default 60s). */
+  timeoutMs?: number;
+  /** UTF-8 text piped to stdin (used by `batch` when no --input is given). */
+  stdin?: string;
+  /** Combined stdout/stderr capture ceiling (default 16 MiB). */
+  maxOutputBytes?: number;
+}
+
+export const OFFICECLI_DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+export const OFFICECLI_DEFAULT_TIMEOUT_MS = 60_000;
+
+/**
+ * OfficeCLI's HTML renderer discovers macOS browsers by probing executable
+ * paths inside /Applications. A child process attributed to Orkas can then
+ * make Chrome perform bundle-maintenance writes, which macOS reports as Orkas
+ * trying to modify another app. Office document operations never need to
+ * execute another installed app, so deny that capability at the process
+ * boundary. The exact bundled executable remains available for initial and
+ * resident launches when Orkas itself is installed under /Applications.
+ * Pass its real path as a sandbox parameter, never as profile source text.
+ */
+export const MAC_OFFICECLI_SANDBOX_PROFILE = [
+  '(version 1)',
+  '(allow default)',
+  '(deny process-exec (require-all (subpath "/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
+  '(deny process-exec (require-all (subpath "/System/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
+  '(deny process-exec (require-all (subpath "/System/Cryptexes/App/System/Applications") (require-not (literal (param "OFFICECLI_BINARY")))))',
+].join('');
+
+function officeCliSpawnCommand(bin: string, args: string[]): { command: string; args: string[] } {
+  if (process.platform !== 'darwin') return { command: bin, args };
+  return {
+    command: '/usr/bin/sandbox-exec',
+    args: ['-D', `OFFICECLI_BINARY=${fs.realpathSync(bin)}`, '-p', MAC_OFFICECLI_SANDBOX_PROFILE, bin, ...args],
+  };
+}
+
+let availableCache: boolean | null = null;
+
+export function _resetOfficeCliAvailableForTest(): void {
+  availableCache = null;
+}
+
+/** True when a usable OfficeCLI binary is present for this platform/arch.
+ *  Only the POSITIVE result is cached — in dev the binary is fetched on demand
+ *  (`npm run officecli:fetch`), so caching a negative from an early call would
+ *  wedge every office tool as missing for the whole session. In a packed build
+ *  the binary is present from first call, so this caches as before. */
+export function officeCliAvailable(): boolean {
+  if (availableCache === true) return true;
+  const bin = officeCliBinaryPath();
+  const ok = !!bin && fs.existsSync(bin);
+  if (ok) availableCache = true;
+  else log.warn('OfficeCLI binary unavailable', { platform: process.platform, arch: process.arch });
+  return ok;
+}
+
+/** Spawn the OfficeCLI binary with `args`. Resolves on process exit with the
+ *  captured stdout/stderr (any exit code — callers inspect `code`); rejects
+ *  on spawn/input failure, cancellation, timeout or output overflow. */
+export function runOfficeCli(args: string[], opts: RunOfficeCliOpts): Promise<OfficeCliResult> {
+  const bin = officeCliBinaryPath();
+  if (!bin) {
+    return Promise.reject(
+      new OfficeCliError('E_OFFICE_ENGINE_MISSING', `no OfficeCLI binary for ${process.platform}-${process.arch}`),
+    );
+  }
+  const timeoutMs = opts.timeoutMs ?? OFFICECLI_DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = Math.max(1, opts.maxOutputBytes ?? OFFICECLI_DEFAULT_MAX_OUTPUT_BYTES);
+  if (opts.signal?.aborted) {
+    return Promise.reject(new OfficeCliError('E_OFFICE_ABORTED', `OfficeCLI aborted before start: ${args[0]}`));
+  }
+
+  return new Promise<OfficeCliResult>((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      const launch = officeCliSpawnCommand(bin, args);
+      child = spawn(launch.command, launch.args, {
+        cwd: opts.cwd,
+        detached: process.platform !== 'win32',
+        // OfficeCLI enables background self-updates by default. Orkas vendors
+        // a hash-pinned binary, so letting it replace itself at runtime defeats
+        // that pin and can swap versions in the middle of a create/batch flow.
+        // Always prefer the version shipped with Orkas; upgrades belong to the
+        // dependency/release pipeline, never an end-user document operation.
+        env: { ...process.env, OFFICECLI_SKIP_UPDATE: '1' },
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      reject(new OfficeCliError('E_OFFICE_SPAWN', (err as Error).message));
+      return;
+    }
+
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    let settled = false;
+    let outputBytes = 0;
+    let timer: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      opts.signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (code: string, message: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new OfficeCliError(code, message));
+    };
+    const terminate = () => {
+      try { killProcessTree(child, 'SIGKILL'); } catch { /* best effort */ }
+    };
+    const failStdin = (err: Error) => {
+      if (settled) return;
+      // Reject before termination so late pipe/close events cannot change the
+      // outcome. Clearing the deadline alone would leave the command running.
+      fail('E_OFFICE_STDIN', `OfficeCLI stdin failed: ${err.message}`);
+      terminate();
+    };
+    const onAbort = () => {
+      terminate();
+      fail('E_OFFICE_ABORTED', `OfficeCLI aborted: ${args[0]}`);
+    };
+    const capture = (chunks: Buffer[], chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += data.length;
+      if (outputBytes > maxOutputBytes) {
+        terminate();
+        fail('E_OFFICE_OUTPUT_LIMIT', `OfficeCLI output exceeded ${maxOutputBytes} bytes: ${args[0]}`);
+        return;
+      }
+      chunks.push(data);
+    };
+
+    timer = setTimeout(() => {
+      terminate();
+      fail('E_OFFICE_TIMEOUT', `OfficeCLI timed out after ${timeoutMs}ms: ${args[0]}`);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    child.stdout?.on('data', (c: Buffer | string) => capture(outChunks, c));
+    child.stderr?.on('data', (c: Buffer | string) => capture(errChunks, c));
+    child.stdin?.on('error', failStdin);
+
+    if (opts.signal) {
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+      if (opts.signal.aborted) onAbort();
+    }
+
+    // Always close stdin: `batch` reads JSON from it; commands that ignore
+    // stdin are unaffected by an immediate EOF.
+    if (!settled) {
+      try {
+        if (opts.stdin !== undefined) child.stdin?.write(opts.stdin);
+        if (!settled) child.stdin?.end();
+      } catch (err) {
+        failStdin(err as Error);
+      }
+    }
+
+    child.on('error', (err: Error) => {
+      fail('E_OFFICE_SPAWN', err.message);
+    });
+
+    child.on('close', (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        code: code ?? -1,
+        stdout: Buffer.concat(outChunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8'),
+      });
+    });
+  });
+}
+
+/** Stop the resident daemon holding `file` in memory. Best-effort, never
+ *  throws — call in a `finally` after a tool finishes with a document. */
+export async function closeOfficeFile(file: string, cwd: string): Promise<void> {
+  try {
+    const result = await runOfficeCli(['close', file], { cwd, timeoutMs: 10_000 });
+    if (result.code !== 0) {
+      log.warn('OfficeCLI resident close failed', {
+        file: logPathRef(file), exit_code: result.code,
+        stdout_chars: result.stdout.length, stderr_chars: result.stderr.length,
+      });
+    }
+  } catch (err) {
+    log.warn('OfficeCLI resident close failed', { file: logPathRef(file), error: logErrorSummary(err) });
+  }
+}
+
+/** Reap ANY lingering OfficeCLI resident daemons. Per-file `closeOfficeFile`
+ *  in each tool's `finally` covers the normal path; this is the backstop for a
+ *  hard crash that skipped the finally. Call at startup (clean prior-session
+ *  leaks) and on app quit. Scope to the exact bundled executable and resident
+ *  mode: other installations and active document commands must survive. */
+export function closeAllOfficeResidents(): void {
+  const bin = officeCliBinaryPath();
+  if (!bin) return;
+  try {
+    if (process.platform === 'win32') {
+      const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+      const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      // Keep the binary path out of executable code. Pin handles and compare
+      // creation times so an exited resident's recycled PID is never killed.
+      const result = spawnSync(powershell, [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        Buffer.from(WINDOWS_RESIDENT_CLEANUP, 'utf16le').toString('base64'),
+      ], {
+        env: { ...process.env, ORKAS_OFFICECLI_SWEEP_BINARY: bin },
+        timeout: 5_000,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      if (result.error || result.status !== 0) throw new Error('OfficeCLI resident cleanup failed');
+    } else {
+      // Scope strictly to OUR binary's resident daemons, not any other officecli.
+      // `pkill -f` treats the pattern as an extended regex, so escape the binary
+      // path (an install dir with `()[]` etc. would otherwise fail to match and
+      // silently leak residents, or match too broadly).
+      const escaped = bin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      spawnSync('pkill', ['-f', `${escaped} __resident-serve__`], { timeout: 5_000, stdio: 'ignore' });
+    }
+  } catch (err) {
+    log.warn('OfficeCLI resident sweep failed', { error: logErrorSummary(err) });
+  }
+}
+
+const WINDOWS_RESIDENT_CLEANUP = String.raw`
+$ErrorActionPreference = 'Stop'
+$query = $null
+$rows = $null
+try {
+  $binary = [IO.Path]::GetFullPath($env:ORKAS_OFFICECLI_SWEEP_BINARY)
+  $name = [IO.Path]::GetFileName($binary).Replace("'", "''")
+  $query = [System.Management.ManagementObjectSearcher]::new("SELECT ProcessId,ExecutablePath,CommandLine,CreationDate FROM Win32_Process WHERE Name='$name'")
+  $rows = $query.Get()
+  $count = 0
+  foreach ($row in $rows) {
+    $candidate = $null
+    try {
+      if (++$count -gt 4096) { throw 'resident_limit' }
+      if (-not [string]::Equals([string]$row.ExecutablePath, $binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+      # Resident mode must be the first argument, not text in a document path.
+      if ([string]$row.CommandLine -notmatch '^\s*(?:"[^"]*"|\S+)\s+__resident-serve__(?:\s|$)') { continue }
+      try {
+        $candidate = [Diagnostics.Process]::GetProcessById([int]$row.ProcessId)
+        $null = $candidate.Handle
+        $started = $candidate.StartTime.ToUniversalTime()
+      } catch [ArgumentException] { continue }
+      catch [InvalidOperationException] { continue }
+      $snapshotStarted = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$row.CreationDate).ToUniversalTime()
+      if (($started.Ticks - ($started.Ticks % 10)) -ne $snapshotStarted.Ticks) { continue }
+      if (-not $candidate.HasExited) { $candidate.Kill() }
+      if (-not $candidate.WaitForExit(500)) { throw 'resident_still_running' }
+    } finally {
+      if ($null -ne $candidate) { $candidate.Dispose() }
+      $row.Dispose()
+    }
+  }
+} catch { exit 1 }
+finally {
+  if ($null -ne $rows) { $rows.Dispose() }
+  if ($null -ne $query) { $query.Dispose() }
+}
+exit 0
+`;

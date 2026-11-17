@@ -1,0 +1,234 @@
+import { responsesRejectedInput, type ResponsesRejectedInput } from './responses-status-diagnostics.js';
+import { toolArgumentsFailure, type ToolArgumentsFailure } from './tool-input-diagnostics.js';
+import { providerErrorFacts } from '../shared/provider-error-facts.js';
+
+/** Metadata only: this observer never changes errors used by retry policy. */
+export interface ProviderRequestFailure {
+  phase: 'unknown' | 'before_request' | 'before_response' | 'after_response';
+  code: string;
+  httpStatus?: number;
+  elapsedMs: number;
+  aborted: boolean;
+  source: ProviderFailureSource;
+  lastEvent: string;
+  requestSequence?: number;
+  contextWindow?: number;
+  outputLimit?: number;
+  budgetObserved?: boolean;
+  contextBudget?: Record<string, number | string>;
+  responsesStatus?: Record<string, unknown>;
+  /** Local failure evidence only; never a retry or telemetry dimension. */
+  toolArguments?: ToolArgumentsFailure;
+}
+
+/** Existing runner observations, never a second scan of request content. */
+export type FailureContextBudget = Record<string, number | string>;
+const BUDGET_NUMBERS = ['candidate_index', 'preparation_context_window', 'budget_context_window', 'output_reservation', 'usable_input_tokens',
+  'input_ceiling_tokens', 'estimated_input_tokens', 'emergency_before_tokens', 'emergency_after_tokens',
+  'compaction_before_tokens', 'compaction_after_tokens', 'compaction_attempts', 'compaction_failures'];
+
+function safeContextBudget(value: unknown): FailureContextBudget | undefined {
+  if (!value || typeof value !== 'object') return;
+  const raw = value as Record<string, unknown>;
+  if (raw.version !== 1) return;
+  const out: FailureContextBudget = { version: 1 };
+  for (const key of BUDGET_NUMBERS) {
+    const v = raw[key];
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) out[key] = Math.min(1_000_000_000, v);
+  }
+  for (const [key, values] of Object.entries({
+    estimate_source: ['estimated', 'anchored'], window_source: ['catalog', 'fallback'],
+    emergency_result: ['not_needed', 'applied', 'nothing_to_drop'],
+  })) if (typeof raw[key] === 'string' && values.includes(raw[key] as string)) out[key] = raw[key] as string;
+  return out;
+}
+
+export type ProviderFailureSource = 'unknown' | 'payload' | 'transport' | 'http' | 'sdk_error' | 'exception';
+const STREAM_EVENTS = new Set(['start', 'text_start', 'text_delta', 'text_end',
+  'thinking_start', 'thinking_delta', 'thinking_end', 'toolcall_start', 'toolcall_delta', 'toolcall_end', 'done']);
+// The host supplies one observer per run, shared by retries and auxiliary calls.
+// Weak ownership retains no sessions, request bodies or unbounded attempt arrays.
+const requestSequences = new WeakMap<(failure: ProviderRequestFailure) => void, number>();
+
+const DIAGNOSTIC_CODES = new Set([
+  'EPERM', 'EACCES',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+  'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID',
+  'invalid_request_error', 'invalid_function_parameters', 'invalid_json_schema',
+  'unsupported_parameter', 'unsupported_value', 'missing_required_parameter',
+  'context_length_exceeded', 'model_not_found', 'authentication_error',
+  'permission_error', 'insufficient_quota', 'rate_limit_error', 'server_error',
+  'internal_server_error', 'service_unavailable', 'overloaded_error',
+  'content_filter', 'content_policy_violation', 'invalid_encrypted_content',
+  'invalid_value', 'upstream_error',
+]);
+
+// Chromium exposes these native transport tokens as Error.message, without a
+// structured code. Accept only complete tokens at the fetch rejection boundary;
+// provider bodies, payload hooks and display prose never use this projection.
+const CHROMIUM_TRANSPORT_CODES = new Set([
+  'net::ERR_EMPTY_RESPONSE', 'net::ERR_SSL_PROTOCOL_ERROR', 'net::ERR_CONNECTION_CLOSED',
+  'net::ERR_CONNECTION_RESET', 'net::ERR_CONNECTION_REFUSED', 'net::ERR_CONNECTION_TIMED_OUT',
+  'net::ERR_TIMED_OUT', 'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_INTERNET_DISCONNECTED',
+  'net::ERR_NETWORK_CHANGED', 'net::ERR_PROXY_CONNECTION_FAILED', 'net::ERR_TUNNEL_CONNECTION_FAILED',
+  'net::ERR_CERT_AUTHORITY_INVALID', 'net::ERR_CERT_DATE_INVALID', 'net::ERR_CERT_COMMON_NAME_INVALID',
+]);
+
+function safeCode(error: unknown): string {
+  // Bound traversal even for cyclic causes. Never inspect messages or bodies.
+  try {
+    for (let itemError = error, depth = 0; itemError && typeof itemError === 'object' && depth < 8; depth++) {
+      const item = itemError as { code?: unknown; cause?: unknown };
+      if (typeof item.code === 'string' && item.code.length <= 128 && DIAGNOSTIC_CODES.has(item.code)) return item.code;
+      if (itemError instanceof ReferenceError) return 'REFERENCE_ERROR';
+      itemError = item.cause;
+    }
+    // Reuse already captured machine fields, including nested HTTP error/type.
+    // Serialized display messages remain disabled at the diagnostic boundary.
+    return providerErrorFacts(error, false).codes.find(code => DIAGNOSTIC_CODES.has(code)) ?? 'unknown';
+  } catch { /* Untrusted exception accessors are not diagnostic facts. */ }
+  return 'unknown';
+}
+
+function safeTransportCode(error: unknown): string {
+  const structured = safeCode(error);
+  if (structured !== 'unknown') return structured;
+  try {
+    if (error instanceof Error && error.name === 'Error'
+      && typeof error.message === 'string' && error.message.length <= 64
+      && CHROMIUM_TRANSPORT_CODES.has(error.message)) return error.message.slice(5);
+  } catch { /* Untrusted exception accessors cannot replace the failure. */ }
+  return 'unknown';
+}
+
+/** Request-local hooks supported by pi-ai. Observe headers without cloning,
+ * buffering or wrapping the response body. The adapter supplies its existing
+ * captured cause; unavailable causes remain unknown instead of guessed prose. */
+export function createRequestDiagnostics(
+  signal?: AbortSignal,
+  onFailure?: (failure: ProviderRequestFailure) => void,
+  contextBudget?: unknown,
+) {
+  const started = performance.now();
+  const requestSequence = onFailure ? Math.min(1_000_000_000, (requestSequences.get(onFailure) ?? 0) + 1) : undefined;
+  if (onFailure && requestSequence !== undefined) requestSequences.set(onFailure, requestSequence);
+  let source: ProviderFailureSource = 'unknown';
+  let lastEvent = 'none';
+  let phase: ProviderRequestFailure['phase'] = 'unknown';
+  let status: number | undefined;
+  let code = 'unknown';
+  let reported = false;
+  let observed = false;
+  let contextWindow: number | undefined;
+  let outputLimit: number | undefined;
+  let budgetObserved = false;
+  let toolArguments: ToolArgumentsFailure | undefined;
+  let streamErrorObserved = false;
+  let streamErrorCode = 'unknown';
+  let rejectedInput: ResponsesRejectedInput | undefined;
+  const onResponse = (response: { status: number }) => {
+    phase = 'after_response';
+    status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+      ? response.status : undefined;
+  };
+  const requestFetch: typeof globalThis.fetch = async (input, init) => {
+    phase = 'before_response';
+    status = undefined;
+    code = 'unknown';
+    source = 'unknown';
+    streamErrorObserved = false;
+    streamErrorCode = 'unknown';
+    rejectedInput = undefined;
+    try {
+      const response = await globalThis.fetch(input, init);
+      onResponse(response);
+      return response;
+    } catch (error) {
+      code = safeTransportCode(error);
+      source = 'transport';
+      throw error;
+    }
+  };
+  return {
+    get sequence(): number | undefined { return requestSequence; },
+    get observed(): boolean { return observed; },
+    get rejectedInput(): ResponsesRejectedInput | undefined { return signal?.aborted ? undefined : rejectedInput; },
+    onResponse,
+    observeInvalidToolArguments(input: unknown, api: string, stopReason: string): void {
+      if (signal?.aborted || toolArguments) return;
+      toolArguments = toolArgumentsFailure(input, api, stopReason);
+    },
+
+    /** SDK-native Codex envelopes, before string flattening. Metadata only:
+     * never attach these facts to the delivered error or retry classifier. */
+    observeProviderStreamEvent(value: unknown): void {
+      if (streamErrorObserved || signal?.aborted || !value || typeof value !== 'object' || Array.isArray(value)) return;
+      try {
+        const event = value as Record<string, unknown>;
+        let error: unknown;
+        if (event.type === 'error') error = event;
+        else if (event.type === 'response.failed') error = (event.response as { error?: unknown } | undefined)?.error;
+        if (!error || typeof error !== 'object' || Array.isArray(error)) return;
+        streamErrorObserved = true;
+        streamErrorCode = safeCode(error);
+        const detail = error as { param?: unknown; error?: { param?: unknown } };
+        rejectedInput = responsesRejectedInput(detail.param ?? detail.error?.param);
+      } catch { /* Diagnostic accessors cannot change SDK delivery. */ }
+    },
+    observeBudget(payload: unknown, window: unknown): void {
+      // O(1) observation of the final adapter payload. Never estimate tokens here.
+      try {
+        if (!payload || typeof payload !== 'object') return;
+        const body = payload as Record<string, unknown>;
+        const bounded = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 1_000_000_000 ? value : undefined;
+        contextWindow = bounded(window);
+        outputLimit = bounded(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens);
+        budgetObserved = true;
+      } catch { /* Metadata cannot change the payload result. */ }
+    },
+    requestFetch,
+    observeEvent(type: string): void {
+      // Retain the event preceding failure, not the generic terminal error.
+      if (type !== 'error') lastEvent = STREAM_EVENTS.has(type) ? type : 'unknown';
+    },
+    async observePayload<T>(operation: () => T | Promise<T>): Promise<T> {
+      try { return await operation(); }
+      catch (error) {
+        // The host hook failed before this SDK invocation could send a request.
+        // Store only closed metadata; rethrow the same error for the SDK policy.
+        phase = 'before_request';
+        source = 'payload';
+        status = undefined;
+        code = safeCode(error);
+        throw error;
+      }
+    },
+    report(error: unknown, aborted = false, boundary: ProviderFailureSource = 'unknown', responsesStatus?: Record<string, unknown>): ProviderRequestFailure | undefined {
+      if (reported) return undefined;
+      reported = true;
+      const existingCode = code === 'unknown' ? safeCode(error) : code;
+      const failure: ProviderRequestFailure = {
+        phase,
+        ...(!aborted && !signal?.aborted && responsesStatus ? { responsesStatus } : {}),
+        ...(!aborted && !signal?.aborted && toolArguments ? { toolArguments } : {}),
+        ...(budgetObserved ? { budgetObserved, contextWindow, outputLimit } : {}),
+        source: source !== 'unknown' ? source : status !== undefined && status >= 400 ? 'http' : boundary,
+        lastEvent,
+        ...(requestSequence === undefined ? {} : { requestSequence }),
+        code: existingCode === 'unknown' && !aborted && !signal?.aborted ? streamErrorCode : existingCode,
+        ...(status === undefined ? {} : { httpStatus: status }),
+        elapsedMs: Math.min(1_000_000_000, Math.max(0, Math.round(performance.now() - started))),
+        aborted: aborted || signal?.aborted === true,
+      };
+      // Only a failed request copies/sanitizes this small metadata record.
+      if (!failure.aborted) {
+        try { failure.contextBudget = safeContextBudget(contextBudget); } catch { /* Best effort. */ }
+      }
+      try { if (onFailure) { onFailure({ ...failure }); observed = true; } } catch { /* Best-effort observer. */ }
+      return failure;
+    },
+  };
+}

@@ -1,0 +1,1931 @@
+/**
+ * Per-conversation file attachments for main chat (`normal`).
+ * Layout:
+ *   sent/committed attachments: `data/<uid>/cloud/chat_attachments/<cid>/`
+ *   composer-only drafts:       `data/<uid>/local/chat_attachment_drafts/<draftCid>/`
+ *
+ * Supported kinds — mirrors `contexts` upload whitelist:
+ *   text   — .md / .markdown / .txt / .csv / .tsv / .json / .yaml / .yml / .log
+ *   pdf    — .pdf
+ *   docx   — .docx / .docm
+ *   spreadsheet  — .xlsx / .xlsm / .xls
+ *   presentation — .pptx / .pptm
+ *   archive — .zip (opaque path-only input for host-native import tools)
+ *   image  — .png / .jpg / .jpeg / .webp / .gif
+ *   video  — .mp4 / .webm / .mov / .m4v / .ogv (display-only, not sent to
+ *            the model; bytes streamed to the renderer via the
+ *            `chat-media://` protocol)
+ *
+ * Lifecycle:
+ *   uploadAttachment   — write original to disk; NO preprocessing. Draft CIDs
+ *                        (`main_chat`, `projchat-*`) are local-only until
+ *                        adoptDraftAttachments moves them into a real cid.
+ *                        PDF/DOCX/
+ *                        XLSX/PPTX extraction and color image compression happen lazily on read via
+ *                        features/file_indexer (which caches under
+ *                        <uid>/local/file_cache/<hash>/). Video is kept raw
+ *                        and never cached.
+ *   deleteAttachment   — remove original + invalidate its file_cache entry
+ *   purgeByCid         — wipe the whole <cid>/ dir + drop all cache entries
+ *                        tagged with this cid (called from
+ *                        chats.deleteConversation)
+ *   buildAttachmentManifest — produce (manifest XML + images) tuple for the
+ *                              model; images are compressed in real time on
+ *                              every turn (no cached preview sibling); video
+ *                              entries are skipped entirely (model can't see
+ *                              them — display-only).
+ *   resolveAttachmentAbsPath — pure helper used by the `chat-media://`
+ *                              protocol handler; validates inputs and
+ *                              enforces "abs path stays inside <cid>/"
+ *
+ * Size caps and extension whitelists align with `features/contexts`.
+ */
+
+import { fileFailureKind, type FileFailureKind } from '../util/app-error';
+import * as fs from 'node:fs';
+import { MAX_TEXT_FILE_BYTES } from '../util/file-size-limits';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isPathAllowed } from '../util/path-sandbox';
+
+import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } from '../paths';
+import {
+  chatAttachmentDirForConversation,
+  cachedChatAttachmentDirForConversation,
+  conversationMessageReadFile,
+} from '../util/project-layout';
+import { createLogger } from '../logger';
+import { linkWithRetry, renameWithRetry, writeJsonSync } from '../storage';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { t } from '../i18n';
+import { toCompressedJpeg } from '../util/image-transform';
+import { activeUserAttachmentNames } from './group_chat/task_board';
+import {
+  invalidateFileCache,
+  purgeFileCacheByCid,
+  statFile,
+  getCachedMeta,
+} from './file_indexer';
+
+const log = createLogger('chat_attachments');
+
+// ── Whitelists & caps (aligned with features/contexts) ────────────────────
+
+const TEXT_EXTS: ReadonlySet<string> = new Set([
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
+  '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
+]);
+const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+// Additional browser formats are display-only. Keep them out of IMAGE_EXTS so attachment
+// upload, model vision input, image transforms, and per-cid attachment serving
+// retain their existing raster-only contract.
+const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.apng', '.jpe', '.jfif', '.avif', '.bmp', '.ico', '.svg']);
+const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
+const LOCAL_DISPLAY_AUDIO_EXTS: ReadonlySet<string> = new Set([...AUDIO_EXTS, '.oga', '.weba']);
+const PDF_EXT = '.pdf';
+const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm', '.xls']);
+const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
+const ARCHIVE_EXTS: ReadonlySet<string> = new Set(['.zip']);
+export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
+  ...TEXT_EXTS,
+  PDF_EXT, ...DOCX_EXTS, ...SPREADSHEET_EXTS, ...PRESENTATION_EXTS,
+  ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS, ...ARCHIVE_EXTS,
+]);
+
+// Text attachments are path-addressed and read by the model in bounded slices,
+// so their composer cap does not need to mirror a prompt/body upload limit.
+// Share storage admission with Project Library; indexing has a separate work limit.
+export const MAX_TEXT_ATTACHMENT_BYTES = MAX_TEXT_FILE_BYTES;
+const MAX_BYTES_TEXT = MAX_TEXT_ATTACHMENT_BYTES;
+const MAX_BYTES_DOCX  = 20  * 1024 * 1024;
+const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
+export const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_BYTES_IMAGE = MAX_IMAGE_ATTACHMENT_BYTES;
+const MAX_BYTES_PDF   = 100 * 1024 * 1024;
+export const MAX_VIDEO_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const MAX_BYTES_VIDEO = MAX_VIDEO_ATTACHMENT_BYTES;
+const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
+// Keep the composer boundary aligned with the authoritative native Skill ZIP
+// importer. The importer still re-checks compressed/uncompressed size, entry
+// count, and traversal safety before extraction.
+const MAX_BYTES_ARCHIVE = 8 * 1024 * 1024;
+
+const MAX_FILENAME_LEN = 200;
+const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
+const GENERATED_ATTACHMENTS_FILE = '.generated-attachments.json';
+const SELECTED_ATTACHMENTS_FILE = '.selected-attachments.json';
+/** Composer boundary: one unsent message may reference at most this many
+ * distinct attachments. Enforced in the storage layer so IPC, drag/drop and
+ * any future callers cannot bypass the UI. */
+export const MAX_PENDING_ATTACHMENTS_PER_MESSAGE = 20;
+
+// ── Types ────────────────────────────────────────────────────────────────
+
+export type AttachmentKind =
+  | 'text'
+  | 'pdf'
+  | 'docx'
+  | 'spreadsheet'
+  | 'presentation'
+  | 'archive'
+  | 'image'
+  | 'video'
+  | 'audio';
+export type ImageMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+
+export interface AttachmentInfo {
+  name: string;
+  bytes: number;
+  kind: AttachmentKind;
+  mtime: number;      // epoch seconds
+}
+
+type AttachmentErrorCode = 'invalid_attachment' | 'file_too_large'
+  | 'too_many_attachments' | 'source_unavailable' | 'not_file' | 'read_failed' | 'write_failed' | 'copy_failed';
+export type Result<T = {}> = ({ ok: true } & T) | {
+  ok: false; error: string; failure_kind?: FileFailureKind; error_code?: AttachmentErrorCode;
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+function safeAttachmentName(name: unknown): string {
+  if (typeof name !== 'string') throw new Error('filename required');
+  const s = name.trim();
+  if (!s || s === '.' || s === '..') throw new Error('invalid filename');
+  if (s.includes('/') || s.includes('\\') || s.includes('\x00')) {
+    throw new Error('filename must not contain path separators');
+  }
+  if (s.startsWith('.')) throw new Error("filename must not start with '.'");
+  if (s.length > MAX_FILENAME_LEN) throw new Error('filename too long');
+  const ext = path.extname(s).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(t('errors.unsupported_file_ext', { ext: ext || t('errors.unsupported_file_no_ext') }));
+  }
+  return s;
+}
+
+function safeCid(cid: unknown): string {
+  if (typeof cid !== 'string' || !cid) throw new Error('cid required');
+  if (cid.includes('/') || cid.includes('\\') || cid.includes('\x00') || cid === '.' || cid === '..') {
+    throw new Error('invalid cid');
+  }
+  return cid;
+}
+
+const COMMANDER_DRAFT_CID = 'main_chat';
+const PROJECT_DRAFT_PREFIX = 'projchat-';
+
+export function isDraftAttachmentCid(cid: unknown): boolean {
+  return typeof cid === 'string' && (
+    cid === COMMANDER_DRAFT_CID
+    || cid.startsWith(PROJECT_DRAFT_PREFIX)
+  );
+}
+
+function kindOf(ext: string): AttachmentKind {
+  const e = ext.toLowerCase();
+  if (e === PDF_EXT) return 'pdf';
+  if (DOCX_EXTS.has(e)) return 'docx';
+  if (SPREADSHEET_EXTS.has(e)) return 'spreadsheet';
+  if (PRESENTATION_EXTS.has(e)) return 'presentation';
+  if (ARCHIVE_EXTS.has(e)) return 'archive';
+  if (IMAGE_EXTS.has(e)) return 'image';
+  if (VIDEO_EXTS.has(e)) return 'video';
+  if (AUDIO_EXTS.has(e)) return 'audio';
+  return 'text';
+}
+
+function maxBytesFor(ext: string): number {
+  const e = ext.toLowerCase();
+  if (e === PDF_EXT) return MAX_BYTES_PDF;
+  if (DOCX_EXTS.has(e)) return MAX_BYTES_DOCX;
+  if (SPREADSHEET_EXTS.has(e) || PRESENTATION_EXTS.has(e)) return MAX_BYTES_OFFICE;
+  if (IMAGE_EXTS.has(e)) return MAX_BYTES_IMAGE;
+  if (VIDEO_EXTS.has(e)) return MAX_BYTES_VIDEO;
+  if (AUDIO_EXTS.has(e)) return MAX_BYTES_AUDIO;
+  if (ARCHIVE_EXTS.has(e)) return MAX_BYTES_ARCHIVE;
+  return MAX_BYTES_TEXT;
+}
+
+function _moveFileBestEffort(from: string, to: string): void {
+  try { fs.renameSync(from, to); }
+  catch {
+    fs.copyFileSync(from, to);
+    try { fs.unlinkSync(from); } catch { /* best-effort */ }
+  }
+}
+
+function _legacyDraftCloudDir(userId: string, cid: string): string {
+  return chatAttachmentDir(userId, cid);
+}
+
+function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
+  if (!isDraftAttachmentCid(cid)) return;
+  const legacy = _legacyDraftCloudDir(userId, cid);
+  if (!fs.existsSync(legacy)) return;
+
+  const local = chatAttachmentDraftDir(userId, cid);
+
+  try {
+    if (!fs.existsSync(local)) {
+      fs.mkdirSync(path.dirname(local), { recursive: true });
+      fs.renameSync(legacy, local);
+    } else {
+      fs.mkdirSync(local, { recursive: true });
+      const selectionFile = path.join(local, SELECTED_ATTACHMENTS_FILE);
+      let selected: Set<string> | undefined;
+      if (fs.existsSync(selectionFile)) {
+        const value: unknown = JSON.parse(fs.readFileSync(selectionFile, 'utf8'));
+        if (!Array.isArray(value)) throw new Error('invalid selected attachment ledger');
+        selected = new Set(value.filter((name): name is string => typeof name === 'string'));
+      }
+      for (const name of fs.readdirSync(legacy)) {
+        if (name === SELECTED_ATTACHMENTS_FILE) continue;
+        const from = path.join(legacy, name);
+        let st: fs.Stats;
+        try { st = fs.statSync(from); } catch { continue; }
+        if (!st.isFile()) continue;
+        const target = uniqueTarget(local, name);
+        if (selected && !name.startsWith('.')) {
+          // These are legacy composer inputs. Record their collision-resolved
+          // names before moving so a failed metadata write cannot hide bytes.
+          selected.add(path.basename(target));
+          writeJsonSync(selectionFile, [...selected]);
+        }
+        _moveFileBestEffort(from, target);
+      }
+      try { fs.unlinkSync(path.join(legacy, SELECTED_ATTACHMENTS_FILE)); } catch { /* optional legacy metadata */ }
+      try { fs.rmdirSync(legacy); } catch { /* best-effort */ }
+    }
+  } catch (err) {
+    log.warn('legacy draft attachment migration failed', {
+      user_id: maskId(userId), cid: maskId(cid), error: logErrorSummary(err),
+    });
+    return;
+  }
+
+}
+
+function attachmentDirForCid(userId: string, cid: string): string {
+  if (isDraftAttachmentCid(cid)) {
+    migrateLegacyDraftCloudDir(userId, cid);
+    return chatAttachmentDraftDir(userId, cid);
+  }
+  return chatAttachmentDirForConversation(userId, cid);
+}
+
+function ensureDir(userId: string, cid: string): string {
+  const dir = attachmentDirForCid(userId, cid);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Durable output ownership is independent of whether a final reply exists.
+ * Older pools have no ledger and retain their history-based draft recovery. */
+function generatedAttachmentNames(userId: string, cid: string): Set<string> {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(
+      path.join(attachmentDirForCid(userId, cid), GENERATED_ATTACHMENTS_FILE), 'utf8',
+    ));
+    if (!Array.isArray(value)) throw new Error('invalid generated attachment ledger');
+    return new Set(value.filter((name): name is string => typeof name === 'string'
+      && path.basename(name) === name && !name.startsWith('.')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('generated attachment ownership read failed', { error: logErrorSummary(error) });
+    }
+    return new Set();
+  }
+}
+
+function saveGeneratedAttachmentNames(userId: string, cid: string, names: Set<string>): void {
+  const file = path.join(attachmentDirForCid(userId, cid), GENERATED_ATTACHMENTS_FILE);
+  if (names.size) {
+    writeJsonSync(file, [...names]);
+  } else if (fs.existsSync(file)) {
+    fs.unlinkSync(file);
+  }
+}
+
+function clearGeneratedAttachment(userId: string, cid: string, name: string): void {
+  const generated = generatedAttachmentNames(userId, cid);
+  if (generated.delete(name)) saveGeneratedAttachmentNames(userId, cid, generated);
+}
+
+/** Only user selection creates composer ownership. A mixed conversation pool
+ * is not evidence of selection, including legacy pools without a receipt. */
+function selectedAttachmentNames(userId: string, cid: string): Set<string> {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(
+      path.join(attachmentDirForCid(userId, cid), SELECTED_ATTACHMENTS_FILE), 'utf8',
+    ));
+    if (!Array.isArray(value)) throw new Error('invalid selected attachment ledger');
+    return new Set(value.filter((name): name is string => typeof name === 'string'
+      && path.basename(name) === name && !name.includes('\\') && !name.startsWith('.')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('selected attachment ownership read failed', { error: logErrorSummary(error) });
+      return new Set();
+    }
+    // These local-only directories have always belonged exclusively to the
+    // composer. Preserve their legacy drafts, never infer inputs in a cid pool.
+    return isDraftAttachmentCid(cid) ? new Set(listAttachments(userId, cid).map(item => item.name)) : new Set();
+  }
+}
+
+function saveSelectedAttachmentNames(userId: string, cid: string, names: Set<string>): void {
+  const file = path.join(attachmentDirForCid(userId, cid), SELECTED_ATTACHMENTS_FILE);
+  if (names.size) {
+    writeJsonSync(file, [...names]);
+  } else if (fs.existsSync(file)) {
+    fs.unlinkSync(file);
+  }
+}
+
+function rollbackSelectedAttachment(target: string | undefined): void {
+  if (!target) return;
+  try { fs.rmSync(target, { force: true }); }
+  catch (error) {
+    // The original publication failure remains authoritative. A leftover
+    // file has no selection receipt and therefore cannot become user input.
+    log.warn('selected attachment rollback cleanup failed', { error: logErrorSummary(error) });
+  }
+}
+
+/** Record only actual files directly in this conversation's attachment pool.
+ * Workspace outputs and existing user inputs do not change composer ownership. */
+export function recordGeneratedAttachment(userId: string, cid: string, absPath: string): void {
+  const safeConvId = safeCid(cid);
+  if (!path.isAbsolute(absPath)) return;
+  const root = path.resolve(attachmentDirForCid(userId, safeConvId));
+  const resolved = path.resolve(absPath);
+  if (path.dirname(resolved) !== root) return;
+  const name = path.basename(resolved);
+  if (name.startsWith('.') || !ALLOWED_EXTENSIONS.has(path.extname(name).toLowerCase())) return;
+  try { if (!fs.statSync(resolved).isFile()) return; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  const names = generatedAttachmentNames(userId, safeConvId);
+  if (names.has(name)) return;
+  names.add(name);
+  saveGeneratedAttachmentNames(userId, safeConvId, names);
+}
+
+function uniqueTarget(dir: string, name: string): string {
+  const target = path.join(dir, name);
+  if (!fs.existsSync(target)) return target;
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  const now = new Date();
+  const pad = (v: number) => String(v).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const stamped = path.join(dir, `${stem}-${stamp}${ext}`);
+  if (!fs.existsSync(stamped)) return stamped;
+  for (let copy = 2; ; copy += 1) {
+    const candidate = path.join(dir, `${stem}-${stamp}-${copy}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+}
+
+const attachmentWriteLocks = new Map<string, Promise<void>>();
+
+async function withAttachmentWriteLock<T>(
+  userId: string,
+  cid: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  const key = JSON.stringify([userId, cid]);
+  const prev = attachmentWriteLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  attachmentWriteLocks.set(key, current);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    if (attachmentWriteLocks.get(key) === current) {
+      attachmentWriteLocks.delete(key);
+    }
+  }
+}
+
+/** Publish complete selected bytes, or reuse an existing validated duplicate. */
+async function publishSelectedAttachment(dir: string, name: string, stage: (temp: string) => Promise<string | void>): Promise<string> {
+  // A short basename also supports valid near-limit Unicode attachment names.
+  const temp = path.join(dir, `.attachment-import-${crypto.randomUUID()}.tmp`);
+  let staged = false;
+  let owned = true;
+  try {
+    const existing = await stage(temp);
+    staged = true;
+    if (existing) return existing;
+    // Reuse Library import's exclusive inode publication: neither an app
+    // producer nor another filesystem writer can replace the winning name.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const target = uniqueTarget(dir, name);
+      try { await linkWithRetry(temp, target); return target; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err; }
+    }
+    throw new Error('could not allocate a unique attachment filename');
+  } catch (err) {
+    // Exclusive creation failed before we owned this random path.
+    if (!staged && (err as NodeJS.ErrnoException)?.code === 'EEXIST') owned = false;
+    throw err;
+  } finally {
+    if (owned) {
+      try { await fs.promises.rm(temp, { force: true }); }
+      catch (cleanupError) {
+        log.warn('attachment import staging cleanup failed', { error: logErrorSummary(cleanupError) });
+      }
+    }
+  }
+}
+
+class StagedAttachmentAdmissionError extends Error {
+  constructor(readonly errorCode: 'file_too_large', message: string) { super(message); }
+}
+
+function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): AttachmentInfo | null {
+  const ext = path.extname(name).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) return null;
+  let st: fs.Stats;
+  try { st = fs.statSync(absPath); }
+  catch { return null; }
+  if (!st.isFile()) return null;
+  return {
+    name,
+    bytes: st.size,
+    kind: kindOf(ext),
+    mtime: Math.floor(st.mtimeMs / 1000),
+  };
+}
+
+/** Only new owned outputs may roll back; existing user/media files stay intact. */
+function commitNewGeneratedAttachment(userId: string, cid: string, target: string): Result {
+  try { recordGeneratedAttachment(userId, cid, target); }
+  catch (err) {
+    try { fs.unlinkSync(target); }
+    catch (cleanupError) {
+      log.warn('generated media ownership rollback failed', { error: logErrorSummary(cleanupError) });
+    }
+    return { ok: false, error: (err as Error).message };
+  }
+  return { ok: true };
+}
+
+/** Shared synchronous storage boundary for validated generated media bytes. */
+function saveGeneratedMediaBytes(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName: string,
+  kind: 'image' | 'video',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  let safeConvId: string;
+  let safeName: string;
+  try {
+    safeConvId = safeCid(cid);
+    safeName = safeAttachmentName(preferredName);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const ext = path.extname(safeName).toLowerCase();
+  const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
+  if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
+
+  const dir = ensureDir(userId, safeConvId);
+  let target = '';
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    target = uniqueTarget(dir, safeName);
+    const temp = path.join(dir, `.attachment-import-${crypto.randomUUID()}.tmp`);
+    let staged = false;
+    let owned = true;
+    try {
+      fs.writeFileSync(temp, buffer, { flag: 'wx' });
+      staged = true;
+      fs.linkSync(temp, target);
+      break;
+    } catch (err) {
+      if (!staged && (err as NodeJS.ErrnoException).code === 'EEXIST') owned = false;
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        target = '';
+        continue;
+      }
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    } finally {
+      if (owned) {
+        try { fs.rmSync(temp, { force: true }); }
+        catch (cleanupError) {
+          log.warn('generated media staging cleanup failed', { error: logErrorSummary(cleanupError) });
+        }
+      }
+    }
+  }
+  if (!target) return { ok: false, error: `could not allocate a unique generated ${kind} filename` };
+
+  const info = attachmentInfoForPath(target, path.basename(target));
+  if (!info) {
+    try { fs.unlinkSync(target); } catch { /* best-effort */ }
+    return { ok: false, error: `generated ${kind} could not be verified after writing` };
+  }
+  const committed = commitNewGeneratedAttachment(userId, safeConvId, target);
+  if (committed.ok === false) return committed;
+  log.info('generated media attachment stored', { bytes: info.bytes, kind: info.kind });
+  return { ok: true, absPath: target, info };
+}
+
+export function saveGeneratedImageAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName = 'codex-generated-image.png',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  const result = saveGeneratedMediaBytes(userId, cid, buffer, preferredName, 'image');
+  if (!result.ok && 'error' in result && result.error === 'generated output must use a supported image extension') {
+    return { ok: false, error: 'generated output must use a raster image extension' };
+  }
+  return result;
+}
+
+/** Persist validated host-generated image or video bytes in the synced
+ * conversation media pool. Callers must inspect the actual container bytes
+ * before choosing the extension; this boundary owns filename, size, collision,
+ * and sync invariants. */
+export function saveGeneratedMediaAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  preferredName: string,
+  kind: 'image' | 'video',
+): Result<{ absPath: string; info: AttachmentInfo }> {
+  return saveGeneratedMediaBytes(userId, cid, buffer, preferredName, kind);
+}
+
+/** Store a remotely materialized media object at a stable, content-route name.
+ * Unlike ordinary generated outputs this path never allocates a collision
+ * suffix: the assistant message already contains the matching cid URL before
+ * the background download finishes. Conversation deletion and this writer use
+ * the same lock so a late download cannot recreate a deleted attachment pool. */
+export async function saveGeneratedMediaCacheAttachment(
+  userId: string,
+  cid: string,
+  buffer: Buffer,
+  stableName: string,
+  kind: 'image' | 'video',
+): Promise<Result<{ absPath: string; info: AttachmentInfo; reused?: boolean }>> {
+  let safeConvId: string;
+  let safeName: string;
+  try {
+    safeConvId = safeCid(cid);
+    safeName = safeAttachmentName(stableName);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const ext = path.extname(safeName).toLowerCase();
+  const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
+  if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
+
+  return withAttachmentWriteLock(userId, safeConvId, () => {
+    if (!fs.existsSync(conversationMessageReadFile(userId, safeConvId))) {
+      return { ok: false, error: 'conversation no longer exists' };
+    }
+    const dir = ensureDir(userId, safeConvId);
+    const target = path.join(dir, safeName);
+    const existing = attachmentInfoForPath(target, safeName);
+    if (existing) {
+      if (existing.kind !== kind || existing.bytes > cap) {
+        return { ok: false, error: 'stable generated media target is invalid' };
+      }
+      try { recordGeneratedAttachment(userId, safeConvId, target); }
+      catch (err) { return { ok: false, error: (err as Error).message }; }
+      return { ok: true, absPath: target, info: existing, reused: true };
+    }
+
+    const temp = path.join(dir, `.${safeName}.${process.pid}-${crypto.randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temp, buffer, { flag: 'wx' });
+      fs.renameSync(temp, target);
+    } catch (err) {
+      try { fs.unlinkSync(temp); } catch { /* best-effort */ }
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    }
+    const info = attachmentInfoForPath(target, safeName);
+    if (!info || info.kind !== kind) {
+      try { fs.unlinkSync(target); } catch { /* best-effort */ }
+      return { ok: false, error: `generated ${kind} could not be verified after writing` };
+    }
+    const committed = commitNewGeneratedAttachment(userId, safeConvId, target);
+    if (committed.ok === false) return committed;
+    log.info('generated media cache attachment stored', { bytes: info.bytes, kind: info.kind });
+    return { ok: true, absPath: target, info };
+  });
+}
+
+function hashBuffer(buf: Buffer): string {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+function hashFile(absPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(absPath);
+    s.on('data', (chunk) => h.update(chunk));
+    s.on('error', reject);
+    s.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
+async function findDuplicateByHash(
+  dir: string,
+  bytes: number,
+  sha256: string,
+  allowedNames?: ReadonlySet<string>,
+): Promise<AttachmentInfo | null> {
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return null; }
+  items.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  for (const e of items) {
+    if (!e.isFile() || e.name.startsWith('.')) continue;
+    if (allowedNames && !allowedNames.has(e.name)) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
+    const abs = path.join(dir, e.name);
+    let st: fs.Stats;
+    try { st = fs.statSync(abs); }
+    catch { continue; }
+    if (st.size !== bytes) continue;
+    try {
+      if (await hashFile(abs) === sha256) {
+        return attachmentInfoForPath(abs, e.name);
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return null;
+}
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+export async function uploadAttachment(
+  userId: string,
+  cid: string,
+  name: string,
+  raw: Buffer | Uint8Array | null | undefined,
+): Promise<Result<{ info: AttachmentInfo; reused?: boolean }>> {
+  let safeName: string;
+  let safeConvId: string;
+  try {
+    safeName = safeAttachmentName(name);
+    safeConvId = safeCid(cid);
+  } catch (err) { return { ok: false, error: (err as Error).message, error_code: 'invalid_attachment' }; }
+
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || []);
+  const ext = path.extname(safeName).toLowerCase();
+  const cap = maxBytesFor(ext);
+  if (buf.length > cap) {
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
+  }
+
+  const dir = ensureDir(userId, safeConvId);
+  const incomingHash = hashBuffer(buf);
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    // Reuse only files that are still pending. Reusing a file already
+    // referenced by history would make this new selection indistinguishable
+    // from the old send, so listPendingAttachments would drop it on restart.
+    const pending = listPendingAttachments(userId, safeConvId);
+    const pendingNames = new Set(pending.map((item) => item.name));
+    const duplicate = await findDuplicateByHash(dir, buf.length, incomingHash, pendingNames);
+    if (duplicate) {
+      log.info('attachment upload reused', {
+        user_id: maskId(userId), cid: maskId(safeConvId),
+        file: logPathRef(duplicate.name), bytes: duplicate.bytes,
+      });
+      return { ok: true, info: duplicate, reused: true };
+    }
+    if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
+      return {
+        ok: false,
+        error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+        error_code: 'too_many_attachments',
+      };
+    }
+
+    let target: string | undefined;
+    // Only publish complete bytes. A failed direct write could leave a short
+    // file that pending-attachment recovery would treat as a successful add.
+    try {
+      // Materialize legacy composer ownership before publishing the new file.
+      const selected = selectedAttachmentNames(userId, safeConvId);
+      target = await publishSelectedAttachment(dir, safeName, temp => fs.promises.writeFile(temp, buf, { flag: 'wx' }));
+      selected.add(path.basename(target));
+      saveSelectedAttachmentNames(userId, safeConvId, selected);
+    }
+    catch (err) {
+      rollbackSelectedAttachment(target);
+      // Roll back the mkdir from `ensureDir` if the directory ended up empty
+      // (i.e., this was the first attachment for the cid and the write failed
+      // before producing anything). Best-effort: a non-empty dir means a
+      // previous successful upload owns it and must not be touched.
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message, error_code: 'write_failed', failure_kind: fileFailureKind(err) };
+    }
+
+    // No upload-time preprocessing: extraction / image compression happen lazily in
+    // features/file_indexer when the model's tools first touch this file.
+    // Video is display-only and never preprocessed.
+
+    const finalName = path.basename(target);
+    const st = fs.statSync(target);
+    const kind = kindOf(ext);
+    clearGeneratedAttachment(userId, safeConvId, finalName);
+    log.info('attachment uploaded', {
+      user_id: maskId(userId), cid: maskId(safeConvId),
+      file: logPathRef(finalName), kind, bytes: st.size,
+    });
+    return {
+      ok: true,
+      info: {
+        name: finalName,
+        bytes: st.size,
+        kind,
+        mtime: Math.floor(st.mtimeMs / 1000),
+      },
+    };
+  });
+}
+
+/** Copy a local file into the attachment pool. `sha256` echoes the content
+ * hash so a composer chip created from a path import carries the same dedupe
+ * key as one created from a byte upload (renderer-side hash skip). */
+export async function importAttachmentFromPath(
+  userId: string,
+  cid: string,
+  sourcePath: string,
+  name?: string,
+): Promise<Result<{ info: AttachmentInfo; reused?: boolean; sha256: string }>> {
+  let safeName: string;
+  let safeConvId: string;
+  try {
+    safeName = safeAttachmentName(name || path.basename(sourcePath || ''));
+    safeConvId = safeCid(cid);
+  } catch (err) { return { ok: false, error: (err as Error).message, error_code: 'invalid_attachment', failure_kind: fileFailureKind(err) }; }
+
+  const absSource = path.resolve(String(sourcePath || ''));
+  let sourceStat: fs.Stats;
+  try { sourceStat = fs.statSync(absSource); }
+  catch (err) { return { ok: false, error: 'file not found', error_code: 'source_unavailable', failure_kind: fileFailureKind(err) }; }
+  if (!sourceStat.isFile()) return { ok: false, error: 'file not found', error_code: 'not_file' };
+
+  const ext = path.extname(safeName).toLowerCase();
+  const cap = maxBytesFor(ext);
+  if (sourceStat.size > cap) {
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
+  }
+
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const dir = ensureDir(userId, safeConvId);
+    let incomingHash: string;
+    try { incomingHash = await hashFile(absSource); }
+    catch (err) { return { ok: false, error: (err as Error).message, error_code: 'read_failed', failure_kind: fileFailureKind(err) }; }
+
+    // Match uploadAttachment: a historical file needs a new pool entry so
+    // the newly-selected pending item can be reconstructed after restart.
+    const pending = listPendingAttachments(userId, safeConvId);
+    const pendingNames = new Set(pending.map((item) => item.name));
+    let duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash, pendingNames);
+    if (duplicate) {
+      log.info('attachment import reused', {
+        user_id: maskId(userId), cid: maskId(safeConvId),
+        file: logPathRef(duplicate.name), bytes: duplicate.bytes,
+      });
+      return { ok: true, info: duplicate, reused: true, sha256: incomingHash };
+    }
+    if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
+      return {
+        ok: false,
+        error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+        error_code: 'too_many_attachments',
+      };
+    }
+
+    let target: string | undefined;
+    try {
+      const selected = selectedAttachmentNames(userId, safeConvId);
+      // Keep in-flight and failed copies out of the public attachment pool.
+      target = await publishSelectedAttachment(dir, safeName, async temp => {
+        await fs.promises.copyFile(absSource, temp, fs.constants.COPYFILE_EXCL);
+        const copied = await fs.promises.stat(temp);
+        if (copied.size > cap) {
+          throw new StagedAttachmentAdmissionError('file_too_large',
+            t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }));
+        }
+        // The source may have changed after initial validation/hash. Bind
+        // admission and the dedupe receipt to the private completed snapshot.
+        const copiedHash = await hashFile(temp);
+        if (copiedHash !== incomingHash) {
+          incomingHash = copiedHash;
+          duplicate = await findDuplicateByHash(dir, copied.size, incomingHash, pendingNames);
+          if (duplicate) return path.join(dir, duplicate.name);
+        }
+      });
+      if (!duplicate) {
+        selected.add(path.basename(target));
+        saveSelectedAttachmentNames(userId, safeConvId, selected);
+      }
+    }
+    catch (err) {
+      if (!duplicate) rollbackSelectedAttachment(target);
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      if (err instanceof StagedAttachmentAdmissionError) {
+        return { ok: false, error: err.message, error_code: err.errorCode };
+      }
+      return { ok: false, error: (err as Error).message, error_code: 'copy_failed', failure_kind: fileFailureKind(err) };
+    }
+
+    if (duplicate) return { ok: true, info: duplicate, reused: true, sha256: incomingHash };
+    const finalName = path.basename(target);
+    const st = fs.statSync(target);
+    const kind = kindOf(ext);
+    clearGeneratedAttachment(userId, safeConvId, finalName);
+    log.info('attachment imported', {
+      user_id: maskId(userId), cid: maskId(safeConvId),
+      file: logPathRef(finalName), kind, bytes: st.size,
+    });
+    return {
+      ok: true,
+      info: {
+        name: finalName,
+        bytes: st.size,
+        kind,
+        mtime: Math.floor(st.mtimeMs / 1000),
+      },
+      sha256: incomingHash,
+    };
+  });
+}
+
+export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return []; }
+  const dir = attachmentDirForCid(userId, safeConvId);
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return []; }
+  items.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  const out: AttachmentInfo[] = [];
+  for (const e of items) {
+    if (!e.isFile()) continue;
+    if (e.name.startsWith('.')) continue;  // skip any lingering legacy sibling
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
+    try {
+      const st = fs.statSync(path.join(dir, e.name));
+      out.push({
+        name: e.name,
+        bytes: st.size,
+        kind: kindOf(ext),
+        mtime: Math.floor(st.mtimeMs / 1000),
+      });
+    } catch { /* skip unreadable */ }
+  }
+  return out;
+}
+
+/**
+ * Explicit selections, minus files owned by live user tasks, generated
+ * outputs, or persisted messages. Unknown pool files are never user inputs.
+ * Used by the chip area
+ * (`/api/conversations/:cid/attachments`) to restore only the "uploaded but
+ * not yet sent" pool on app restart — without also re-chiping files that
+ * already belong to prior messages.
+ */
+export function listPendingAttachments(userId: string, cid: string): AttachmentInfo[] {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return []; }
+  const generated = generatedAttachmentNames(userId, safeConvId);
+  const selected = selectedAttachmentNames(userId, safeConvId);
+  const active = activeUserAttachmentNames(userId, safeConvId);
+  const all = listAttachments(userId, safeConvId).filter(item => selected.has(item.name)
+    && !generated.has(item.name) && !active.has(item.name));
+  if (!all.length) return all;
+
+  const jsonlPath = conversationMessageReadFile(userId, safeConvId);
+  let raw: string;
+  try { raw = fs.readFileSync(jsonlPath, 'utf8'); }
+  catch { return all; }
+  const committed = committedAttachmentNames(userId, safeConvId, raw);
+
+  return all.filter((a) => !committed.has(a.name));
+}
+
+/** Shared structured attachment-reference parser; preserves the composer contract. */
+function committedAttachmentNames(userId: string, safeConvId: string, raw: string): Set<string> {
+  const committed = new Set<string>();
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const rec = JSON.parse(s) as { attachments?: unknown; produced?: unknown; text?: unknown };
+      if (Array.isArray(rec.attachments)) {
+        for (const name of rec.attachments) {
+          if (typeof name === 'string') committed.add(name);
+        }
+      }
+      // Native CLI image generation is materialized into this same synced
+      // pool, but belongs to the assistant's `produced` output rather than a
+      // future composer upload. Mark only exact files under this cid root as
+      // committed so a restart cannot resurrect them as unsent user chips.
+      if (Array.isArray(rec.produced)) {
+        const root = path.resolve(attachmentDirForCid(userId, safeConvId));
+        for (const raw of rec.produced) {
+          if (typeof raw !== 'string' || !path.isAbsolute(raw)) continue;
+          const abs = path.resolve(raw);
+          const rel = path.relative(root, abs);
+          if (rel && !rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel) && path.dirname(rel) === '.') {
+            committed.add(path.basename(abs));
+          }
+        }
+      }
+      // A synced assistant row retains the portable cid URL even when its
+      // absolute `produced` path belongs to another device. Recover the
+      // committed filename from that URL so restored generated media never
+      // reappears as a local composer draft.
+      if (typeof rec.text === 'string') {
+        for (const match of rec.text.matchAll(/chat-media:\/\/cid\/([^/\s)]+)\/([^\s)#?]+)/g)) {
+          try {
+            const referencedCid = decodeURIComponent(match[1]);
+            const referencedName = safeAttachmentName(decodeURIComponent(match[2]));
+            if (referencedCid === safeConvId) committed.add(referencedName);
+          } catch { /* ignore malformed/non-attachment media URLs */ }
+        }
+      }
+    } catch { /* skip malformed line */ }
+  }
+
+  return committed;
+}
+
+/** Bounded, asynchronous maintenance check. Unknown histories stay protected. */
+export async function hasPendingAttachmentsForCleanup(userId: string, cid: string): Promise<boolean> {
+  const safeConvId = safeCid(cid);
+  let entries: fs.Dirent[];
+  try { entries = await fs.promises.readdir(attachmentDirForCid(userId, safeConvId), { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const names = entries.filter(e => !e.name.startsWith('.')
+    && ALLOWED_EXTENSIONS.has(path.extname(e.name).toLowerCase()));
+  if (!names.length) return false;
+  if (names.some(e => !e.isFile())) return true;
+  let file: Awaited<ReturnType<typeof fs.promises.open>>;
+  try { file = await fs.promises.open(conversationMessageReadFile(userId, safeConvId), 'r'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  try {
+    const limit = 4 * 1024 * 1024;
+    const size = (await file.stat()).size;
+    if (size > limit) return true;
+    const buffer = Buffer.alloc(size + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead !== size) return true;
+    const committed = committedAttachmentNames(userId, safeConvId, buffer.subarray(0, size).toString('utf8'));
+    return names.some(e => !committed.has(e.name));
+  } finally { await file.close(); }
+}
+
+export function deleteAttachment(userId: string, cid: string, name: string): Result {
+  let safeName: string;
+  let safeConvId: string;
+  try {
+    safeName = safeAttachmentName(name);
+    safeConvId = safeCid(cid);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  const dir = attachmentDirForCid(userId, safeConvId);
+  const p = path.join(dir, safeName);
+  if (!fs.existsSync(p)) return { ok: false, error: 'not found' };
+  try { fs.unlinkSync(p); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  clearGeneratedAttachment(userId, safeConvId, safeName);
+  const selected = selectedAttachmentNames(userId, safeConvId);
+  if (selected.delete(safeName)) saveSelectedAttachmentNames(userId, safeConvId, selected);
+  // Drop the lazy file_cache entry for this source (if any was materialised).
+  try { invalidateFileCache(userId, p); }
+  catch (err) { log.warn('attachment cache invalidation failed', { file: logPathRef(p), error: logErrorSummary(err) }); }
+  // Remove the per-cid directory if this was the last attachment — leaving
+  // empty `chat_attachments/<cid>/` shells around violates the "no payload,
+  // no directory" expectation, and the user has no UI to clean them up.
+  try {
+    if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+  } catch { /* best-effort */ }
+  return { ok: true };
+}
+
+// Internal only: preserve the failed operation's reason for protocol logging.
+// Public resolver codes and response bodies retain their compatibility contract.
+type MediaFileDiagnostic = 'not_found' | 'permission_denied' | 'not_file' | 'io_error';
+function mediaFileFailureCode(error: unknown): MediaFileDiagnostic {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' ? 'not_found'
+    : code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'io_error';
+}
+
+/** Diagnostic only: one async stat, no read, SVG materialization or mutation.
+ * stat_available does not establish readability, transport or decode success.
+ */
+export async function diagnoseMediaFile(
+  userId: string,
+  source: { localPath: string } | { cid: string; name: string },
+): Promise<{ diagnosis: string; media_kind?: AttachmentKind; media_failure_context?: string }> {
+  let abs: string;
+  let local = false;
+  if ('localPath' in source) {
+    if (!source.localPath || !path.isAbsolute(source.localPath)) return { diagnosis: 'bad_input' };
+    abs = path.resolve(source.localPath);
+    local = true;
+  } else {
+    try {
+      const cid = safeCid(source.cid);
+      const name = safeAttachmentName(source.name);
+      // Rendering resolves/migrates the owning layout first. Diagnostics use
+      // that hint only; a cold cache remains unknown instead of scanning files.
+      const dir = isDraftAttachmentCid(cid) ? chatAttachmentDraftDir(userId, cid)
+        : cachedChatAttachmentDirForConversation(userId, cid);
+      if (!dir) return { diagnosis: 'unavailable' };
+      abs = path.resolve(dir, name);
+    } catch { return { diagnosis: 'bad_input' }; }
+  }
+  const ext = path.extname(abs).toLowerCase();
+  if (local && !LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
+    return { diagnosis: 'bad_input' };
+  }
+  const media_kind = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? 'image' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : kindOf(ext));
+  // Lexical scope only, not file provenance or a symlink target. No additional
+  // I/O, message/index scan or path hash; distinguish the actual stat errno.
+  const tempRelative = local ? path.relative(os.tmpdir(), abs) : '';
+  const inOsTemp = !tempRelative || (!path.isAbsolute(tempRelative) && tempRelative !== '..' && !tempRelative.startsWith(`..${path.sep}`));
+  const scope = local ? (inOsTemp ? 'os_temp' : 'other_local') : 'attachment';
+  const context = (state: string) => ({ media_failure_context: `${local ? 'local' : 'cid'}|${scope}|${state}` });
+  try {
+    const stat = await fs.promises.stat(abs);
+    if (!stat.isFile()) return { diagnosis: 'not_file', media_kind, ...context('not_file') };
+    const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
+    if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind, ...context('too_large') };
+    return { diagnosis: 'stat_available', media_kind, ...context('stat_available') };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    const state = ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(code || '') ? code!.toLowerCase() : 'io_error';
+    return { diagnosis: mediaFileFailureCode(error), media_kind, ...context(state) };
+  }
+}
+
+/**
+ * Resolve (uid, cid, name) → absolute on-disk path, with every guard rail the
+ * `chat-media://` protocol handler needs:
+ *   - safeCid / safeAttachmentName reject path separators, traversal names,
+ *     empty strings, non-whitelisted extensions
+ *   - After `path.resolve` the final abs path MUST still live under the cid
+ *     dir (belt-and-braces anti-traversal; the name checks above already
+ *     block `..` but a defensive `path.relative` check survives future edits)
+ *   - File must exist and be a regular file
+ *
+ * Returns `{ok:true, absPath, kind}` on success. Errors use codes suitable
+ * for HTTP status mapping by the protocol handler:
+ *   'bad_input' → 400, 'forbidden' → 403, 'not_found' → 404
+ */
+export function resolveAttachmentAbsPath(
+  userId: string,
+  cid: string,
+  name: string,
+): Result<{ absPath: string; kind: AttachmentKind }> | { ok: false; code: 'bad_input' | 'forbidden' | 'not_found'; error: string; diagnosticCode?: MediaFileDiagnostic } {
+  let safeName: string;
+  let safeConvId: string;
+  try {
+    safeName = safeAttachmentName(name);
+    safeConvId = safeCid(cid);
+  } catch (err) {
+    return { ok: false, code: 'bad_input', error: (err as Error).message };
+  }
+  const root = path.resolve(attachmentDirForCid(userId, safeConvId));
+  const abs = path.resolve(root, safeName);
+  const rel = path.relative(root, abs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, code: 'forbidden', error: 'path traversal blocked' };
+  }
+  let stat: fs.Stats;
+  try { stat = fs.statSync(abs); }
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
+  const ext = path.extname(safeName).toLowerCase();
+  return { ok: true, absPath: abs, kind: kindOf(ext) };
+}
+
+/**
+ * Resolve an arbitrary absolute local path → streamable media file, for the
+ * `chat-media://local/<abs-path>` protocol route. Unlike per-cid attachments
+ * this serves files from anywhere on the user's machine — but only when they
+ * look like media (image, video, or audio extension) and aren't obscenely large.
+ *
+ * Threat model: the user runs the LLM on their own machine; worst case is
+ * the LLM asks the renderer to display one of the user's own files. Not
+ * exfiltration. No dir whitelist; the extension + size checks are the only
+ * gates.
+ *
+ * Accepts: absolute path (caller has already decoded URL + OS-normalized)
+ * Rejects: relative paths, non-existent targets, non-file targets,
+ *          non-media extensions, files over the per-kind cap.
+ */
+export function resolveLocalMediaPath(
+  absPath: string,
+): { ok: true; absPath: string; kind: 'image' | 'video' | 'audio' } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } {
+  if (typeof absPath !== 'string' || !absPath) {
+    return { ok: false, code: 'bad_input', error: 'path required' };
+  }
+  if (!path.isAbsolute(absPath)) {
+    return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  }
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !LOCAL_DISPLAY_AUDIO_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  let stat: fs.Stats;
+  try { stat = fs.statSync(normalized); }
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
+  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
+  if (stat.size > cap) {
+    const mb = Math.round(cap / 1024 / 1024);
+    return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
+  }
+  if (ext === '.svg') {
+    let body: string;
+    try { body = fs.readFileSync(normalized, 'utf8'); }
+    catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+    // Do not run markup-pattern checks across opaque raster base64 payloads;
+    // arbitrary encoded bytes can coincidentally end with text like `onfoo=`.
+    const bodyForSafety = body.replace(
+      /data:image\/(?:png|jpe?g|webp|gif);base64,[a-z0-9+/=\r\n]+/gi,
+      'data:image/png;base64,',
+    );
+    // Local SVGs render inside an <img>, but still reject active/remote content.
+    // VideoStudio contact sheets use only relative PNG hrefs plus rect/text/image.
+    if (
+      /<!DOCTYPE\b|<!ENTITY\b|<script\b|<foreignObject\b|<(?:iframe|object|embed)\b/i.test(bodyForSafety)
+      || /\bon[a-z]+\s*=/i.test(bodyForSafety)
+      || /javascript\s*:|data\s*:\s*text\/html/i.test(bodyForSafety)
+      || /(?:href|xlink:href|src)\s*=\s*["']\s*(?:https?:|\/\/)/i.test(bodyForSafety)
+      || /(?:@import|url\s*\()\s*["']?\s*(?:https?:|\/\/)/i.test(bodyForSafety)
+    ) {
+      return { ok: false, code: 'bad_input', error: 'unsafe SVG content' };
+    }
+  }
+  const kind = VIDEO_EXTS.has(ext) ? 'video' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : 'image');
+  return { ok: true, absPath: normalized, kind };
+}
+
+/**
+ * Make a passive local SVG self-contained before returning it to an <img>.
+ * Chromium intentionally blocks external subresources for SVG-as-image, so
+ * legacy VideoStudio contact sheets with relative PNG hrefs otherwise render
+ * only their labels. New contact sheets are already self-contained; this is
+ * the read-only compatibility path for existing conversation history.
+ */
+export function materializeLocalDisplaySvg(
+  absPath: string,
+): { ok: true; body: string } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } {
+  const resolved = resolveLocalMediaPath(absPath);
+  if (!resolved.ok) {
+    const err = resolved as { code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic };
+    return { ok: false, code: err.code, error: err.error, ...(err.diagnosticCode ? { diagnosticCode: err.diagnosticCode } : {}) };
+  }
+  if (path.extname(resolved.absPath).toLowerCase() !== '.svg') {
+    return { ok: false, code: 'bad_input', error: 'path is not an SVG' };
+  }
+
+  let body: string;
+  try { body = fs.readFileSync(resolved.absPath, 'utf8'); }
+  catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
+
+  const root = path.dirname(resolved.absPath);
+  const sourceUrl = pathToFileURL(resolved.absPath);
+  let inlineError: { code: 'bad_input' | 'not_found' | 'too_large'; error: string; diagnosticCode?: MediaFileDiagnostic } | null = null;
+  let refCount = 0;
+  body = body.replace(
+    /(<image\b[^>]*?\b(?:href|xlink:href)\s*=\s*)(["'])([^"']*)\2/gi,
+    (full, prefix: string, quote: string, rawRef: string) => {
+      if (inlineError) return full;
+      const ref = String(rawRef || '').trim();
+      if (/^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(ref)) return full;
+      refCount += 1;
+      if (refCount > 20) {
+        inlineError = { code: 'too_large', error: 'SVG contains too many image references' };
+        return full;
+      }
+      if (!ref || ref.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('//')) {
+        inlineError = { code: 'bad_input', error: 'unsupported SVG image reference' };
+        return full;
+      }
+      let imageAbs: string;
+      try {
+        // SVG hrefs are URLs: decode filename bytes once and keep query/fragment
+        // outside the filesystem path before applying the existing confinement.
+        imageAbs = fileURLToPath(new URL(ref.replace(/&amp;/g, '&'), sourceUrl));
+      } catch {
+        inlineError = { code: 'bad_input', error: 'invalid SVG image reference' };
+        return full;
+      }
+      const rel = path.relative(root, imageAbs);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || !isPathAllowed(imageAbs, [root])) {
+        inlineError = { code: 'bad_input', error: 'SVG image reference escapes its directory' };
+        return full;
+      }
+      const imageExt = path.extname(imageAbs).toLowerCase();
+      if (!IMAGE_EXTS.has(imageExt)) {
+        inlineError = { code: 'bad_input', error: `unsupported SVG image extension: ${imageExt || '(none)'}` };
+        return full;
+      }
+      let stat: fs.Stats;
+      try { stat = fs.statSync(imageAbs); }
+      catch (error) {
+        inlineError = { code: 'not_found', error: 'SVG image reference not found', diagnosticCode: mediaFileFailureCode(error) };
+        return full;
+      }
+      if (!stat.isFile()) {
+        inlineError = { code: 'not_found', error: 'SVG image reference is not a file', diagnosticCode: 'not_file' };
+        return full;
+      }
+      if (stat.size > MAX_BYTES_IMAGE) {
+        inlineError = { code: 'too_large', error: 'SVG image reference exceeds image size cap' };
+        return full;
+      }
+      const data = fs.readFileSync(imageAbs).toString('base64');
+      return `${prefix}${quote}data:${mediaMimeFor(imageAbs)};base64,${data}${quote}`;
+    },
+  );
+
+  if (inlineError) return { ok: false, ...inlineError };
+  if (Buffer.byteLength(body, 'utf8') > MAX_BYTES_IMAGE) {
+    return { ok: false, code: 'too_large', error: 'materialized SVG exceeds image size cap' };
+  }
+  return { ok: true, body };
+}
+
+/**
+ * Sibling of `resolveLocalMediaPath` for files that aren't media but still
+ * need to be streamed through `chat-media://local/<abs>` so the renderer can
+ * preview them in-app (PDF via Chromium's PDFium, HTML via a sandboxed
+ * iframe). Same threat model: extension allow-list, no directory allow-list.
+ *
+ * No size cap — these are served via `serveFileRange`, so Chromium streams
+ * the bytes directly into the iframe (or PDF viewer) without ever touching
+ * the JS heap. Worst case of a huge file is a few seconds of busy GPU
+ * process while the user dismisses the overlay.
+ */
+const PREVIEW_DOC_EXTS: ReadonlySet<string> = new Set(['.pdf', '.html', '.htm']);
+
+export function resolveLocalPreviewPath(
+  absPath: string,
+): { ok: true; absPath: string; kind: 'pdf' | 'html' } | { ok: false; code: 'bad_input' | 'not_found'; error: string } {
+  if (typeof absPath !== 'string' || !absPath) {
+    return { ok: false, code: 'bad_input', error: 'path required' };
+  }
+  if (!path.isAbsolute(absPath)) {
+    return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  }
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!PREVIEW_DOC_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  let stat: fs.Stats;
+  try { stat = fs.statSync(normalized); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  return { ok: true, absPath: normalized, kind: ext === '.pdf' ? 'pdf' : 'html' };
+}
+
+/** MIME lookup for the chat-media:// protocol handler. Covers images, videos,
+ *  audio, and the in-app preview docs served via `resolveLocalPreviewPath` (pdf /
+ *  html). Text/markdown go through the `produced.readText` IPC instead. */
+export function mediaMimeFor(name: string): string {
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.m4v') return 'video/x-m4v';
+  if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.aac') return 'audio/aac';
+  if (ext === '.flac') return 'audio/flac';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.html' || ext === '.htm') return 'text/html';
+  return 'application/octet-stream';
+}
+
+/** MIME lookup for `chat-media://local`. Browser display aliases are kept
+ * separate from `mediaMimeFor`, which is also used by per-cid attachments. */
+export function localMediaMimeFor(name: string): string {
+  const aliases: Record<string, string> = {
+    '.apng': 'image/apng', '.jpe': 'image/jpeg', '.jfif': 'image/jpeg',
+    '.avif': 'image/avif', '.bmp': 'image/bmp', '.ico': 'image/x-icon',
+    '.svg': 'image/svg+xml', '.oga': 'audio/ogg', '.weba': 'audio/webm',
+  };
+  const alias = aliases[path.extname(name).toLowerCase()];
+  if (alias) return alias;
+  return mediaMimeFor(name);
+}
+
+/**
+ * Same-folder web assets of an HTML page previewed through `chat-media://local`
+ * (stylesheets, scripts, JSON data, fonts). Unlike the media and preview
+ * document routes above, these are served only below a folder the host file
+ * viewer granted for the page it is about to open. A previewed page therefore
+ * cannot widen its own reach, for example by framing another local document.
+ */
+const PREVIEW_ASSET_EXTS: ReadonlySet<string> = new Set([
+  '.css', '.js', '.mjs', '.json', '.woff', '.woff2', '.ttf', '.otf',
+]);
+const PREVIEW_ASSET_ROOT_TTL_MS = 12 * 60 * 60 * 1000;
+const PREVIEW_ASSET_ROOT_LIMIT = 64;
+const previewAssetRoots = new Map<string, number>();
+
+type PreviewAssetResult =
+  | { ok: true; absPath: string; kind: 'asset' }
+  | { ok: false; code: 'bad_input' | 'not_found' | 'forbidden'; error: string };
+
+function previewAssetRootTooBroad(rootReal: string): boolean {
+  if (rootReal === path.parse(rootReal).root) return true;
+  let home = os.homedir();
+  try { home = fs.realpathSync(home); } catch { /* keep the unresolved home */ }
+  // The home folder, or anything above it, would expose every project below it.
+  return !!home && isPathAllowed(home, [rootReal]);
+}
+
+/** Let the HTML page at `htmlAbsPath` load assets from its own folder tree. */
+export function grantLocalHtmlPreviewAssets(
+  htmlAbsPath: string,
+  now = Date.now(),
+): { ok: true; root: string } | { ok: false; code: 'bad_input' | 'not_found' | 'forbidden'; error: string } {
+  const doc = resolveLocalPreviewPath(htmlAbsPath);
+  if (!doc.ok) {
+    const err = doc as { code: 'bad_input' | 'not_found'; error: string };
+    return { ok: false, code: err.code, error: err.error };
+  }
+  if (doc.kind !== 'html') return { ok: false, code: 'bad_input', error: 'not an HTML document' };
+  let root: string;
+  try { root = fs.realpathSync(path.dirname(doc.absPath)); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  if (previewAssetRootTooBroad(root)) {
+    return { ok: false, code: 'forbidden', error: 'folder is too broad to share with a preview' };
+  }
+  previewAssetRoots.delete(root);
+  previewAssetRoots.set(root, now);
+  while (previewAssetRoots.size > PREVIEW_ASSET_ROOT_LIMIT) {
+    const oldest = previewAssetRoots.keys().next().value;
+    if (oldest === undefined) break;
+    previewAssetRoots.delete(oldest);
+  }
+  return { ok: true, root };
+}
+
+/**
+ * Resolve an asset below one of `rootsReal` (real paths). Containment is checked before
+ * existence, so a page cannot probe for files outside its folder. Hidden
+ * folders and files below the root (`.git`, `.env*`, …) are never served.
+ */
+export function resolveHtmlPreviewAssetWithinRoots(absPath: string, rootsReal: readonly string[]): PreviewAssetResult {
+  if (typeof absPath !== 'string' || !absPath) return { ok: false, code: 'bad_input', error: 'path required' };
+  if (!path.isAbsolute(absPath)) return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!PREVIEW_ASSET_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  const outside = { ok: false, code: 'forbidden', error: 'outside the previewed page folder' } as const;
+  if (!rootsReal.length || !isPathAllowed(normalized, rootsReal)) return outside;
+  let real: string;
+  let stat: fs.Stats;
+  try {
+    real = fs.realpathSync(normalized);
+    stat = fs.statSync(real);
+  } catch {
+    return { ok: false, code: 'not_found', error: 'not found' };
+  }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  const root = rootsReal.find((candidate) => isPathAllowed(real, [candidate]));
+  if (!root) return outside;
+  const rel = path.relative(root, real);
+  if (rel.split(path.sep).some((segment) => segment.startsWith('.'))) {
+    return { ok: false, code: 'forbidden', error: 'hidden path' };
+  }
+  return { ok: true, absPath: real, kind: 'asset' };
+}
+
+/** Resolve an asset for a page the file viewer granted with `grantLocalHtmlPreviewAssets`. */
+export function resolveLocalHtmlPreviewAssetPath(absPath: string, now = Date.now()): PreviewAssetResult {
+  for (const [root, grantedAt] of previewAssetRoots) {
+    if (now - grantedAt > PREVIEW_ASSET_ROOT_TTL_MS) previewAssetRoots.delete(root);
+  }
+  return resolveHtmlPreviewAssetWithinRoots(absPath, [...previewAssetRoots.keys()]);
+}
+
+/** Content types for same-folder preview assets. */
+export function localPreviewAssetMimeFor(name: string): string {
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '.css') return 'text/css; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'text/javascript; charset=utf-8';
+  if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.woff') return 'font/woff';
+  if (ext === '.woff2') return 'font/woff2';
+  if (ext === '.ttf') return 'font/ttf';
+  if (ext === '.otf') return 'font/otf';
+  return 'application/octet-stream';
+}
+
+function imageMimeFromExt(ext: string): ImageMimeType {
+  const e = ext.toLowerCase();
+  if (e === '.png') return 'image/png';
+  if (e === '.webp') return 'image/webp';
+  if (e === '.gif') return 'image/gif';
+  return 'image/jpeg'; // .jpg / .jpeg / fallback
+}
+
+/**
+ * Move an entire draft attachment dir (e.g. `main_chat/`, used by the
+ * commander tab
+ * before a conversation exists) into a freshly-minted `<cid>/`. No caches
+ * need to follow — cache entries are keyed by absolute path and will simply
+ * point at the old draft location until next access, at which point
+ * ensureFresh rebuilds for the new path. pruneOrphans sweeps the stale
+ * draft-path cache at startup.
+ */
+export async function adoptDraftAttachments(
+  userId: string,
+  fromCid: string,
+  toCid: string,
+): Promise<Result<{ count: number; items: Array<{ sourceName: string; targetName: string }> }>> {
+  let srcSafe: string;
+  let dstSafe: string;
+  try { srcSafe = safeCid(fromCid); dstSafe = safeCid(toCid); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (srcSafe === dstSafe) return { ok: false, error: 'same cid' };
+
+  // Both owners stay locked across asynchronous Windows rename retries. A stable
+  // order also prevents reciprocal adoptions from waiting on each other.
+  const [first, second] = [srcSafe, dstSafe].sort();
+  return withAttachmentWriteLock(userId, first, () => withAttachmentWriteLock(userId, second, async () => {
+    const src = attachmentDirForCid(userId, srcSafe);
+    if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
+    const dst = chatAttachmentDirForConversation(userId, dstSafe);
+    const sourceGenerated = generatedAttachmentNames(userId, srcSafe);
+    const sourceSelected = selectedAttachmentNames(userId, srcSafe);
+    const destinationSelected = selectedAttachmentNames(userId, dstSafe);
+    const destinationGenerated = generatedAttachmentNames(userId, dstSafe);
+    let sourceNames: string[] = [];
+    try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
+    catch { /* ignore */ }
+    let movedNames: Array<{ source: string; target: string }> = [];
+    const movedPaths: Array<{ from: string; target: string }> = [];
+    let generatedOwnershipChanged = false;
+
+    try {
+      // Convert legacy dedicated drafts before a whole-directory rename.
+      if (sourceSelected.size) saveSelectedAttachmentNames(userId, srcSafe, sourceSelected);
+      if (!fs.existsSync(dst)) {
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        await renameWithRetry(src, dst);
+        movedNames = sourceNames.map((name) => ({ source: name, target: name }));
+      } else {
+        for (const name of fs.readdirSync(src)) {
+          if (name === GENERATED_ATTACHMENTS_FILE || name === SELECTED_ATTACHMENTS_FILE) continue;
+          const from = path.join(src, name);
+          const target = uniqueTarget(dst, name);
+          await moveDraftEntry(from, target);
+          movedPaths.push({ from, target });
+          if (!name.startsWith('.')) {
+            movedNames.push({ source: name, target: path.basename(target) });
+          }
+        }
+        if (sourceGenerated.size) {
+          const generated = new Set(destinationGenerated);
+          for (const item of movedNames) {
+            if (sourceGenerated.has(item.source)) generated.add(item.target);
+          }
+          saveGeneratedAttachmentNames(userId, dstSafe, generated);
+          generatedOwnershipChanged = true;
+        }
+        if (sourceSelected.size) {
+          const selected = new Set(destinationSelected);
+          for (const item of movedNames) {
+            if (sourceSelected.has(item.source)) selected.add(item.target);
+          }
+          saveSelectedAttachmentNames(userId, dstSafe, selected);
+        }
+      }
+    } catch (err) {
+      // The freshly-created conversation must never receive only part of the
+      // user's draft. Restore every entry already moved so the renderer can keep
+      // the original chips and let the user retry the whole send.
+      for (const item of movedPaths.reverse()) {
+        try {
+          fs.mkdirSync(path.dirname(item.from), { recursive: true });
+          await moveDraftEntry(item.target, item.from);
+        } catch (rollbackErr) {
+          log.warn('draft attachment adoption rollback failed', {
+            user_id: maskId(userId), from_cid: maskId(dstSafe), to_cid: maskId(srcSafe),
+            error: logErrorSummary(rollbackErr),
+          });
+        }
+      }
+      if (generatedOwnershipChanged) {
+        try {
+          saveGeneratedAttachmentNames(userId, dstSafe, destinationGenerated);
+        } catch (rollbackErr) {
+          log.warn('draft attachment ownership rollback failed', { error: logErrorSummary(rollbackErr) });
+        }
+      }
+      return { ok: false, error: (err as Error).message };
+    }
+
+    for (const name of [GENERATED_ATTACHMENTS_FILE, SELECTED_ATTACHMENTS_FILE]) {
+      try { fs.unlinkSync(path.join(src, name)); } catch { /* best-effort cleanup after publication */ }
+    }
+    try { fs.rmdirSync(src); } catch { /* best-effort */ }
+
+    const count = movedNames.length;
+    log.info('draft attachments adopted', {
+      user_id: maskId(userId), from_cid: maskId(srcSafe), to_cid: maskId(dstSafe), count,
+    });
+    return {
+      ok: true,
+      count,
+      items: movedNames.map((name) => ({
+        sourceName: name.source,
+        targetName: name.target,
+      })),
+    };
+  }));
+}
+
+async function moveDraftEntry(from: string, to: string): Promise<void> {
+  try { await renameWithRetry(from, to); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+    fs.copyFileSync(from, to);
+    try { fs.unlinkSync(from); }
+    catch (unlinkErr) {
+      fs.rmSync(to, { force: true });
+      throw unlinkErr;
+    }
+  }
+}
+
+/** Remove the entire `<cid>/` attachment dir + drop all file_cache entries
+ *  tagged with this cid. Returns count of attachment files deleted. */
+export async function purgeByCid(userId: string, cid: string): Promise<number> {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return 0; }
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const dir = attachmentDirForCid(userId, safeConvId);
+    let count = 0;
+    try {
+      const root = await fs.promises.lstat(dir).catch(err => {
+        if (err.code === 'ENOENT') return null;
+        throw err;
+      });
+      if (root) {
+        const pending = root.isDirectory() ? [''] : [];
+        const files: string[] = [];
+        for (let cursor = 0; cursor < pending.length; cursor++) {
+          const parent = pending[cursor];
+          const entries = await fs.promises.readdir(path.join(dir, parent), { withFileTypes: true });
+          for (const entry of entries) {
+            const relative = path.join(parent, entry.name);
+            if (entry.isDirectory()) pending.push(relative);
+            else files.push(relative);
+          }
+        }
+        // rm removes links themselves; neither inventory nor removal follows
+        // a linked directory into another task or an external workspace.
+        await fs.promises.rm(dir, { recursive: true, force: true });
+        count = files.filter(name => name !== GENERATED_ATTACHMENTS_FILE).length;
+      }
+    } catch (err) { log.warn('attachment purge failed', { cid: maskId(cid), error: logErrorSummary(err) }); }
+    try { await purgeFileCacheByCid(userId, safeConvId); }
+    catch (err) { log.warn('attachment cache purge failed', { cid: maskId(safeConvId), error: logErrorSummary(err) }); }
+    return count;
+  });
+}
+
+// ── Prompt injection (manifest + images) ─────────────────────────────────
+
+export interface AttachmentManifest {
+  /** `<attachments>…</attachments>` XML listing model-readable attachments
+   *  with absolute paths + kind + optional total_chars. Empty string when no text-ish
+   *  attachments are attached. The model uses this as a directory listing
+   *  and calls the on-demand file tools for content. */
+  manifest: string;
+  /** Compressed color JPEG images formatted for `ChatOptions.images` (pi-ai
+   *  ImageContent). Produced in real time on each call — no cache. */
+  images: Array<{ data: string; mediaType: ImageMimeType }>;
+  /** Names of attachments we couldn't use (missing / too big / load error). */
+  skipped: Array<{ name: string; reason: string }>;
+  /** Current-turn attachment metadata for Orkas-managed server routing. */
+  metadata: AttachmentRequestMetadata;
+}
+
+export interface AttachmentRequestMetadata {
+  hasAttachments: boolean;
+  attachmentTypes: AttachmentKind[];
+}
+
+export interface BuildManifestOpts {
+  /** Max number of images eagerly prepared for model delivery. Remaining
+   * images stay in the manifest as path-addressable deferred attachments.
+   * Defaults to the composer attachment limit (20). */
+  maxImages?: number;
+}
+
+export interface BuildConversationAttachmentIndexOpts {
+  /** Attachment names already represented by the current-turn manifest. */
+  excludeNames?: readonly string[];
+  /** Max files listed in the lightweight conversation-wide index. */
+  maxFiles?: number;
+}
+
+/**
+ * Produce the model-facing view of the attachments for one turn:
+ *   - text            → listed with `total_chars` (cheap: one fs.readFileSync
+ *                       + .length via file_indexer.statFile). Model can go
+ *                       straight to read_files.
+ *   - pdf / docx /
+ *     spreadsheet /
+ *     presentation   → listed with `total_chars` ONLY if the cache already has
+ *                       it (i.e. someone has read/stated this file before).
+ *                       Otherwise `total_chars` is omitted and the model must
+ *                       let read_files prepare extraction. Never eagerly extract
+ *                       here — upload stays zero-cost.
+ *   - image           → compressed color JPEG via real-time
+ *                       toCompressedJpeg on the raw source → images[]
+ *                       for pi-ai vision.
+ *   - video/audio     → listed by path for media tools, without inline bytes.
+ *   - archive         → listed by path only for a task-specific host tool;
+ *                       archive bytes are never parsed into model context.
+ */
+export async function buildAttachmentManifest(
+  userId: string,
+  cid: string,
+  names: string[],
+  opts: BuildManifestOpts = {},
+): Promise<AttachmentManifest> {
+  const requestedMaxImages = opts.maxImages ?? MAX_PENDING_ATTACHMENTS_PER_MESSAGE;
+  const maxImages = Number.isFinite(requestedMaxImages)
+    ? Math.max(0, Math.min(MAX_PENDING_ATTACHMENTS_PER_MESSAGE, Math.trunc(requestedMaxImages)))
+    : MAX_PENDING_ATTACHMENTS_PER_MESSAGE;
+  const skipped: Array<{ name: string; reason: string }> = [];
+  const entries: string[] = [];
+  const images: Array<{ data: string; mediaType: ImageMimeType }> = [];
+  const attachmentTypes: AttachmentKind[] = [];
+  const seenTypes = new Set<AttachmentKind>();
+  let attachmentCount = 0;
+
+  const addAttachmentType = (kind: AttachmentKind) => {
+    attachmentCount += 1;
+    if (!seenTypes.has(kind)) {
+      seenTypes.add(kind);
+      attachmentTypes.push(kind);
+    }
+  };
+  const metadata = (): AttachmentRequestMetadata => ({
+    hasAttachments: attachmentCount > 0,
+    attachmentTypes: [...attachmentTypes],
+  });
+
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch (err) { return { manifest: '', images: [], skipped: [{ name: '', reason: (err as Error).message }], metadata: metadata() }; }
+  const dir = attachmentDirForCid(userId, safeConvId);
+
+  for (const rawName of names) {
+    let nm: string;
+    try { nm = safeAttachmentName(rawName); }
+    catch (err) { skipped.push({ name: String(rawName), reason: (err as Error).message }); continue; }
+    const abs = path.join(dir, nm);
+    const ext = path.extname(nm).toLowerCase();
+    const kind = kindOf(ext);
+    addAttachmentType(kind);
+    if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: t('attachments.skipped.missing') }); continue; }
+
+    if (kind === 'image') {
+      if (images.length >= maxImages) {
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="deferred"/>`);
+        continue;
+      }
+      try {
+        const buf = fs.readFileSync(abs);
+        // Preserve reference colors on first delivery, just as read_files does.
+        const compressed = await toCompressedJpeg(buf, { maxDim: 1024, quality: 70 });
+        images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
+        // Candidate providers enforce their own N-image request limit after
+        // this manifest is built. `image_order` preserves a deterministic
+        // name/path ↔ image-block mapping for whichever prefix is delivered.
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="model-bounded" image_order="${images.length}"/>`);
+      } catch (err) {
+        skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
+      }
+      continue;
+    }
+
+    if (kind === 'video' || kind === 'audio') {
+      // Not vision/inline-text input, but the FILE is available at its path.
+      // Surface it in the manifest (do NOT skip it) with model_readable="false"
+      // so an agent can probe / transcribe / extract frames with media tools.
+      // The earlier "display only, not read by the model" skip made agents give
+      // up on a clip the user explicitly handed them (VideoStudio [474]).
+      entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="${kind}" model_readable="false"/>`);
+      continue;
+    }
+
+    if (kind === 'archive') {
+      entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="archive" model_readable="false"/>`);
+      continue;
+    }
+
+    // text / pdf / modern Office → manifest entry (path + kind + total_chars if known).
+    let totalChars: number | undefined;
+    if (kind === 'text') {
+      // Text is cheap to stat (one fs.readFileSync). Always include total_chars
+      // so the first read_files call can land on the right range.
+      try {
+        const meta = await statFile(userId, abs);
+        totalChars = meta.totalChars;
+      } catch (err) {
+        log.warn('attachment manifest text metadata failed', { file: logPathRef(nm), error: logErrorSummary(err) });
+      }
+    } else {
+      // Rich documents: peek only — no extract. total_chars appears only when
+      // a prior read/stat already materialised the cache.
+      const cached = getCachedMeta(userId, abs);
+      if (cached?.totalChars !== undefined) totalChars = cached.totalChars;
+    }
+
+    const attrs = [
+      `name="${escapeAttr(nm)}"`,
+      `path="${escapeAttr(abs)}"`,
+      `kind="${kind}"`,
+    ];
+    if (totalChars !== undefined) attrs.push(`total_chars="${totalChars}"`);
+    entries.push(`<file ${attrs.join(' ')}/>`);
+  }
+
+  const hasMedia = entries.some((e) => (
+    e.includes('kind="video"') || e.includes('kind="audio"')
+  ));
+  const mediaNote = hasMedia
+    ? '\n<!-- video/audio are not vision input; read their content with media tools (probe / transcribe / extract frames) via the path — do not treat them as unreadable -->'
+    : '';
+  const hasArchives = entries.some((e) => e.includes('kind="archive"'));
+  const archiveNote = hasArchives
+    ? '\n<!-- ZIP archives are opaque inputs. Do not call read_files on them; use a task-specific host import tool with the exact path when the user requested that import. -->'
+    : '';
+  const hasImages = entries.some((e) => e.includes('kind="image"'));
+  const imageNote = hasImages
+    ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_files({"paths":[{"path":"<exact-path>"}]}) for that image, one at a time; listing a path alone is not visual processing. -->'
+    : '';
+  const accessNote = entries.length
+    ? '\n<!-- These host-validated paths are authoritative and readable. For file contents, call read_files with the exact path directly; do not search for an attached file first. -->'
+    : '';
+  const manifest = entries.length
+    ? `<attachments>${accessNote}${mediaNote}${archiveNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
+    : '';
+  return { manifest, images, skipped, metadata: metadata() };
+}
+
+/**
+ * Build a cheap, conversation-wide attachment directory listing. Unlike the
+ * current-turn manifest above, this is meant to survive session history trims:
+ * it lists already-uploaded files by name/path/kind, without inlining image
+ * bytes or file contents.
+ */
+export async function buildConversationAttachmentIndex(
+  userId: string,
+  cid: string,
+  opts: BuildConversationAttachmentIndexOpts = {},
+): Promise<string> {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return ''; }
+
+  const dir = attachmentDirForCid(userId, safeConvId);
+  let dirents: fs.Dirent[];
+  try { dirents = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return ''; }
+
+  const excluded = new Set<string>();
+  for (const rawName of opts.excludeNames || []) {
+    try { excluded.add(safeAttachmentName(rawName)); }
+    catch { /* ignore invalid caller input */ }
+  }
+
+  const maxFiles = Math.max(1, Math.min(200, opts.maxFiles ?? MAX_CONVERSATION_ATTACHMENT_INDEX_FILES));
+  const files = dirents
+    .filter((d) => d.isFile() && !d.name.startsWith('.') && !excluded.has(d.name))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+  if (!files.length) return '';
+
+  const entries: string[] = [];
+  for (const d of files.slice(0, maxFiles)) {
+    let nm: string;
+    try { nm = safeAttachmentName(d.name); }
+    catch { continue; }
+    const abs = path.join(dir, nm);
+    let st: fs.Stats;
+    try { st = fs.statSync(abs); }
+    catch { continue; }
+    const ext = path.extname(nm).toLowerCase();
+    const kind = kindOf(ext);
+    const attrs = [
+      `name="${escapeAttr(nm)}"`,
+      `path="${escapeAttr(abs)}"`,
+      `kind="${kind}"`,
+      `size="${st.size}"`,
+    ];
+
+    if (kind === 'text') {
+      try {
+        const meta = await statFile(userId, abs);
+        attrs.push(`total_chars="${meta.totalChars}"`);
+      } catch (err) {
+        log.warn('attachment index text metadata failed', { file: logPathRef(nm), error: logErrorSummary(err) });
+      }
+    } else {
+      const cached = getCachedMeta(userId, abs);
+      if (cached?.totalChars !== undefined) attrs.push(`total_chars="${cached.totalChars}"`);
+    }
+
+    if (kind === 'image') attrs.push('inline="false"');
+    if (kind === 'video' || kind === 'audio' || kind === 'archive') attrs.push('model_readable="false"');
+    entries.push(`<file ${attrs.join(' ')}/>`);
+  }
+
+  if (!entries.length) return '';
+  const omitted = files.length > entries.length
+    ? `\n<omitted count="${files.length - entries.length}"/>`
+    : '';
+  return (
+    `<conversation-attachments cid="${escapeAttr(safeConvId)}">\n` +
+    '<!-- Files uploaded earlier in this conversation. Use read_files for readable files and task-specific host tools for opaque archives; images/videos/archives are not inline. -->\n' +
+    entries.join('\n') +
+    omitted +
+    '\n</conversation-attachments>'
+  );
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Exported for ipc handlers that list by user.
+export { userChatAttachmentsDir };

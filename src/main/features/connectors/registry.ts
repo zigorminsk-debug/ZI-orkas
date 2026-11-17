@@ -1,0 +1,507 @@
+/**
+ * Connector registry persistence.
+ *
+ * User records use `<uid>/cloud/config/connectors.json`; local CLI records use
+ * `<uid>/local/config/device-connectors.json`. These are local storage paths;
+ * readers combine them and writers preserve the separate record partitions.
+ * Token-bearing grants, DCR credentials and resolved transport fields are sealed
+ * per instance through local-secret-store, using the local uid as owner. Public
+ * metadata remains plaintext. The previous per-instance encrypted format is
+ * migrated without exposing secret bytes. Writes retain the mutex and atomic
+ * publication; actual changes notify the renderer.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+import { Mutex } from 'async-mutex';
+
+import { userConnectorsConfigFile, userDeviceConnectorsConfigFile } from '../../paths';
+import { writeTextAtomicSync } from '../../storage';
+import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
+import * as localSecrets from '../../util/local-secret-store';
+import { cancelForConnector } from './action_confirm';
+import { connectorRecordsForScope, prepareDeviceLocalConnectorStorage } from './device-local';
+import type {
+  ConnectorInstance,
+  ConnectorsFile,
+  OAuthGrant,
+  ComposioGrant,
+  DcrClientCredentials,
+  Transport,
+} from './types';
+
+const log = createLogger('connectors:registry');
+const _writeMutex = new Mutex();
+
+const EMPTY: ConnectorsFile = { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
+const CONNECTOR_SECRET_NAMESPACE = 'connectors.instance';
+export const SECRETS_UNAVAILABLE_MESSAGE = 'connector_secrets_unavailable';
+const _readCache = new Map<string, { file: string; mtimeMs: number; size: number; data: ConnectorsFile }>();
+
+// On-disk shape: ConnectorInstance with all token-bearing fields collapsed into one
+// locally encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
+// not a "secret" by name, `applyTemplate` bakes the resolved `access_token` into
+// `transport.env[oauth_env_key]` (stdio) / `transport.headers.Authorization` (streamable-http);
+// leaving it plaintext on disk would defeat the whole encryption. `manager.ts::_resolveTransport`
+// re-runs `applyTemplate` from the catalog template + fresh `oauth_grant` on every connect, so
+// the persisted transport is purely vestigial at runtime — sealing it has zero runtime cost.
+// Only this module is aware of the disk form.
+type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'composio_grant' | 'transport'> & {
+  secrets_enc?: string;
+  // Kept optional in the disk type so a hydrate failure can still surface a row (with `transport`
+  // unset and oauth_grant unset) — manager will mark it `status:error` and the user re-OAuths.
+};
+interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; composio_grant?: ComposioGrant; transport?: Transport }
+
+const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
+const UNAVAILABLE_SECRETS = Symbol('unavailableConnectorSecrets');
+interface PreservedSecrets {
+  ciphertext: string;
+  /** Canonical plaintext that produced `ciphertext`. Missing means decryption
+   * failed; the blob may only be reused while no replacement secrets exist. */
+  plaintext?: string;
+}
+interface UnavailableSecretsState {
+  /** Status read from disk before the device-local error projection was applied. */
+  persistedStatus: ConnectorInstance['status'];
+}
+type ConnectorInstanceWithLocalSecretState = ConnectorInstance & {
+  [PRESERVED_SECRETS]?: PreservedSecrets;
+  [UNAVAILABLE_SECRETS]?: UnavailableSecretsState;
+};
+
+// Secret-owner resolver. The open-source build stores connector secrets under the local uid.
+function _secretOwner(uid: string): string {
+  return uid;
+}
+
+function _secretContext(uid: string, instanceId: string): localSecrets.LocalSecretContext {
+  return {
+    namespace: CONNECTOR_SECRET_NAMESPACE,
+    ownerId: _secretOwner(uid),
+    recordId: instanceId,
+  };
+}
+
+function _notifyRendererChanged(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
+    ipc.broadcastToRenderer?.('connectors:changed', { changed: true });
+  } catch { /* tests / open-source build may not have the IPC bridge loaded */ }
+}
+
+function _cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function _cloneInstance(inst: ConnectorInstance): ConnectorInstance {
+  const out = _cloneJson(inst);
+  const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
+  if (preserved) {
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ...preserved };
+  }
+  const unavailable = (inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+  if (unavailable) {
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = _cloneJson(unavailable);
+  }
+  return out;
+}
+
+export function hasUnavailableSecrets(inst: ConnectorInstance | null | undefined): boolean {
+  return !!inst && !!(inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+}
+
+function _cloneFile(data: ConnectorsFile): ConnectorsFile {
+  const connections: Record<string, ConnectorInstance> = {};
+  for (const [id, inst] of Object.entries(data.connections || {})) {
+    connections[id] = _cloneInstance(inst);
+  }
+  return {
+    version: data.version || 2,
+    connections,
+    oauth_hints: _cloneJson(data.oauth_hints || {}),
+    _deleted_at: _cloneJson(data._deleted_at || {}),
+  };
+}
+
+function _cacheKey(uid: string, file: string): string {
+  return `${uid}\0${file}`;
+}
+
+function _cacheRead(uid: string, file: string, st: fs.Stats): ConnectorsFile | null {
+  const cached = _readCache.get(_cacheKey(uid, file));
+  if (!cached || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) return null;
+  return _cloneFile(cached.data);
+}
+
+function _cacheWrite(uid: string, file: string, st: fs.Stats, data: ConnectorsFile): void {
+  _readCache.set(_cacheKey(uid, file), {
+    file,
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    data: _cloneFile(data),
+  });
+}
+
+function _legacySeeds(uid: string): string[] {
+  const primary = _secretOwner(uid);
+  return primary === uid ? [uid] : [primary, uid];
+}
+
+function _tryDecrypt(uid: string, instanceId: string, payload: string): { json: string; migrated: boolean } | null {
+  try {
+    const dec = localSecrets.decryptLocalSecretWithMeta(
+      _secretContext(uid, instanceId),
+      payload,
+      { legacySeeds: _legacySeeds(uid) },
+    );
+    return { json: dec.plaintext, migrated: localSecrets.shouldRewriteLocalSecret(dec.kind) };
+  } catch {
+    return null;
+  }
+}
+
+function _persistedStatusBeforeSecretError(inst: ConnectorInstance): ConnectorInstance['status'] {
+  // Persisted rows should have status; tolerate older/malformed metadata so one bad row
+  // cannot make the entire connector registry unreadable while handling a decrypt failure.
+  return inst.status ? _cloneJson(inst.status) : { kind: 'connecting' };
+}
+
+function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: ConnectorInstance; migrated: boolean } {
+  const { secrets_enc, ...rest } = disk;
+  // transport is required on ConnectorInstance but absent from the disk shape — it lives in the
+  // secrets blob. Cast through; manager.ts handles the no-transport / no-grant case via
+  // `_resolveTransport` returning null → status:error.
+  const out = { ...rest } as ConnectorInstance;
+  if (!secrets_enc) return { instance: out, migrated: false };
+  const dec = _tryDecrypt(uid, disk.id, secrets_enc);
+  if (dec === null) {
+    log.warn('decrypt secrets_enc failed (known formats) — instance left without transport/grant', { id: disk.id });
+    const persistedStatus = _persistedStatusBeforeSecretError(out);
+    out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = { persistedStatus };
+    return { instance: out, migrated: false };
+  }
+  try {
+    const blob = JSON.parse(dec.json) as SecretsBlob;
+    if (blob.oauth_grant) out.oauth_grant = blob.oauth_grant;
+    if (blob.dcr_client) out.dcr_client = blob.dcr_client;
+    if (blob.composio_grant) out.composio_grant = blob.composio_grant;
+    if (blob.transport) out.transport = blob.transport;
+    // Metadata-only writes dominate connector startup. Keep the exact sealed
+    // value when its plaintext is unchanged so status/tool-cache updates do
+    // not repeatedly invoke the local secret backend.
+    if (!dec.migrated) {
+      (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = {
+        ciphertext: secrets_enc,
+        plaintext: dec.json,
+      };
+    }
+  } catch (err) {
+    log.warn('parse secrets_enc payload failed', { id: disk.id, error: logErrorSummary(err) });
+    const persistedStatus = _persistedStatusBeforeSecretError(out);
+    out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = { persistedStatus };
+    return { instance: out, migrated: false };
+  }
+  return { instance: out, migrated: dec.migrated };
+}
+
+function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk {
+  const { oauth_grant, dcr_client, composio_grant, transport, ...rest } = inst;
+  const onDisk = { ...rest } as InstanceOnDisk;
+  const unavailable = (inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+  if (unavailable) onDisk.status = _cloneJson(unavailable.persistedStatus);
+  if (oauth_grant || dcr_client || composio_grant || transport) {
+    const blob: SecretsBlob = {};
+    if (oauth_grant) blob.oauth_grant = oauth_grant;
+    if (dcr_client) blob.dcr_client = dcr_client;
+    if (composio_grant) blob.composio_grant = composio_grant;
+    if (transport) blob.transport = transport;
+    const plaintext = JSON.stringify(blob);
+    const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
+    const ciphertext = preserved?.plaintext === plaintext
+      ? preserved.ciphertext
+      : localSecrets.encryptLocalSecret(_secretContext(uid, inst.id), plaintext);
+    onDisk.secrets_enc = ciphertext;
+    (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext, plaintext };
+  } else {
+    const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
+    if (preserved && preserved.plaintext === undefined) onDisk.secrets_enc = preserved.ciphertext;
+  }
+  return onDisk;
+}
+
+function _readFileSync(uid: string, local: boolean): ConnectorsFile {
+  const file = local ? userDeviceConnectorsConfigFile(uid) : userConnectorsConfigFile(uid);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(file);
+    const cached = _cacheRead(uid, file, st);
+    if (cached) return cached;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') log.warn('stat connectors.json failed', { error: logErrorSummary(err) });
+    return _cloneFile(EMPTY);
+  }
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      log.warn('reading connectors.json failed', { error: logErrorSummary(err) });
+    }
+    return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
+  }
+  if (!raw.trim()) return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
+
+  // Current format: plaintext JSON envelope, secrets_enc per instance. The only legacy form
+  // migrated here is the immediately previous per-instance crypto-vault payload.
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === 'object' && obj.connections && typeof obj.connections === 'object') {
+      const conns: Record<string, ConnectorInstance> = {};
+      let migrated = false;
+      for (const [id, disk] of Object.entries(obj.connections as Record<string, InstanceOnDisk>)) {
+        const hydrated = _hydrateSecrets(uid, disk);
+        conns[id] = hydrated.instance;
+        migrated = migrated || hydrated.migrated;
+      }
+      const oauthHints = obj.oauth_hints && typeof obj.oauth_hints === 'object' ? obj.oauth_hints : {};
+      const deletedAt = obj._deleted_at && typeof obj._deleted_at === 'object' ? obj._deleted_at : {};
+      const data: ConnectorsFile = { version: 2, connections: conns, oauth_hints: oauthHints, _deleted_at: deletedAt };
+      if (migrated) {
+        _writeFileSync(uid, data, local);
+        _notifyRendererChanged();
+      }
+      try {
+        st = fs.statSync(file);
+        _cacheWrite(uid, file, st, data);
+      } catch { /* best-effort cache */ }
+      return _cloneFile(data);
+    }
+  } catch (err) {
+    log.warn('parse connectors.json failed', { error: logErrorSummary(err) });
+  }
+  return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
+}
+
+function _readSync(uid: string): ConnectorsFile {
+  prepareDeviceLocalConnectorStorage(uid);
+  const cloud = _readFileSync(uid, false);
+  const local = _readFileSync(uid, true);
+  return {
+    version: 2,
+    connections: { ...connectorRecordsForScope(cloud.connections, false), ...connectorRecordsForScope(local.connections, true) },
+    oauth_hints: { ...connectorRecordsForScope(cloud.oauth_hints, false), ...connectorRecordsForScope(local.oauth_hints, true) },
+    _deleted_at: { ...connectorRecordsForScope(cloud._deleted_at, false), ...connectorRecordsForScope(local._deleted_at, true) },
+  };
+}
+
+/** Local writes cannot rewrite the cloud file or trigger a cloud dirty event. */
+function _writeSync(uid: string, data: ConnectorsFile): void {
+  for (const local of [true, false]) {
+    const subset: ConnectorsFile = {
+      version: 2,
+      connections: connectorRecordsForScope(data.connections, local),
+      oauth_hints: connectorRecordsForScope(data.oauth_hints, local),
+      _deleted_at: connectorRecordsForScope(data._deleted_at, local),
+    };
+    if (JSON.stringify(subset) === JSON.stringify(_readFileSync(uid, local))) continue;
+    _writeFileSync(uid, subset, local);
+  }
+}
+
+function _writeFileSync(uid: string, data: ConnectorsFile, local: boolean): boolean {
+  const file = local ? userDeviceConnectorsConfigFile(uid) : userConnectorsConfigFile(uid);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const onDisk: Record<string, InstanceOnDisk> = {};
+    for (const [id, inst] of Object.entries(data.connections)) {
+      onDisk[id] = _dehydrateSecrets(uid, inst);
+    }
+    const body = JSON.stringify({
+      version: 2,
+      connections: onDisk,
+      oauth_hints: data.oauth_hints || {},
+      _deleted_at: data._deleted_at || {},
+    }, null, 2);
+    try {
+      if (fs.readFileSync(file, 'utf8') === body) return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (!Object.keys(data.connections).length && !Object.keys(data.oauth_hints || {}).length
+        && !Object.keys(data._deleted_at || {}).length) return false;
+    }
+    // Atomic tmp+rename: this file is EVERY connector's config + OAuth
+    // secrets_enc. A torn write (crash/power loss mid-write) parses as garbage
+    // and the reader silently falls back to an empty registry — all connectors
+    // and grants gone. mode 0600 carries onto the target via the rename.
+    writeTextAtomicSync(file, body, 'utf8', { mode: 0o600 });
+    // Diagnostic verify: read back size + the secrets_enc fingerprints we just wrote so a
+    // future "the RT we sent doesn't match server" failure can be traced against actual
+    // bytes on disk at write time. `secrets_enc` is the AES-GCM blob; a hash of it is a
+    // stable clobber-detection key without putting connector-grant bytes in the log.
+    try {
+      const st = fs.statSync(file);
+      const fingerprints: Record<string, string> = {};
+      for (const [id, disk] of Object.entries(onDisk)) {
+        if (disk.secrets_enc) {
+          fingerprints[id] = crypto.createHash('sha256').update(disk.secrets_enc).digest('hex').slice(0, 8);
+        }
+      }
+      log.info('connectors.json write ok', {
+        bytes: st.size,
+        mtime_ms: st.mtimeMs,
+        secrets_enc_hash: fingerprints,
+      });
+      _cacheWrite(uid, file, st, data);
+    } catch (verifyErr) {
+      log.warn('write verify (stat) failed', { error: logErrorSummary(verifyErr) });
+    }
+    return true;
+  } catch (err) {
+    log.error('failed to persist connectors.json', { error: logErrorSummary(err) });
+    throw err;
+  }
+}
+
+export function load(uid: string): ConnectorsFile {
+  if (!uid) return _cloneFile(EMPTY);
+  return _readSync(uid);
+}
+
+/** Compact RT fingerprint for diagnostic logs across the registry call chain. */
+function _rt(grant: ConnectorInstance['oauth_grant']): string {
+  const t = grant?.refresh_token;
+  if (!t) return 'none';
+  return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+}
+
+export async function upsert(uid: string, inst: ConnectorInstance): Promise<void> {
+  await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const before = cur.connections[inst.id];
+    log.info('registry.upsert', {
+      id: inst.id,
+      rt_before: _rt(before?.oauth_grant),
+      rt_after: _rt(inst.oauth_grant),
+      had_existing: !!before,
+    });
+    cancelForConnector(uid, inst.id);
+    cur.connections[inst.id] = inst;
+    if (cur._deleted_at?.[inst.id]) {
+      const deleted = { ...(cur._deleted_at || {}) };
+      delete deleted[inst.id];
+      cur._deleted_at = deleted;
+    }
+    return _writeSync(uid, cur);
+  });
+  _notifyRendererChanged();
+}
+
+export async function remove(uid: string, id: string): Promise<boolean> {
+  const removed = await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    if (!cur.connections[id]) return false;
+    log.info('registry.remove', { id, rt_before: _rt(cur.connections[id].oauth_grant) });
+    cancelForConnector(uid, id);
+    delete cur.connections[id];
+    if (cur.oauth_hints?.[id]) {
+      const hints = { ...(cur.oauth_hints || {}) };
+      delete hints[id];
+      cur.oauth_hints = hints;
+    }
+    cur._deleted_at = { ...(cur._deleted_at || {}), [id]: new Date().toISOString() };
+    _writeSync(uid, cur);
+    return true;
+  });
+  if (removed) _notifyRendererChanged();
+  return removed;
+}
+
+export function shouldReauthorize(uid: string, id: string): boolean {
+  if (!uid || !id) return false;
+  const file = _readSync(uid);
+  return !!file.oauth_hints?.[id]?.reauthorize;
+}
+
+export async function setReauthorizeHint(uid: string, id: string, enabled: boolean): Promise<void> {
+  if (!uid || !id) return;
+  await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const hints = { ...(cur.oauth_hints || {}) };
+    if (enabled) hints[id] = { ...(hints[id] || {}), reauthorize: true };
+    else delete hints[id];
+    cur.oauth_hints = hints;
+    return _writeSync(uid, cur);
+  });
+  _notifyRendererChanged();
+}
+
+export async function update(
+  uid: string,
+  id: string,
+  patch: (inst: ConnectorInstance) => ConnectorInstance,
+): Promise<ConnectorInstance | null> {
+  const next = await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const existing = cur.connections[id];
+    if (!existing) return null;
+    const updated = patch(existing);
+    log.info('registry.update', {
+      id,
+      rt_before: _rt(existing.oauth_grant),
+      rt_after: _rt(updated.oauth_grant),
+      rt_changed: existing.oauth_grant?.refresh_token !== updated.oauth_grant?.refresh_token,
+    });
+    cur.connections[id] = updated;
+    _writeSync(uid, cur);
+    return updated;
+  });
+  if (next) _notifyRendererChanged();
+  return next;
+}
+
+export type ConnectorInstancePatch = (inst: ConnectorInstance) => ConnectorInstance;
+
+/** Apply several per-instance patches under one registry lock and persist the
+ *  aggregate file once. Intended for startup probes, where each connection
+ *  independently discovers status/tools but none needs an intermediate disk
+ *  snapshot. Secret-rotation paths continue to use `update` immediately. */
+export async function updateMany(
+  uid: string,
+  patches: ReadonlyMap<string, readonly ConnectorInstancePatch[]>,
+): Promise<Record<string, ConnectorInstance>> {
+  const updated = await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const out: Record<string, ConnectorInstance> = {};
+    for (const [id, instancePatches] of patches) {
+      const existing = cur.connections[id];
+      if (!existing || !instancePatches.length) continue;
+      let next = existing;
+      for (const patch of instancePatches) next = patch(next);
+      log.info('registry.updateMany', {
+        id,
+        patches: instancePatches.length,
+        rt_before: _rt(existing.oauth_grant),
+        rt_after: _rt(next.oauth_grant),
+      });
+      cur.connections[id] = next;
+      out[id] = next;
+    }
+    if (Object.keys(out).length) _writeSync(uid, cur);
+    return out;
+  });
+  if (Object.keys(updated).length) _notifyRendererChanged();
+  return updated;
+}
+
+export function isValidInstanceId(id: unknown): id is string {
+  return typeof id === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id);
+}

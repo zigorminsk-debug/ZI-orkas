@@ -1,0 +1,2163 @@
+import { providerUserCacheKey } from './provider-cache-scope';
+import { modelKeyFailureMessage } from './user-visible-errors';
+/**
+ * Runner factory — assembles a fresh `AgentRunner` per chat request.
+ *
+ * Priority-list driven:
+ *   - `pickChatEntry()` returns the first usable (provider, model, apiKey)
+ *     tuple from the user-ordered entries list (see features/auth.ts).
+ *   - The runner rebuilds `defaultProvider` + `defaultModel` to match that
+ *     choice on every build, so the entries list is the single source of
+ *     truth for "what model am I talking to right now".
+ *   - Cheap: we use pi-ai through a per-build `ProviderRegistry` and only
+ *     materialize the single provider we picked.
+ *
+ * When `pickChatEntry()` returns null we fail fast with a user-facing
+ * "no model configured" error so the renderer doesn't surface the Anthropic SDK's
+ * cryptic "Could not resolve authentication method" message. Dev escape
+ * hatch: set `ANTHROPIC_API_KEY` in the environment and we pass through
+ * to the SDK's default-provider + env-var auth path.
+ */
+
+import type { ProviderRequestFailure, AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
+import type { Api, Model } from '@earendil-works/pi-ai';
+import { getAgentIdleClock } from '../../util/system-activity';
+import { customModelImageSupport } from './custom-model-image-support';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import {
+  pickChatEntryGroup,
+  hasConfiguredModel,
+  getConfiguredModelCooldown,
+  getConfiguredModelOAuthExpiredMessage,
+  getConfiguredModelContextWindowMessage,
+  type ChatEntryChoice,
+} from '../../features/auth';
+import {
+  getSystemPromptBlock,
+  getSystemSkillsPromptBlock,
+  getAgentSkillDependenciesPromptBlock,
+  APP_AUTHORING_SYSTEM_SKILLS,
+  type SkillSelectionInput,
+  type SkillRuntimeBinding,
+} from './skill-registry';
+import { t } from '../../i18n';
+import {
+  getSession,
+  getSessionForUser,
+  memoryScopeForSession,
+  metacognitionAllowedForSession,
+  sessionKindOf,
+  toolResultsDirForSession,
+} from './session-store';
+import {
+  listEntries,
+  removeEntry,
+  formatForSystemPrompt as formatMemoryForSystemPrompt,
+  type MemoryScope,
+} from '../../features/memory';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry, batchMemoryEntries } from '../../features/memory-writes';
+import {
+  formatProjectContextPolicyForSystemPrompt,
+  formatProjectInstructionsForSystemPrompt,
+  readProjectInstructions,
+  writeProjectInstructionsIfUnchanged,
+} from '../../features/projects';
+import * as projectTasks from '../../features/project_tasks';
+import * as conversationTaskBoard from '../../features/group_chat/task_board';
+import * as metacognition from '../../features/metacognition';
+import { appendAgentSkill, listAgentSummaries } from '../../features/agents';
+const log = createLogger('model/runner');
+const REFLECTION_TOOL_NAMES = new Set(['metacognition', 'skill_manage']);
+// The durable Plan implementation remains in core-agent for persisted-session
+// compatibility and controlled evaluation, but Orkas does not currently expose
+// it as a model action. Internal model planning and the evidence-backed
+// workspace/completed-work state continue to operate without this tool.
+const EXPOSE_EXECUTION_PLAN_TOOL = false;
+import { createLocalTools, createFileTools, createProgramSourceLoader } from './local-tools';
+import { createOfficeTools } from './office-tools';
+import { createPdfTools } from './pdf-tools';
+import { officeCliAvailable } from '../../features/office/office_engine';
+import { createLibraryTool } from './kb-tools';
+import { createChatHistoryTool } from './chat-history-tools';
+import { createImageGenTool } from './image-gen-tool';
+import { createVideoGenTool } from './video-gen-tool';
+import { createResearchVerifyTool } from './research-verify-tool';
+import { createGenerateSpeechTool } from './generate-speech-tool';
+import {
+  AGENT_DEPENDENCY_TOOL_GROUP_IDS,
+  getToolCatalogEntry,
+  getLoadableToolGroupsSystemPromptBlock,
+  isToolVisibleToAgent,
+  toolNamesForGroups,
+} from './tool-catalog';
+import { createToolLoadTool, createToolSurfaceController } from './tool-surface';
+import { createProgrammaticToolPolicy } from './programmatic-tool-policy';
+import { createWebSearchOverrideTool } from './search-tools';
+import { renderWebFetchPage } from './web-fetch-render';
+import {
+  agentEvolvedSkillsDir,
+  agentPrivateSkillsDir,
+  sessionAnalysisInputsDir,
+  userMarketplaceAgentSkillsDir,
+} from '../../paths';
+import { artifactDirForConversation, conversationLayout, chatAttachmentDirForConversation } from '../../util/project-layout';
+import {
+  capToolResultWithRetry,
+  DEFAULT_INLINE_RESULT_TOKENS,
+} from '../../util/tool-result-cap';
+import { createToolResultTools } from './tool-result-tools';
+import {
+  buildOrkasApiModel,
+  createOrkasApiProvider,
+  buildMoonshotModel,
+  buildDeepSeekModel,
+  buildDoubaoModel,
+  buildConfiguredOpenAICompatibleModel,
+  createConfiguredOpenAICompatibleProvider,
+  createMoonshotProvider,
+  createDeepSeekProvider,
+  createDoubaoProvider,
+  buildCustomOpenAICompatibleModel,
+  buildCustomAnthropicModel,
+  buildCustomResponsesModel,
+  createCustomOpenAICompatibleProvider,
+  omitReservedOutputLimitForProvider,
+} from './external-providers';
+import { withTaskBudget } from './task-budget-provider';
+import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
+import { clearCooldown } from './profile-cooldown';
+import {
+  isExternalApiProvider,
+  resolveConfiguredPiModel,
+  modelInputImageLimit,
+} from '../provider_catalog';
+import { clientConfig, getRetryErrorPolicyConfig } from '../../features/client_config';
+import { readDisabledSets } from '../../features/component_enabled';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
+import {
+  nativeSearchToolForModel,
+  nativeSearchToolName,
+  routeSearchPayloadTools,
+} from './native-search-tools';
+import { hasAnySearchProfile } from '../../features/search_auth';
+import { buildConnectorSurface } from './connector-meta-tools';
+import { createLogger } from '../../logger';
+import { logErrorSummary, maskId } from '../../util/log-redact';
+import { repairOpenAIToolMessageOrder } from './openai-payload';
+import {
+  DEEP_RESEARCH_EVIDENCE_STATE_KEY,
+  DEEP_RESEARCH_SKILL_ID,
+  captureDeepResearchWebFetchEvidence,
+  deepResearchEvidenceFile,
+} from './deep-research-evidence';
+import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
+import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
+import {
+  splitCommanderAgentsBlock,
+  splitCommanderOrchestrationBlock,
+  splitLanguageDirectiveBlock,
+  splitRuntimeInjectionBlock,
+  splitVolatilePromptTail,
+} from '../../prompts/chat_prompt_composer';
+
+const runnerLog = createLogger('runner');
+const legacySkillEnabledRepairAttempted = new Set<string>();
+
+function isNativeSearchEnabled(): boolean {
+  return true;
+}
+
+function buildExternalProviderModel(
+  providerId: string,
+  modelId: string,
+  customConfig?: ChatEntryChoice['customConfig'],
+): Model<Api> | null {
+  switch (providerId) {
+    case 'orkas-api':
+      return buildOrkasApiModel(modelId);
+    case 'moonshot':
+      return buildMoonshotModel(modelId);
+    case 'deepseek':
+      return buildDeepSeekModel(modelId);
+    case 'doubao':
+      return buildDoubaoModel(modelId);
+    case 'custom':
+      return customConfig
+        ? (customConfig.protocol === 'anthropic'
+          ? buildCustomAnthropicModel(modelId, customConfig)
+          : customConfig.protocol === 'responses'
+            ? buildCustomResponsesModel(modelId, customConfig)
+            : buildCustomOpenAICompatibleModel(modelId, customConfig))
+        : null;
+    default:
+      return buildConfiguredOpenAICompatibleModel(providerId, modelId);
+  }
+}
+
+function modelCatalogEntryFromModel(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): { contextWindow?: number; maxOutputTokens?: number } | null {
+  if (!model) return null;
+  const entry: { contextWindow?: number; maxOutputTokens?: number } = {};
+  if (typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+    entry.contextWindow = model.contextWindow;
+  }
+  if (typeof model.maxTokens === 'number' && model.maxTokens > 0 && !modelOutputLimitExceedsWindow(model)) {
+    entry.maxOutputTokens = model.maxTokens;
+  }
+  return Object.keys(entry).length ? entry : null;
+}
+
+function modelOutputLimitExceedsWindow(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): boolean {
+  if (!model) return false;
+  return typeof model.contextWindow === 'number' && model.contextWindow > 0
+    && typeof model.maxTokens === 'number' && model.maxTokens >= model.contextWindow;
+}
+
+type CA = typeof import('#core-agent');
+type AgentRunnerCtor = CA['AgentRunner'];
+type AgentRunnerInstance = InstanceType<AgentRunnerCtor>;
+type CoreAgentConfig = ReturnType<CA['createConfig']>;
+
+let _caPromise: Promise<CA> | null = null;
+function applyRetryErrorPolicy(mod: CA): void {
+  try {
+    mod.configureRetryErrorPolicy(getRetryErrorPolicyConfig());
+  } catch (err) {
+    runnerLog.warn('retry error policy sync failed', { error: logErrorSummary(err) });
+  }
+}
+
+clientConfig.subscribe('model.retry_error_policy', () => {
+  _caPromise?.then(applyRetryErrorPolicy).catch(() => {});
+});
+
+// core-agent has no browser runtime, so `web_fetch` falls back to the host's
+// offscreen Chromium when a direct response is a bot check or an app shell.
+let webFetchRendererRegistered = false;
+function applyWebFetchRenderer(mod: CA): void {
+  if (webFetchRendererRegistered) return;
+  try {
+    mod.configureWebFetchRenderer(renderWebFetchPage);
+    webFetchRendererRegistered = true;
+  } catch (err) {
+    runnerLog.warn('web fetch renderer registration failed', { error: logErrorSummary(err) });
+  }
+}
+
+async function ca(): Promise<CA> {
+  if (!_caPromise) _caPromise = import('#core-agent') as Promise<CA>;
+  const mod = await _caPromise;
+  applyRetryErrorPolicy(mod);
+  applyWebFetchRenderer(mod);
+  return mod;
+}
+
+
+export interface BuildRunnerParams {
+  sessionId: string;
+  persistenceSignal?: AbortSignal;
+  systemPrompt?: string;
+  userId?: string;
+  /** Host-authoritative completed dialogue. Replaces the execution session's
+   * completed raw messages before a normal new turn. */
+  conversationHistory?: {
+    source: string;
+    messages: Message[];
+    replaceFromTurnId?: number;
+    checkpoint?: string;
+  };
+  /** Preserve a verified active execution turn verbatim instead of rebasing
+   * it from canonical completed dialogue. */
+  resumeActiveTurn?: boolean;
+  /** Conversation id. Used by file-tools to scope read_file / search_file
+   *  / process_file_full calls whose path targets the attachment dir of the
+   *  current conv. */
+  cid?: string;
+  conversationTitle?: string;
+  conversationTitleUpdatedAt?: number;
+  /** Stable id for the current visible actor/model turn. Used by delete_file
+   *  confirmation UI so batching never crosses prior conversation turns. */
+  turnId?: string;
+  /** Stable inbound message id used as the exclusive upper bound for
+   * current-conversation history tools. */
+  historyBoundaryMessageId?: string;
+  /** Host-owned final delivery versus intermediate work for Commander. */
+  outputDelivery?: 'final' | 'process';
+  /** Host-side post-success hook for a user-confirmed custom Connector. */
+  onCustomConnectorAdded?: (connectorId: string) => void;
+  /** Current real user text, used by tools that must bind an approval action
+   * to explicit user intent rather than merely to the existence of a turn. */
+  userMessage?: string;
+  /** Host-owned approval source, refreshed only after a real user steer is durably applied. */
+  currentUserMessage?: { text: string };
+  /** Image-understanding calls must never fall back to a text-only request. */
+  requireImageInput?: boolean;
+  /** Current-turn attachment kinds. Tool exposure uses this metadata without
+   * inspecting attachment contents or eagerly running extraction. */
+  attachmentMetadata?: { hasAttachments?: boolean; attachmentTypes?: readonly string[] };
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Resolved once at
+   *  the top of group_chat::runTurn from `conv.project_id`. */
+  projectId?: string;
+  /** Agent id bound to the conversation. Empty/undefined = default scope. */
+  agentId?: string;
+  /** Human-readable actor name used in user-facing local permission prompts. */
+  agentName?: string;
+  /** Max tool-call rounds per turn before force-end. Undefined → core-agent
+   *  default (100). Group chat raises it for the commander's long builds. */
+  maxToolLoops?: number;
+  /** Per-tool stall watchdog. The caller derives it from the session idle
+   * timeout so the session-level tool-phase backstop always sits strictly
+   * behind it: a stalled tool fails as one recoverable tool error instead of
+   * the session watchdog killing the whole turn. Undefined → core-agent
+   * default (1_800_000ms). */
+  toolIdleTimeoutMs?: number;
+  /** Optional one-time soft convergence threshold. Undefined preserves the
+   *  core-agent default; this does not change the hard tool-loop limit. */
+  elapsedConvergenceMs?: number;
+  /** Host awake clock shared with the outer idle watchdog. */
+  idleNow?: () => number;
+  /** Provider stream deadline before its first usable text/tool event. This
+   * boundary is safe for fallback because no visible output has committed. */
+  providerFirstEventTimeoutMs?: number;
+
+  /** Optional subset of skill ids; undefined = full global listing. See
+   * `skill-registry.getSystemPromptBlock` for the exact semantics. */
+  skillList?: string[];
+  /** Host-owned System Skill allowlist. Undefined preserves Commander's full
+   * catalog; edit surfaces pass fixed protocol ids. */
+  systemSkillList?: readonly string[];
+  /** Agent-authored fixed tool groups. An explicit empty list requests only
+   * host-required tools; missing metadata gets a fixed compatibility surface. */
+  toolList?: string[];
+  /** Expose the shared dependency-group directory for Agent Creator. This does
+   * not expand the editor session's own fixed tool surface. */
+  agentToolDependencyAuthoring?: boolean;
+  /** User-explicit skill refs selected in the composer. These are rendered
+   *  even when they live in open/global skill roots that are normally lazy. */
+  forceOpenSkillRefs?: readonly SkillSelectionInput[];
+  /** Shared host-owned map for Skills selected after runner construction.
+   * Rich steer mutates the same identity only after Session accepts the user
+   * message, so read_file can resolve the newly advertised @skill ref. */
+  runtimeSkillBindings?: Map<string, SkillRuntimeBinding>;
+  /** Mutable current-turn tool-group grants from explicit user selections.
+   * This host ingress activates obvious dependencies before the named Agent's
+   * lower-priority `tool_load` fallback is needed. */
+  runtimeGrantedToolGroups?: string[];
+  /** Extra tools added to core-agent's builtins (e.g. group_chat commander
+   * gets dispatch tools (`run_worker` / `dispatch_to`) plus marketplace /
+   * skill-search / automation-listing tools). */
+  extraTools?: AgentTool[];
+  /** Extra absolute directory roots whitelisted for file-tools (read_file /
+   *  stat_file / search_files / grep_files) on top of workspace + attachment.
+   *  Read AND write are permitted under these roots. Used by per-skill
+   *  edit chats to expose the skill dir. */
+  extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see them, but write-side tools
+   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  generate_image and other write-capable tools) cannot mutate paths inside.
+   *  Used by group-chat commander to inspect agent / skill specs without
+   *  giving direct-write access — the structured `<agent>` / `<skill>`
+   *  containers are the only sanctioned mutation channels for those resources. */
+  readOnlyExtraRoots?: readonly string[];
+  /** Additional file-tool-only read roots. Like `readOnlyExtraRoots`, these
+   *  are never passed to localTools, so `delete_file` and other local-exec
+   *  tools cannot act on them. Used for user-approved read-only folder grants. */
+  fileReadOnlyExtraRoots?: readonly string[];
+  /** Mutable run-scoped roots admitted after runner construction by rich
+   * interrupt-steer. Read tools observe additions; local mutation tools use
+   * the same identity as a deny-only scope. */
+  runtimeReadOnlyRoots?: string[];
+  /** Expose the stable tool superset needed by rich active-turn messages. */
+  richSteerEnabled?: boolean;
+  /** Fires with the absolute path after each successful `write_file` /
+   * `create_pdf` call or tracked bash output file. See `model/client.ts`
+   * `ChatOptions.onFileWritten` for the caller-facing contract. */
+  onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** Turn owner resource-display filter for the `publish_outputs` tool. */
+  onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** A saved automation, so the host can offer the user a route to it. */
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
+  /** Caller-supplied predicate consumed by write-style tools' uniquify
+   *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
+  hasProducedPath?: (absPath: string) => boolean;
+  /** Fires after each successful `create_artifact` call. See `model/client.ts`
+   *  `ChatOptions.onArtifactCreated`. */
+  onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
+  /** Fires once per skill id rendered into the system-prompt skills index,
+   *  with its source system. Called at runner build time (before the LLM
+   *  sees the prompt). Bus collects per turn for `skill_advertised`. */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B') => void;
+  /** Fires when `read_file` resolves to a SKILL.md path inside any of the
+   *  three skill roots. Bus collects per turn for `skill_invoked`. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
+  /** Fires when the pi-ai onPayload hook injects a vendor native web search
+   *  tool schema for this call. Used by client.ts to record a synthetic
+   *  `progress/native_search/injected` event into the devtools archive.
+   *  May fire multiple times per chat turn if rotating-provider falls over
+   *  to a secondary candidate. */
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void;
+  /** Fires when rotating-provider commits to a candidate (success) or
+   *  surfaces a non-rotatable error (failure). Used by client.ts to update
+   *  the dev archive's recorded model / provider / profile so the stored
+   *  row reflects the candidate that actually owned the visible outcome,
+   *  not the rotating-provider's primary label. Fires at most once per
+   *  call; not invoked when rotation rolls past a candidate. */
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
+  /** Reports configured/currently available rotating-provider candidates even
+   * when the call succeeds on the first candidate. */
+  onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
+  onRequestFailure?: (failure: ProviderRequestFailure) => void;
+}
+
+export interface NativeSearchInjectedInfo {
+  provider: string;
+  model: string;
+  api: string;
+  tool: string;
+}
+
+function inputImageLimitForChoice(mod: CA, choice: ChatEntryChoice | undefined): number {
+  const providerId = choice?.provider || 'anthropic';
+  const modelId = choice?.model || 'claude-opus-4-8';
+  const model = isExternalApiProvider(providerId)
+    ? buildExternalProviderModel(providerId, modelId, choice?.customConfig)
+    : resolveConfiguredPiModel(mod, providerId, modelId)?.model;
+  return modelInputImageLimit(providerId, modelId, model);
+}
+
+function conversationAttachmentNames(
+  userId: string,
+  cid: string | undefined,
+  projectId: string | undefined,
+): string[] {
+  if (!cid) return [];
+  try {
+    return fs.readdirSync(
+      chatAttachmentDirForConversation(userId, cid, projectId),
+      { withFileTypes: true },
+    ).filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+/** Tool definition snapshot persisted to the dev-only LLM archive so the
+ * debug panel can show "what tools did the LLM actually see for this call".
+ * Mirrors the AgentTool shape minus the executor closure (which is not
+ * serialisable). */
+export interface ToolDefSnapshot {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  /** `'core-agent'` = pi-ai builtin (read_file / write_file / bash / web_search / web_fetch / list_files);
+   *  `'orkas'` = injected by buildRunner (overrides + extras like memory, kb, image_gen, web_search override);
+   *  `'extra'` = passed by caller via `extraTools` (group_chat commander uses this for dispatch + marketplace / skill / automation tools). */
+  source: 'core-agent' | 'orkas' | 'extra';
+}
+
+/** Exported for unit tests — see runner.test.ts. */
+export const _splitCommanderOrchestrationBlock = splitCommanderOrchestrationBlock;
+
+export async function buildRunner(params: BuildRunnerParams): Promise<{
+  runner: AgentRunnerInstance;
+  /** Opaque identity shared by every turn of this persisted model session.
+   *  Consumers may use object identity for session-local transient state but
+   *  must not inspect or expose the underlying PersistentSession. */
+  failureTrackingScope: object;
+  resolvedSystemPrompt: string;
+  /** Per-turn volatile blocks (orchestration ledger / plan / datetime) peeled
+   *  OUT of the system prompt to keep the cache prefix stable; the caller
+   *  forwards this as `runStream({ turnEphemeral })` so it rides this turn's
+   *  user message instead. Empty for runs with no volatile blocks. */
+  turnEphemeral: string;
+  /** Read stamps for files whose complete text `turnEphemeral` carries; the
+   *  caller forwards this as `runStream({ initialReadFileState })` so the
+   *  run's file tools treat them as read. Absent when nothing was shown whole. */
+  initialReadFileState?: ReadonlyMap<string, unknown>;
+  entryId?: string;
+  profileId?: string;
+  providerId: string;
+  modelId: string;
+  /** Actual activation mode after rollout, eligibility, and history-compat checks. */
+  toolSurfaceMode: 'scoped' | 'legacy_all';
+  /** Final tool set visible to the LLM (after last-write-wins merge of
+   *  core-agent builtins + buildRunner-injected + caller-supplied extras).
+   *  Used by the dev-only archiver. */
+  toolDefs: ToolDefSnapshot[];
+  /** UI-only skill display names collected while rendering the prompt block.
+   *  Not injected into model context; reused for process-log labels. */
+  skillDisplayNameById: Map<string, string>;
+  /** Run-scoped read-ref identities for process-log labels. Physical Skill
+   *  roots stay private to the runner and are not included in these values. */
+  skillMetadataByReadRef: Map<string, { id: string; name: string; source: string }>;
+  /** UI-only agent display names collected once before the run.
+   *  Not injected into model context; reused for process-log labels. */
+  agentDisplayNameById: Map<string, string>;
+  /** UI-only Connector display names from the same visible snapshot and live
+   * checks used by this runner's connector tools. */
+  connectorDisplayNameById: Map<string, string>;
+}> {
+  // Auth gate first — if no group has any usable candidate, fail before
+  // loading core-agent / scanning skills / opening a session file. Gives
+  // a clear user message instead of the Anthropic SDK's "Could not
+  // resolve authentication method".
+  const group = await pickChatEntryGroup();
+  const primary: ChatEntryChoice | undefined = group[0];
+  if (!primary && (params.requireImageInput || !process.env.ANTHROPIC_API_KEY)) {
+    const contextWindowMessage = getConfiguredModelContextWindowMessage();
+    if (contextWindowMessage) throw new Error(contextWindowMessage);
+    const oauthExpiredMessage = getConfiguredModelOAuthExpiredMessage();
+    if (oauthExpiredMessage) throw new Error(oauthExpiredMessage);
+    const cooldown = getConfiguredModelCooldown();
+    if (cooldown) {
+      // Preserve the classified credential cause across preflight without
+      // parsing localized recovery text or exposing the raw provider error.
+      throw Object.assign(
+        new Error(modelKeyFailureMessage(cooldown.kind) || t('errors.model_temporarily_unavailable')),
+        { code: `provider_${cooldown.kind}` },
+      );
+    }
+    if (hasConfiguredModel().configured) {
+      throw new Error(t('errors.model_config_unavailable'));
+    }
+    throw new Error(t('errors.no_model_configured'));
+  }
+
+  const sessionKind = sessionKindOf(params.sessionId);
+  const isReflectionSession = sessionKind === 'reflect';
+  const isAgentEditSession = sessionKind === 'agent';
+  const isAgentToolAuthoringSession = isAgentEditSession
+    && params.agentToolDependencyAuthoring === true;
+
+  // Per-user disabled-skill set; passed into getSystemPromptBlock so the
+  // rendered `## Available skills` block excludes user-disabled skills regardless
+  // of agent-level allowlist. Resolved off the active uid; session_id no longer
+  // carries the uid (CLAUDE.md §5), so callers that don't pass `params.userId`
+  // fall through to the active-user singleton. Wrapped in a try/catch so ad-hoc
+  // test paths that activate no user just see a null uid → empty disabled set.
+  const earlyUid = params.userId || _safeActiveUserId();
+  if (
+    !isReflectionSession
+    && earlyUid
+    && earlyUid === _safeActiveUserId()
+    && !legacySkillEnabledRepairAttempted.has(earlyUid)
+  ) {
+    legacySkillEnabledRepairAttempted.add(earlyUid);
+    try {
+      // Lazy require avoids the skills -> model/client -> runner import cycle.
+      // The repair must precede the disabled-id snapshot so the current turn
+      // sees canonical marketplace ids immediately after an upgrade.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+      const skills = require('../../features/skills') as {
+        repairLegacySkillEnabledIdsForActiveUser?: () => Promise<number>;
+      };
+      await skills.repairLegacySkillEnabledIdsForActiveUser?.();
+    } catch (err) {
+      legacySkillEnabledRepairAttempted.delete(earlyUid);
+      log.warn('legacy skill enabled-state repair failed', {
+        user_id: maskId(earlyUid),
+        error: logErrorSummary(err),
+      });
+    }
+  }
+  const disabledSkillIds = earlyUid && !isReflectionSession
+    ? readDisabledSets(earlyUid).skills
+    : new Set<string>();
+
+  // System A render allowlist. SkillStore (System B) is gated by `skillList`
+  // alone — see line ~429. Tier semantics live in
+  // `docs/architecture/skill-engineering-contract.md`; do not redefine them here.
+  const renderAllowlist = params.skillList;
+  const skillDisplayNameById = new Map<string, string>();
+  // Host-only logical paths for this runner. The registry fills this from the
+  // exact filtered prompt render; every provider/tool round then reuses the
+  // same snapshot without rescanning Skill directories or persisting paths in
+  // conversation history.
+  const skillRuntimeBindings = !isReflectionSession && params.runtimeSkillBindings
+    ? params.runtimeSkillBindings
+    : new Map<string, SkillRuntimeBinding>();
+  const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
+  const skillSearchVisible = skillSearchExposureFromSessionId(params.sessionId);
+  const skillBlocksPromise: Promise<[string, string]> = isReflectionSession
+    ? Promise.resolve(['', ''])
+    : (async (): Promise<[string, string]> => {
+      // Register system skills first so cross-tier same-name collisions resolve
+      // deterministically; the regular entry falls back to its id read ref.
+      const systemBlock = systemSkillsVisible
+        ? await getSystemSkillsPromptBlock(
+            earlyUid || undefined,
+            skillRuntimeBindings,
+            /^gmember-/.test(params.sessionId)
+              ? APP_AUTHORING_SYSTEM_SKILLS.filter(id => params.systemSkillList === undefined || params.systemSkillList.includes(id))
+              : params.systemSkillList,
+          )
+        : '';
+      const regularBlock = await getSystemPromptBlock({
+        ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
+        disabledIds: disabledSkillIds,
+        // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's
+        // own internal skills render for it, but never for the commander or
+        // other agents. Empty for commander/non-agent sessions.
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+        ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
+        displayNameById: skillDisplayNameById,
+        runtimeBindings: skillRuntimeBindings,
+        ...(skillSearchVisible ? { includeSkillSearchHint: true } : {}),
+        ...(!isAgentEditSession && params.forceOpenSkillRefs?.length
+          ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
+      });
+      // The editor already has a trusted candidate roster; rename its host
+      // heading rather than adding a duplicate inventory to the prompt.
+      return [systemBlock, isAgentToolAuthoringSession
+        ? regularBlock.replace('## Available skills (skills)', '## Agent Skill dependencies')
+          || getAgentSkillDependenciesPromptBlock(skillRuntimeBindings)
+        : regularBlock];
+    })();
+  const [mod, session, [systemSkillsBlock, skillsBlock]] = await Promise.all([
+    ca(),
+    earlyUid ? getSessionForUser(earlyUid, params.sessionId) : getSession(params.sessionId),
+    skillBlocksPromise,
+  ]);
+  const skillMetadataByReadRef = new Map(
+    Array.from(skillRuntimeBindings, ([ref, binding]) => [
+      ref,
+      { id: binding.id, name: binding.name, source: binding.source },
+    ]),
+  );
+
+  const providerId = primary?.provider || 'anthropic';
+  const modelId    = primary?.model    || 'claude-opus-4-8';
+
+  // A failed prior save must be repaired before canonical history can replace it.
+  await session.flushPending(params.persistenceSignal);
+  const sessionHadHistoryBeforeSync = session.length > 0;
+  const preservingActiveTurn = !!params.resumeActiveTurn
+    && !!session.getSerializedContextState()?.activeTurn;
+  if (params.conversationHistory && !preservingActiveTurn) {
+    session.replaceConversationHistory(
+      params.conversationHistory.messages,
+      params.conversationHistory.source,
+      {
+        ...(params.conversationHistory.replaceFromTurnId !== undefined
+          ? { replaceFromTurnId: params.conversationHistory.replaceFromTurnId }
+          : {}),
+        ...(params.conversationHistory.checkpoint
+          ? { checkpoint: params.conversationHistory.checkpoint }
+          : {}),
+      },
+    );
+  }
+
+  // Build the Host tools. Ordinary tasks may read persisted metacognition in
+  // their system prompt below, but only reflection receives its write tool.
+  // AgentRunner owns the final provider-definition snapshot after every
+  // source is assembled.
+  const uid = params.userId || _safeActiveUserId();
+  const agentId = params.agentId || '';
+  // Cross-session memory eligibility + per-agent scope (null = not eligible →
+  // no tool, no injection). See memoryScopeForSession for the per-kind rule.
+  const memoryAgentScope = memoryScopeForSession(params.sessionId, agentId);
+  // Commander and named Agents can mutate their current project's context.
+  // Anonymous workers retain their existing read-only project boundary.
+  const isCommander = sessionKind === 'gconv';
+  const isGroupAgent = sessionKind === 'gmember';
+  const agentDisplayNameById = new Map<string, string>();
+  if (uid) {
+    try {
+      for (const agent of await listAgentSummaries()) {
+        if (agent?.agent_id) agentDisplayNameById.set(agent.agent_id, agent.name || agent.agent_id);
+      }
+    } catch (err) {
+      log.warn('agent display-name scan failed', { user_id: maskId(uid), error: logErrorSummary(err) });
+    }
+  }
+  const agentName = (params.agentName || (agentId ? agentDisplayNameById.get(agentId) : '') || agentId || '').trim();
+  const injectedTools: AgentTool[] = [];
+
+  const recordHistoryResource = (resource: HistoryResource) => {
+    try {
+      session.addHistoryResource(resource);
+    } catch (err) {
+      log.warn('history resource registration failed', {
+        session_id: maskId(params.sessionId),
+        kind: resource.kind,
+        error: logErrorSummary(err),
+      });
+    }
+  };
+  const onArtifactCreatedForHistory = params.onArtifactCreated
+    ? (a: { id: string; title: string; revision?: number }) => {
+        try {
+          params.onArtifactCreated!(a);
+        } finally {
+          if (uid && params.cid) {
+            recordHistoryResource({
+              kind: 'final_output',
+              path: path.join(artifactDirForConversation(uid, params.cid, a.id), 'index.html'),
+              name: a.title || a.id,
+              note: 'Interactive app artifact entry point.',
+            });
+          }
+        }
+      }
+    : undefined;
+
+  if (uid && memoryAgentScope) {
+    // Cross-session memory. `agent` tier binds to THIS caller's scope and
+    // `project` to THIS conversation's project, so the model can never reach
+    // another agent's or project's store; `shared`/`user` are global. The
+    // `project` tier exists only in project sessions — outside a project it is
+    // absent from the tool schema entirely (see memory-tool.ts).
+    const scopeId = memoryAgentScope; // narrowed to string
+    const projectScopeId = params.projectId || '';
+    const toScope = (tier: 'agent' | 'project' | 'shared' | 'user'): MemoryScope =>
+      tier === 'agent' ? { agent: scopeId }
+      : tier === 'project' ? { project: projectScopeId }
+      : tier === 'shared' ? 'memory' : 'user';
+    const memoryHandler: MemoryToolHandler = {
+      add: (tier, content, signal) => addMemoryEntry(uid, toScope(tier), content, { signal }),
+      replace: (tier, oldText, content, signal) => replaceMemoryEntry(uid, toScope(tier), oldText, content, { signal }),
+      remove: (tier, oldText) => removeMemoryEntry(uid, toScope(tier), oldText),
+      batch: (tier, revision, operations, signal) => batchMemoryEntries(uid, toScope(tier), revision, operations, { signal }),
+      list: (tier) => listEntries(uid, toScope(tier)),
+    };
+    const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
+    // Context writes do not widen the separate project-task permissions.
+    injectedTools.push(createCrossSessionMemoryTool(memoryHandler, {
+      includeProjectTier: !!projectScopeId,
+      projectTierReadOnly: !!projectScopeId && !isCommander && !isGroupAgent,
+      globalTiersReadOnly: !isCommander,
+    }));
+  }
+
+  // Creating a project for this conversation and relocating it is Commander's
+  // decision; a named Agent or Worker never receives the executor.
+  if (uid && isCommander && params.cid) {
+    const { createProjectSetupTool } = await import('../../features/project_setup_tool');
+    injectedTools.push(createProjectSetupTool({
+      userId: uid,
+      cid: params.cid,
+      projectId: params.projectId || null,
+    }));
+  }
+
+  if (uid && (isCommander || isGroupAgent)) {
+    const { createAutoTasksTool } = await import('../../features/auto_tasks_tool');
+    injectedTools.push(createAutoTasksTool({
+      userId: uid,
+      cid: params.cid,
+      projectId: params.projectId || (isGroupAgent ? null : undefined),
+      ...(params.onAutoTaskSaved ? { onSaved: params.onAutoTaskSaved } : {}),
+      ...(params.onAutoTaskDeleted ? { onDeleted: params.onAutoTaskDeleted } : {}),
+    }));
+  }
+
+  // Only Commander can follow the project it creates during this turn.
+  // Existing project and named-Agent scopes remain fixed.
+  if (uid && memoryAgentScope && (params.projectId || isCommander || isGroupAgent)) {
+    if (isCommander && !params.projectId) {
+      const { createConversationTasksTool } = await import('../../features/conversation_tasks_tool');
+      injectedTools.push(createConversationTasksTool(uid, params.cid || '', agentDisplayNameById,
+        params.onTodoTaskSaved, params.onTodoTaskDeleted));
+    } else {
+      const { createProjectTasksHandler } = await import('../../features/project_tasks_tool_handler');
+      const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(
+        uid, params.projectId || '', params.cid || '', agentDisplayNameById,
+        { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
+        params.onTodoTaskSaved, params.onTodoTaskDeleted,
+      ), {
+        globalScope: !params.projectId,
+        readOnly: !isCommander && !isGroupAgent,
+      }));
+    }
+  }
+
+  if (uid && memoryAgentScope && params.projectId) {
+    const pid = params.projectId;
+    // Named project actors share the same conditional instructions writer.
+    if (isCommander || isGroupAgent) {
+      const { createProjectInstructionsTool } = await import('../../../core-agent/src/tools/project-instructions-tool');
+      const initialInstructions = await readProjectInstructions(uid, pid);
+      let expectedInstructions = initialInstructions.ok ? initialInstructions.content : null;
+      injectedTools.push(createProjectInstructionsTool({
+        set: async (instructions: string) => {
+          if (expectedInstructions === null) return { ok: false, error: 'not_found' };
+          const r = await writeProjectInstructionsIfUnchanged(
+            uid,
+            pid,
+            expectedInstructions,
+            instructions,
+          );
+          if (r.ok) {
+            expectedInstructions = instructions;
+            return { ok: true };
+          }
+          const writeError = 'error' in r ? r.error : 'write_failed';
+          const error = writeError === 'conflict'
+            ? 'conflict: project instructions changed after this turn started; retry in a new turn with the latest content'
+            : writeError;
+          return { ...r, ok: false, error };
+        },
+      }));
+    }
+  }
+
+  // Reflection-only metacognition write tool. Never resolve this through the
+  // active-user singleton: a queued background reflection may overlap an
+  // account switch. Ordinary tasks still receive the read-only prompt block.
+  if (
+    uid
+    && metacognitionAllowedForSession(params.sessionId, agentId)
+    && metacognition.isFeatureEnabledForUser(uid)
+  ) {
+    const metaHandler: MetacognitionToolHandler = {
+      read: (target) => metacognition.readContentForUser(uid, agentId, target),
+      write: (target, content) => metacognition.writeContentForUser(uid, agentId, target, content),
+    };
+    const { createMetacognitionTool } = await import('../../../core-agent/src/tools/metacognition-tool');
+    injectedTools.push(createMetacognitionTool(metaHandler, {
+      competence: metacognition.COMPETENCE_CHAR_LIMIT,
+      strategies: metacognition.STRATEGIES_CHAR_LIMIT,
+    }));
+  }
+
+  // Local-machine tools: bash / write_file overrides (permission-gated) +
+  // create_pdf. These MUST come after core-agent's
+  // builtins in the list so `AgentRunner`'s last-write-wins tool map
+  // overrides `bash` and `write_file` with the permission-gated versions.
+  const runtimeSkillReadRoots = Array.from(new Set(
+    Array.from(skillRuntimeBindings.values(), (binding) => path.resolve(binding.root)),
+  ));
+  const agentPrivateSkillReadRoots = uid && agentId
+    ? [
+      userMarketplaceAgentSkillsDir(uid, agentId),
+      agentPrivateSkillsDir(uid, agentId),
+      agentEvolvedSkillsDir(uid, agentId),
+    ]
+    : [];
+  const fileReadOnlyExtraRoots = [
+    ...(params.fileReadOnlyExtraRoots || []),
+    ...(params.readOnlyExtraRoots || []),
+    ...agentPrivateSkillReadRoots,
+    ...runtimeSkillReadRoots,
+  ];
+  const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
+  const analysisInputsDir = uid ? sessionAnalysisInputsDir(uid, params.sessionId) : '';
+  const deepResearchSnapshotFile = toolResultsDir
+    ? deepResearchEvidenceFile(toolResultsDir)
+    : '';
+  const deepResearchIsAvailable = (): boolean => Array.from(
+    skillRuntimeBindings.values(),
+  ).some((binding) => binding.id === DEEP_RESEARCH_SKILL_ID);
+  const localReadOnlyDenyRoots = [
+    ...fileReadOnlyExtraRoots,
+    ...(toolResultsDir ? [toolResultsDir] : []),
+  ];
+
+  // Schema-only lock from local state: no publication lookup per runner build,
+  // and an unresolved binding leaves the turn usable. create_artifact itself
+  // re-resolves the binding and fails closed.
+  let lockedAppType: 'local'|'web'|undefined;
+  if (uid && params.cid) {
+    try { lockedAppType = await (await import('../../features/saved_apps')).boundAppType(uid, params.cid); }
+    catch (error) { log.warn('app editing binding unavailable for tool schema', { error: logErrorSummary(error) }); }
+  }
+  const localTools = createLocalTools({
+    ...(lockedAppType?{lockedAppType}:{}),
+    ...(uid ? { userId: uid } : {}),
+    ...(params.cid ? { cid: params.cid } : {}),
+    ...(params.turnId ? { turnId: params.turnId } : {}),
+    ...(agentId ? { agentId } : {}),
+    ...(agentName ? { agentName } : {}),
+    ...(params.projectId ? { projectId: params.projectId } : {}),
+    ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+    // Read-only roots stay out of the writable lane, but localTools still
+    // receive them as deny-only roots. This keeps all-files access modes from
+    // mutating platform/skill/agent specs that were exposed for inspection.
+    ...(localReadOnlyDenyRoots.length ? { readOnlyExtraRoots: localReadOnlyDenyRoots } : {}),
+    ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+    ...(analysisInputsDir ? { analysisInputRoots: [analysisInputsDir] } : {}),
+    skillRuntimeBindings,
+    ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+    ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+    ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+    ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
+  });
+
+  // File-scoped tools (read_files + search_files + grep_files). Skipped when
+  // uid is unknown
+  // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
+  // `readOnlyExtraRoots` is threaded here for the read scope (workspace +
+  // attachment + extraRoots + readOnlyExtraRoots all visible). Local write
+  // and delete tools only receive those roots as deny-only guards above.
+  const fileToolOptions = uid
+    ? {
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(fileReadOnlyExtraRoots.length || toolResultsDir
+          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, ...(toolResultsDir ? [toolResultsDir] : [])] }
+          : {}),
+        ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+        // Keep the shared map identity even when it starts empty: trusted
+        // rich-steer selection may bind an additional Skill later this run.
+        skillRuntimeBindings,
+        ...(toolResultsDir ? { toolResultsRoot: toolResultsDir } : {}),
+        ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
+        rawTextMaxBytes: mod.DEFAULT_RUN_PROGRAM_LIMITS.maxToolResultBytes,
+      }
+    : undefined;
+  const fileTools = fileToolOptions ? createFileTools(fileToolOptions) : [];
+  const programSourceLoader = fileToolOptions
+    ? createProgramSourceLoader(fileToolOptions)
+    : undefined;
+
+  // Persisted oversized outputs have their own capability boundary. The model
+  // receives opaque refs and can search/read bounded chunks or materialize a
+  // session-local working copy for bash/code analysis. The original store
+  // stays denied to generic file reads; only bash is granted the working-copy
+  // root in workspace-only mode.
+  const toolResultTools = toolResultsDir ? createToolResultTools({
+    toolResultsDir,
+    materializeDir: analysisInputsDir,
+    isProgrammaticToolCallContext: mod.isProgrammaticToolCallContext,
+  }) : [];
+
+  // Library tool (list/search/read actions). Read-only, no localExec
+  // required. Injected for every main conv + group_chat actor; agent-edit
+  // / skill-edit sessions also get them (the LLM may want to preview KB
+  // content when building workflows). Skipped when uid is unknown
+  // (matches file-tools).
+  const kbTools = uid ? [createLibraryTool({
+    userId: uid,
+    ...(params.projectId ? { projectId: params.projectId } : {}),
+  })] : [];
+
+  // Conversation-history tool (search/read actions). Group Agents get
+  // only a host-bound current-conversation scope alongside bounded canonical
+  // dialogue replay, and cannot browse sibling conversations.
+  // Commander additionally retains all scope, plus project only when this
+  // conversation is actually bound to a project.
+  const chatHistoryTools = uid && (isCommander || isGroupAgent) ? [createChatHistoryTool({
+    userId: uid,
+    isProgrammaticToolCallContext: mod.isProgrammaticToolCallContext,
+    ...(params.cid ? { currentCid: params.cid } : {}),
+    ...(params.historyBoundaryMessageId
+      ? { currentMessageId: params.historyBoundaryMessageId }
+      : {}),
+    ...(params.projectId ? { projectId: params.projectId } : {}),
+    allowedScopes: isCommander
+      ? (params.projectId ? ['current', 'project', 'all'] : ['current', 'all'])
+      : ['current'],
+  })] : [];
+
+  // Media generation. Shares the localExec access mode with
+  // local-tools (writing image bytes is the same blast radius as write_file).
+  // Skipped when uid is unknown — generators need the
+  // workspace + attachment scope to validate paths.
+  const imageGenTools: AgentTool[] = uid
+    ? [createImageGenTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+  const videoGenTools: AgentTool[] = uid
+    ? [createVideoGenTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+  const speechGenTools: AgentTool[] = uid
+    ? [createGenerateSpeechTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+
+  // Owner-only native Studio runtimes are large implementation modules. Do
+  // not import or construct them for Commander or unrelated Agents merely to
+  // discard them at the owner gate below.
+  const videoStudioTools: AgentTool[] = [];
+  if (uid && isToolVisibleToAgent('video_studio', agentId)) {
+    const studioOpts = {
+      userId: uid,
+      ...(params.cid ? { cid: params.cid } : {}),
+      ...(params.turnId ? { turnId: params.turnId } : {}),
+      ...(params.userMessage ? { userMessage: params.userMessage } : {}),
+      ...(params.currentUserMessage ? { currentUserMessage: params.currentUserMessage } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(agentName ? { agentName } : {}),
+      ...(params.projectId ? { projectId: params.projectId } : {}),
+      ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+      ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+      ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+      ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+      ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+      ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+    };
+    const sharedStudio = (await import('./video-studio-tool')).createVideoStudioTool(studioOpts);
+    videoStudioTools.push((await import('./video-timeline-tool')).createVideoTimelineTool(studioOpts, sharedStudio));
+  }
+
+  const imageStudioTools: AgentTool[] = uid && isToolVisibleToAgent('image_studio', agentId)
+    ? [(await import('./image-studio-tool')).createImageStudioTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+
+  const deepResearchTools: AgentTool[] = [];
+  if (toolResultsDir && isToolVisibleToAgent('research_verify_citations', agentId)) {
+    deepResearchTools.push(createResearchVerifyTool({ toolResultsDir }));
+  }
+
+  // Office document tools (bundled OfficeCLI engine). Permission-gated like
+  // local-tools (writing a docx/xlsx/pptx is the same blast radius as
+  // write_file). Skipped when uid is unknown — the factory needs the
+  // workspace + attachment scope to sandbox output paths.
+  const officeTools: AgentTool[] = uid && officeCliAvailable()
+    ? createOfficeTools({
+        userId: uid,
+        creationStateDir: path.join(params.cid ? conversationLayout(uid, params.cid, params.projectId).groupDir : toolResultsDir, 'office-creation'),
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })
+    : [];
+
+  // Guaranteed local PDF editing/rendering. Unlike the retired nano-pdf
+  // skill, this path has no user-installed CLI or paid model-key dependency.
+  const pdfTools: AgentTool[] = uid
+    ? createPdfTools({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })
+    : [];
+
+  // `web_search` override — last-write-wins replacement for core-agent's
+  // built-in keyless web_search. Routes to a paid search API when the user
+  // has any `searchProfiles` configured; otherwise delegates back to the
+  // built-in Brave/Bing scraper. See `model/core-agent/search-tools.ts`.
+  // Async because the factory pulls `defineTool` / `runBuiltinWebSearch`
+  // off the ESM core-agent dynamic import.
+  const searchOverrideTools: AgentTool[] = [await createWebSearchOverrideTool({
+    conversationId: params.cid || '',
+    conversationTitle: params.conversationTitle || '',
+    conversationTitleUpdatedAt: params.conversationTitleUpdatedAt || 0,
+    turnId: params.turnId || '',
+    agentId,
+    agentName,
+  })];
+
+  // Connector meta-tools + system-prompt block (MCP-based, umbrella pattern). When ≥1
+  // connector is visible to this actor we inject the two meta-tools (`list_connector_tools` /
+  // `call_connector_tool`) plus a `## Connectors` block enumerating the connectors directly in
+  // the system prompt — the model sees the catalog without a discovery round-trip, and the
+  // block sits in the cached prefix. When 0 visible: zero tools, no block. Per-connector MCP
+  // actions are NEVER injected into `tools[]` — the model discovers and invokes them through
+  // the meta-tools (umbrella pattern); flat-injecting would balloon `tools[]` past the 20–50
+  // selection-accuracy cliff and invalidate the prompt-cache prefix on every connect/disconnect.
+  //
+  // Session-kind gate (tri-state):
+  //   - `gconv` (commander) + `gmember` (agent worker)    → block + full tools (list + call —
+  //                                                         actual user tasks invoking external
+  //                                                         services).
+  //   - `agent` (agent-edit)                              → block + discover-only tool
+  //                                                         (`list_connector_tools`). Editor
+  //                                                         LLM reads action names + JSON
+  //                                                         schemas so the authored workflow
+  //                                                         can write "use gmail's `send_email`
+  //                                                         with body=..." rather than the
+  //                                                         coarse "use gmail to send email".
+  //                                                         `call_connector_tool` is withheld
+  //                                                         so an authoring session can never
+  //                                                         produce external side effects.
+  //   - everything else (skill-edit / KB-image / CLI dispatch / reflect /
+  //     anon)                                            → none.
+  // Connector visibility is user-scoped. Session kind controls whether an actor
+  // may discover or call the visible connectors.
+  const exposure = uid ? connectorExposureFromSessionId(params.sessionId) : 'none';
+  const connectorSurface = uid && exposure !== 'none'
+    ? await buildConnectorSurface(
+        {
+          userId: uid,
+          ...(params.cid ? { cid: params.cid } : {}),
+          ...(params.richSteerEnabled ? { allowRuntimeRefresh: true } : {}),
+          ...(isCommander ? { allowCustomConnectorInstall: true } : {}),
+          ...(params.onCustomConnectorAdded ? { onCustomConnectorAdded: params.onCustomConnectorAdded } : {}),
+        },
+        exposure === 'discover+block' ? 'discover' : 'full',
+      )
+    : { promptBlock: '', tools: [], connectorDisplayNameById: new Map<string, string>() };
+  const connectorDisplayNameById = connectorSurface.connectorDisplayNameById;
+  const agentConnectorPromptEnabled = sessionKind !== 'gmember'
+    || params.toolList === undefined
+    || toolNamesForGroups([
+      ...params.toolList,
+      ...(params.runtimeGrantedToolGroups || []),
+    ]).includes('list_connector_tools');
+  // A fixed Agent sees the Connector catalog only when its authored
+  // dependency or a user-explicit current-turn selection activates that
+  // capability. Rich steer may grant it later; that selection carries its own
+  // host-authored Connector notice in the user message.
+  const connectorBlock = agentConnectorPromptEnabled
+    ? connectorSurface.promptBlock
+    : '';
+  const connectorMetaTools = connectorSurface.tools;
+
+  // Orkas consolidates the core package's single-file reader into the host
+  // read_files contract. Filtering here retires only the model-visible alias;
+  // the core package remains reusable by callers that still own read_file.
+  const builtinTools = mod.getBuiltinTools().filter((tool) => tool.name !== 'read_file');
+
+  // Merge injected tools with extra tools from caller
+  const allTools = [
+    ...injectedTools,
+    ...localTools,
+    ...fileTools,
+    ...kbTools,
+    ...chatHistoryTools,
+    ...imageGenTools,
+    ...videoGenTools,
+    ...speechGenTools,
+    ...videoStudioTools,
+    ...imageStudioTools,
+    ...deepResearchTools,
+    ...officeTools,
+    ...pdfTools,
+    ...searchOverrideTools,
+    ...toolResultTools,
+    ...(params.extraTools || []),
+    ...connectorMetaTools,
+  ];
+
+  // Authoritative owner-scoped visibility gate: drop any tool whose catalog
+  // entry declares an `ownerAgent` other than this actor. Defense-in-depth
+  // beyond the construction-time gate above — guarantees an owner-only tool can
+  // never reach another actor's tools[] regardless of which injection path
+  // produced it. Unknown caller tools remain visible in legacy mode; scoped
+  // mode rejects them below so a registration cannot silently become
+  // permanently inactive.
+  const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
+  const evolutionToolNames = agentId && earlyUid ? ['skill_manage'] : [];
+  const isNamedAgentRuntime = sessionKind === 'gmember';
+  const programmaticToolPolicy = programmaticExecutionExposureFromSessionId(params.sessionId)
+    ? createProgrammaticToolPolicy({ ...(uid ? { userId: uid } : {}) })
+    : undefined;
+  const dynamicToolLoading = isCommander || isNamedAgentRuntime;
+  const dynamicLoadPolicy = isNamedAgentRuntime
+    ? 'agent-dependency' as const
+    : 'loadable' as const;
+  const availableToolNames = Array.from(new Set([
+    ...builtinTools.map((tool) => tool.name),
+    ...visibleTools.map((tool) => tool.name),
+    ...(EXPOSE_EXECUTION_PLAN_TOOL ? ['manage_execution_plan'] : []),
+    ...evolutionToolNames,
+    ...(dynamicToolLoading ? ['tool_load'] : []),
+    ...(programmaticToolPolicy ? ['run_program'] : []),
+  ]));
+  // Reflection is a fixed utility surface. Its independent prompt never uses
+  // ordinary Host Skills or general task tools: named Agents may update their
+  // learned Skill store, while every reflection may update metacognition.
+  // Restrict the controller's available set itself so host-managed groups and
+  // the global legacy rollback cannot accidentally widen this actor.
+  const surfaceAvailableToolNames = isReflectionSession
+    ? availableToolNames.filter((name) => REFLECTION_TOOL_NAMES.has(name))
+    : availableToolNames;
+  // Rich steer may retain Connector list/call executors even when this run
+  // starts with no visible Connector. They are host-grantable after an
+  // explicit user selection, but must not make the model-facing fallback
+  // directory or tool_load enum claim that Connectors are currently usable.
+  const dynamicLoadableToolNames = connectorSurface.promptBlock
+    ? availableToolNames
+    : availableToolNames.filter((name) => (
+        name !== 'list_connector_tools' && name !== 'call_connector_tool'
+      ));
+  // Describe the target Agent, not the editor's read-only Connector surface.
+  // A retained rich-steer executor without a visible connection is not usable.
+  const agentAuthoringToolNames = [...dynamicLoadableToolNames];
+  if (connectorSurface.promptBlock
+    && agentAuthoringToolNames.includes('list_connector_tools')
+    && !agentAuthoringToolNames.includes('call_connector_tool')) {
+    agentAuthoringToolNames.push('call_connector_tool');
+  }
+  const agentSkillDependencies = isCommander
+    ? getAgentSkillDependenciesPromptBlock(skillRuntimeBindings)
+    : '';
+  // Agent creation is an infrequent Commander route, so its exact
+  // group-to-tool directory belongs in the progressive-disclosure read rather
+  // than every Commander system prompt. The binding is run-scoped and the file
+  // tool renders this prelude only for the System Skill entry itself; SKILL.md
+  // bytes, hashes, ranges, and referenced files remain unchanged.
+  if (isCommander) {
+    const dependencyDirectory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames: agentAuthoringToolNames,
+      purpose: 'agent-authoring',
+    });
+    for (const binding of new Set(skillRuntimeBindings.values())) {
+      if (binding.source === 'system' && binding.id === 'agent-creator') {
+        binding.entryReadPrelude = [binding.entryReadPrelude, dependencyDirectory, agentSkillDependencies]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+  }
+  const scopedEligible = isReflectionSession
+    || isCommander
+    || sessionKind === 'gmember'
+    || sessionKind === 'gworker'
+    || isAgentEditSession
+    || params.toolList !== undefined;
+  const configuredGroups = params.toolList !== undefined
+    ? params.toolList
+    // Historical custom/marketplace Agents without dependency metadata keep a
+    // fixed compatibility surface. Unlike legacy_all, this cannot grow during
+    // the session and excludes host/runtime-only management groups.
+    : sessionKind === 'gmember'
+      ? AGENT_DEPENDENCY_TOOL_GROUP_IDS
+      : [];
+  const hostPreloadGroups = sessionKind === 'gworker'
+    // Ordinary run_worker calls omit toolList and retain the fixed generic
+    // profile. Host-owned internal workers may provide a narrower explicit
+    // profile, which must not be broadened back to workspace/web/library.
+    ? (params.toolList === undefined ? ['workspace', 'web', 'library'] : [])
+    : isCommander
+      ? ['workspace.read', 'workspace.execute.command', 'web']
+    : isAgentEditSession
+      // Agent editor may inspect installed Connector action schemas while
+      // authoring dependencies, but discover mode still withholds calls.
+      ? ['workspace.read', 'connectors']
+      : [];
+  // Resolve trusted entry context once for both initial tools and turn guidance.
+  const conversationAssistance = (uid && params.cid && (isCommander || (isGroupAgent && agentId)))
+    ? await (await import('../../features/conversation_assistance_context')).resolveConversationAssistanceForTurn(uid, params.cid, {
+        ...(isGroupAgent ? { agentId } : {}), outputDelivery: params.outputDelivery,
+      })
+    : { kind: undefined, guidance: '' };
+  const toolSurface = createToolSurfaceController({
+    availableToolNames: surfaceAvailableToolNames,
+    dynamicLoadableToolNames: isReflectionSession
+      ? surfaceAvailableToolNames
+      : dynamicLoadableToolNames,
+    configuredGroups,
+    hostPreloadGroups,
+    ...(params.runtimeGrantedToolGroups
+      ? { runtimeGrantedGroups: params.runtimeGrantedToolGroups }
+      : {}),
+    hostRequiredToolNames: isReflectionSession
+      ? surfaceAvailableToolNames
+      : [
+          'read_files',
+          'tool_result',
+          ...(conversationAssistance.kind === 'app_creation' ? ['create_artifact'] : []),
+          ...(programmaticToolPolicy ? ['run_program'] : []),
+          // Skill discovery is a small read-only catalog surface for task
+          // runtimes. Package import and other management mutations remain
+          // dormant and Commander-only.
+          ...((isCommander || isNamedAgentRuntime) && availableToolNames.includes('skill_search')
+            ? ['skill_search']
+            : []),
+          // App navigation is the one resident Commander support affordance:
+          // it is broadly useful, closed-set, and remains side-effect-free
+          // until the user clicks the staged card. App diagnosis stays behind
+          // its focused Management child group.
+          ...(isCommander && availableToolNames.includes('open_app_view') ? ['open_app_view'] : []),
+          // Preserve the existing project-bound backlog surface. The
+          // non-project global-only executor is deferred under Management.
+          ...(params.projectId ? ['todo_tasks', ...((isCommander || isGroupAgent) ? ['auto_tasks'] : [])] : []),
+          ...(params.onOutputsPublished ? ['publish_outputs'] : []),
+        ],
+    restoredState: session.getToolSurfaceState(),
+    preserveLegacySession: dynamicToolLoading
+      && !session.getToolSurfaceState()
+      && sessionHadHistoryBeforeSync,
+    scopedEligible,
+    dynamicLoading: dynamicToolLoading,
+    dynamicLoadPolicy,
+    // The environment rollback exists for Commander incidents. It must not
+    // turn a named Agent's low-priority fallback into a legacy full surface.
+    allowLegacyAll: isCommander,
+    persist: (state) => session.setToolSurfaceState(state),
+  });
+  if (toolSurface.mode === 'scoped') {
+    const uncataloged = availableToolNames.filter((name) => !getToolCatalogEntry(name));
+    if (uncataloged.length) {
+      throw new Error(`Scoped tool surface contains uncataloged tools: ${uncataloged.join(', ')}`);
+    }
+  }
+  if (toolSurface.mode === 'scoped' && toolSurface.dynamicLoading) {
+    visibleTools.push(createToolLoadTool(toolSurface, {
+      ...(isNamedAgentRuntime && !connectorBlock && connectorSurface.promptBlock
+        ? { contextByGroup: { connectors: connectorSurface.promptBlock } }
+        : {}),
+    }));
+  }
+  const runtimeGrantableToolNames = new Set(
+    params.richSteerEnabled ? toolNamesForGroups(['connectors']) : [],
+  );
+
+  // Apply the inline-result policy at AgentRunner's FINAL result boundary.
+  // The runner supplies fixed ordinary/Skill per-result ceilings in its ledger;
+  // DEFAULT_INLINE_RESULT_TOKENS is the standalone fallback. This transformer
+  // (instead of pre-wrapping the current tool list) also covers core builtins
+  // and tools AgentRunner adds later, notably skill_manage. AgentRunner
+  // supplies the shared per-model-step inline ledger through ctx.state and
+  // shrinks it when context headroom is low. `uid` can be empty in ad-hoc
+  // tests; without a session Result Store we leave outputs untouched.
+  const transformToolResult = uid
+    ? (toolName: string, result: ToolResult, ctx: ToolContext): Promise<ToolResult> => {
+        if (
+          deepResearchSnapshotFile
+          && toolName === 'web_fetch'
+          && deepResearchIsAvailable()
+        ) {
+          const capture = captureDeepResearchWebFetchEvidence(
+            result,
+            deepResearchSnapshotFile,
+          );
+          if (capture.reason === 'io_error') {
+            runnerLog.warn('deep research evidence capture failed', {
+              error_type: capture.errorType || 'UnknownError',
+            });
+          }
+        }
+        return capToolResultWithRetry(toolName, result, ctx, {
+          maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS,
+          toolResultsDir,
+        });
+      }
+    : undefined;
+
+  // Source attribution for the final AgentRunner-owned definition snapshot.
+  // Do not construct definitions here: AgentRunner still has to add late core
+  // tools (currently skill_manage when evolution is enabled), and dormant
+  // schemas must stay unmaterialized. The retained Plan implementation is
+  // deliberately disabled at AgentRunner construction below.
+  const extraToolNameSet = new Set((params.extraTools ?? []).map((t) => t.name));
+  const toolSourceByName = new Map<string, ToolDefSnapshot['source']>();
+  for (const t of builtinTools) {
+    toolSourceByName.set(t.name, 'core-agent');
+  }
+  for (const t of visibleTools) {
+    toolSourceByName.set(
+      t.name,
+      extraToolNameSet.has(t.name)
+        ? 'extra'
+        : 'orkas',
+    );
+  }
+
+  // Finalize system prompt. Cache-friendly order:
+  //   [base prompt] → [tool groups] → [connectors] → [system skills] → [skills]
+  //   → [agents] → [runtime injection] → [memory]
+  //   → [response language]. Conditional orchestration instructions/state and
+  //   the datetime tail ride the current turn instead.
+  // Everything from [runtime injection] onward is the turn-volatile region;
+  // the stable prefix above it is what the provider prompt-cache reuses.
+  const parts: string[] = [];
+  const { stable: stableSystemPrompt, volatileTail } = splitVolatilePromptTail(params.systemPrompt);
+  const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
+  const { stable: stableWithoutLanguage, languageDirectiveBlock } = splitLanguageDirectiveBlock(stableWithoutAgents);
+  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutLanguage);
+  // Orchestration rules exist only with a live ledger. Peel that whole
+  // conditional block out with its per-turn JSON and re-emit it below.
+  const { stable: stableWithoutOrchestration, orchestrationBlock } = splitCommanderOrchestrationBlock(stableWithoutRuntime);
+  if (stableWithoutOrchestration) parts.push(stableWithoutOrchestration);
+  // Commander receives authoring dependencies on demand with agent-creator.
+  // A dedicated Agent editor sees them without widening its fixed surface.
+  const toolGroupsBlock = isAgentToolAuthoringSession || toolSurface.dynamicLoading
+    ? getLoadableToolGroupsSystemPromptBlock({
+        availableToolNames: isAgentToolAuthoringSession ? agentAuthoringToolNames : dynamicLoadableToolNames,
+        initialActiveToolNames: toolSurface.activeToolNames(),
+        ...(isAgentToolAuthoringSession ? {} : { allowedGroupIds: toolSurface.loadableGroups() }),
+        purpose: isAgentToolAuthoringSession ? 'agent-authoring' : isCommander ? 'runtime' : 'agent-runtime',
+      })
+    : '';
+  if (toolGroupsBlock) parts.push(toolGroupsBlock);
+  if (connectorBlock) parts.push(connectorBlock.trim());
+  if (systemSkillsBlock) parts.push(systemSkillsBlock.trim());
+  if (skillsBlock) parts.push(skillsBlock.trim());
+  if (agentsBlock) parts.push(agentsBlock);
+  // Static rules for resolving conflicts among the user-managed project
+  // layers. Always present in real project work sessions, even when ORKAS.md,
+  // memory, or the task backlog is empty.
+  const projectContextPolicyBlock = (uid && memoryAgentScope && params.projectId)
+    ? formatProjectContextPolicyForSystemPrompt()
+    : '';
+  if (projectContextPolicyBlock) parts.push(projectContextPolicyBlock);
+  // User-authored project instructions (read side): low-churn configuration,
+  // so it stays in the stable cache prefix (before the runtime injection).
+  // Gated on memoryAgentScope like memory: edit/one-shot sessions get neither.
+  const projectInstructionsBlock = (uid && memoryAgentScope && params.projectId)
+    ? formatProjectInstructionsForSystemPrompt(uid, params.projectId)
+    : '';
+  if (projectInstructionsBlock) parts.push(projectInstructionsBlock);
+  if (runtimeInjectionBlock) parts.push(runtimeInjectionBlock);
+  // Cross-session memory (read side): the user's stored profile + notes as
+  // background context. It is more turn-volatile than resource indexes, so
+  // it sits after connectors / skills / agents but before per-turn state.
+  // Empty string when nothing is stored (no tokens for new users).
+  // Re-read each turn — a mid-conversation write shows up next turn.
+  // Project sessions additionally render the project's own notes section.
+  const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope, params.projectId) : '';
+  if (memoryBlock) parts.push(memoryBlock);
+  // Reflection only improves future behavior if its persisted assessment is
+  // present on the next eligible turn. Keep it beside cross-session memory:
+  // both are user-scoped, low-volume, and re-read every turn. The empty
+  // agentId intentionally maps commander conversations to `_default`.
+  const metacognitionBlock = (
+    uid
+    && memoryAgentScope
+    && metacognition.isFeatureEnabledForUser(uid)
+  ) ? metacognition.formatForSystemPromptForUser(uid, agentId) : '';
+  if (metacognitionBlock) parts.push(metacognitionBlock);
+  // Keep the selected response language as the final instruction in the
+  // host-composed base prompt. Core-agent may append learned-Skill guidance
+  // and repository instructions after this boundary.
+  // Agent workflows, skills, and memory may legitimately be authored in
+  // English, but their source language must not become the reply language.
+  if (languageDirectiveBlock) parts.push(languageDirectiveBlock);
+  const resolvedSystemPrompt = parts.join('\n\n');
+  // P2: the truly per-turn-volatile blocks — conditional orchestration rules,
+  // the ledger JSON, and the datetime tail — do NOT go into the system prompt.
+  // Even peeled to the tail they bust the
+  // Anthropic single-block system cache (and therefore the whole history
+  // prefix) every turn. Instead they ride on THIS turn's user message
+  // (core-agent AgentRunParams.turnEphemeral → getMessagesForModel), the
+  // uncached tail after all history, so the system + history cache prefix stays
+  // byte-stable across turns. See Common/docs/plans/context-cost-optimization.md.
+  // Conversation task board (plan D8/P3): commander turns only, and only
+  // while live rows exist — the block changes with every admission/terminal,
+  // so it rides the uncached turn tail, and the
+  // lightweight chat path (empty board) pays nothing.
+  const conversationBoardBlock = (uid && params.cid && sessionKind === 'gconv')
+    ? await conversationTaskBoard.formatConversationBoardForTurn(uid, params.cid).catch(() => '')
+    : '';
+  // Entry guidance stays on the current turn, outside the stable system prefix.
+  const conversationAssistanceBlock = conversationAssistance.guidance;
+  // A file the guidance showed whole is already read for this run: the file
+  // tools accept its first edit without an E_NOT_READ round, and still reject
+  // it as stale if the bytes change before then.
+  const initialReadFileState = conversationAssistance.readSeeds?.length
+    ? new Map<string, unknown>(conversationAssistance.readSeeds.map((seed) => [seed.path, seed.stamp]))
+    : undefined;
+  const turnEphemeral = [
+    orchestrationBlock,
+    volatileTail,
+    conversationBoardBlock,
+    conversationAssistanceBlock,
+  ]
+    .filter((b) => b && b.trim())
+    .join('\n\n');
+
+  // Evolution (the self-evolving skill store) is per-agent: when an
+  // agentId is present we write into that agent's private directory
+  // `<uid>/cloud/agents/<aid>/skills/`. The core default conversation
+  // (no agentId) has evolution disabled — the commander shouldn't be
+  // auto-producing skills; user-authored skills go through the
+  // System A path in the user UI.
+  // When the evolution stanza is not passed, core-agent defaults to
+  // enabled=true + skillsDir="skills" relative to cwd, which would
+  // dump into `PC/skills/` (see the fix point in
+  // docs/plans/agent-as-directory.md).
+  const evolutionConfig = (agentId && earlyUid)
+    ? { enabled: true, skillsDir: agentEvolvedSkillsDir(earlyUid, agentId) }
+    : { enabled: false };
+
+  // Fill the model catalog with each model's REAL context window (+ max output
+  // tokens) so core-agent's compaction trigger uses it instead of the 200K
+  // fallback — otherwise a 1M-window model compacts at 0.8×200K=160K, throwing
+  // away most of its context (G7). Populate EVERY candidate in the rotating
+  // group (keyed by its modelId), not just the primary: rotating-provider can
+  // fail over to a different-window model mid-run, and core-agent looks the
+  // window up by the model the stream actually reported (P1-6).
+  // resolveConfiguredPiModel returns the pi-ai Model (catalog or custom-built),
+  // which carries contextWindow + maxTokens.
+  // Each entry must satisfy core-agent's ModelConfigSchema, which REQUIRES
+  // `provider` + `model` (contextWindow / maxOutputTokens are optional).
+  // modelCatalogEntryFromModel only supplies the windows, so add provider/model
+  // here. These two are schema-required metadata only — core-agent reads the
+  // catalog solely for contextWindow/maxOutputTokens and routes via
+  // defaultProvider/defaultModel + the injected rotating provider, never via
+  // catalog[x].provider. (Omitting them is what crashed createConfig with a Zod
+  // "provider/model Required" error once a candidate carried a real window.)
+  const modelCatalog: Record<string, { provider: string; model: string; contextWindow?: number; maxOutputTokens?: number }> = {};
+  for (const choice of group) {
+    if (modelCatalog[choice.model]) continue;
+    const model = isExternalApiProvider(choice.provider)
+      ? buildExternalProviderModel(choice.provider, choice.model, choice.customConfig)
+      : resolveConfiguredPiModel(mod, choice.provider, choice.model)?.model;
+    if (modelOutputLimitExceedsWindow(model)) {
+      // A catalog row, not user data: the ids are ours. The limit is dropped
+      // so the budget and the request both fall back to the default output
+      // allowance instead of a window with no room for input.
+      log.error('model catalog output limit is not smaller than its context window; ignoring the limit', {
+        provider: choice.provider,
+        model: choice.model,
+        contextWindow: model?.contextWindow,
+        maxTokens: model?.maxTokens,
+      });
+    }
+    const entry = modelCatalogEntryFromModel(model);
+    if (entry) modelCatalog[choice.model] = { provider: choice.provider, model: choice.model, ...entry };
+  }
+  const config: CoreAgentConfig = mod.createConfig({
+    agent: {
+      defaultProvider: providerId,
+      defaultModel: modelId,
+      ...(resolvedSystemPrompt ? { systemPrompt: resolvedSystemPrompt } : {}),
+      ...(params.maxToolLoops ? { maxToolLoops: params.maxToolLoops } : {}),
+      ...(params.toolIdleTimeoutMs ? { toolIdleTimeoutMs: params.toolIdleTimeoutMs } : {}),
+    },
+    evolution: evolutionConfig,
+    ...(Object.keys(modelCatalog).length ? { models: { catalog: modelCatalog } } : {}),
+    // We deliberately do NOT populate `models.providers` —
+    // ProviderRegistry's constructor runs the default factory
+    // (anthropic / openai / pi-ai) on every entry and stuffs the
+    // provider instance into the `providers` cache; subsequent
+    // `providers.get(id)` calls hit the cache first and never reach
+    // the registerFactory-injected rotating-provider below (this
+    // includes the single-key case — the old "group.length===1 → take
+    // the legacy path" branch missed cooldown / error classification
+    // for exactly this reason). Hand all provider creation to
+    // rotating-provider; for a single key the wrapper is just one
+    // closure (negligible cost) and we get a uniform error path.
+  });
+
+  const providers = new mod.ProviderRegistry(config);
+
+  if (primary) {
+    // Build a rotating provider covering the whole primary group. Even
+    // when there's only one candidate, the wrapper is cheap (just one
+    // pass-through) and keeps the code path uniform.
+    const onCandidateChosen = (info: { profileId: string; providerId: string; modelId: string }) => {
+      params.onCandidateChosen?.(info);
+    };
+    const rotating = await buildRotatingProvider(
+      mod,
+      providerId,
+      group,
+      params.onNativeSearchInjected,
+      onCandidateChosen,
+      params.onCandidatesObserved,
+      params.providerFirstEventTimeoutMs,
+      uid || undefined,
+      undefined,
+      {
+        conversationId: params.cid,
+        turnId: params.turnId,
+      },
+      params.cid,
+      params.requireImageInput,
+      params.onRequestFailure,
+    );
+    // Inject the rotating provider into BOTH the factory slot AND the
+    // pre-built instance cache. ProviderRegistry.get() short-circuits on
+    // the instance cache without consulting the factory, so injecting
+    // only the factory would be a no-op if any upstream path ever
+    // pre-warms the default implementation.
+    providers.registerFactory(providerId, () => rotating);
+    (providers as any).providers?.set?.(providerId, rotating);
+  }
+
+  // When a skill is learned via skill_manage(create), append it to the bound
+  // agent's explicit skill_list metadata if one exists. Goes through
+  // `appendAgentSkill` (not `updateCustomAgent`) to bypass the unknown-id
+  // filter, which would drop the new id — System B (SkillStore) skills aren't
+  // in System A's SkillLoader spec list. No-op when agentId is empty or when
+  // the agent has no explicit dependency list.
+  const onSkillCreated = agentId
+    ? (skillId: string) => {
+        return appendAgentSkill(agentId, skillId)
+          .then(() => undefined)
+          .catch((err) => log.warn('skill_list sync failed', {
+            agent_id: maskId(agentId),
+            skill_id: maskId(skillId),
+            error: logErrorSummary(err),
+          }));
+      }
+    : undefined;
+
+  // Bridge System B advertised → ChatOptions.onSkillAdvertised. The SDK
+  // doesn't know about the host's skill-system taxonomy; we tag every id
+  // it surfaces as `'B'` before passing it up.
+  const onLearnedSkillAdvertised = params.onSkillAdvertised
+    ? (id: string) => params.onSkillAdvertised!(id, 'B')
+    : undefined;
+
+  const runner = new mod.AgentRunner({
+    idleNow: params.idleNow ?? await getAgentIdleClock(),
+    config,
+    providers,
+    session,
+    ...(visibleTools.length ? { tools: visibleTools } : {}),
+    ...(toolSurface.mode === 'scoped'
+      ? {
+          isToolActive: (name: string) => toolSurface.isActive(name),
+          ...(toolSurface.dynamicLoading
+            ? {
+                // Makes the E_TOOL_NOT_LOADED refusal name the exact group(s)
+                // Commander can load instead of making it guess.
+                toolLoadGroups: (name: string) => toolSurface.loadableGroupsForTool(name),
+              }
+            : {}),
+        }
+      : {}),
+    // The core package still ships read_file for standalone callers. Orkas
+    // owns a consolidated read_files contract, so retire the builtin executor
+    // in every surface mode (including reflection and legacy rollback). Fixed
+    // actors additionally drop dormant executors as before.
+    disabledToolNames: [
+      'read_file',
+      ...(!EXPOSE_EXECUTION_PLAN_TOOL ? ['manage_execution_plan'] : []),
+      ...(toolSurface.mode === 'scoped' && !toolSurface.dynamicLoading
+        ? availableToolNames.filter((name) => (
+            !toolSurface.isActive(name) && !runtimeGrantableToolNames.has(name)
+          ))
+        : []),
+    ],
+    ...(transformToolResult ? { transformToolResult } : {}),
+    ...(programmaticToolPolicy ? { programmaticToolPolicy } : {}),
+    ...(programSourceLoader ? { programSourceLoader } : {}),
+    ...(toolResultsDir ? {
+      toolContextState: {
+        toolResultSpoolDir: toolResultsDir,
+        ...(deepResearchSnapshotFile ? {
+          [DEEP_RESEARCH_EVIDENCE_STATE_KEY]: deepResearchSnapshotFile,
+        } : {}),
+      },
+    } : {}),
+    ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
+    ...(onSkillCreated ? { onSkillCreated } : {}),
+    ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
+  });
+
+  // This is the same active-definition path used by AgentRunner immediately
+  // before an ordinary provider request. Reading it after construction keeps
+  // diagnostics, the dev archive, and tests aligned with late core
+  // tools without serializing dormant schemas.
+  const snapshotToolDefinition = (definition: {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+  }): ToolDefSnapshot => ({
+    name: definition.name,
+    description: definition.description,
+    inputSchema: definition.inputSchema,
+    source: toolSourceByName.get(definition.name) ?? 'core-agent',
+  });
+  const toolDefs = runner.getActiveToolDefinitions()
+    .map(snapshotToolDefinition)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    runner,
+    failureTrackingScope: session,
+    resolvedSystemPrompt,
+    turnEphemeral,
+    ...(initialReadFileState ? { initialReadFileState } : {}),
+    entryId: primary?.entryId,
+    profileId: primary?.profileId,
+    providerId,
+    modelId,
+    toolSurfaceMode: toolSurface.mode,
+    toolDefs,
+    skillDisplayNameById,
+    skillMetadataByReadRef,
+    agentDisplayNameById,
+    connectorDisplayNameById,
+  };
+}
+
+/** Best-effort accessor for the active uid that doesn't throw when no user is activated yet
+ *  (ad-hoc / test paths). Production callers always come through with `params.userId` or after
+ *  `activateUser()`, so the fallback is just a safety net. Loaded lazily via require to avoid
+ *  pulling features/users into the early import graph. */
+function _safeActiveUserId(): string | null {
+  try {
+    const { getActiveUserId } = require('../../features/users') as typeof import('../../features/users');
+    return getActiveUserId();
+  } catch {
+    return null;
+  }
+}
+
+/** Tri-state connector exposure, gated by session kind (CLAUDE.md §5 session-id table):
+ *   - `tools+block`:    group-chat task sessions (`gconv` commander + `gmember` agent worker)
+ *     — block + both meta-tools (`list_connector_tools` + `call_connector_tool`). Full exposure.
+ *   - `discover+block`: agent-edit (`agent`) — block + `list_connector_tools` ONLY. Editor LLM
+ *     can discover action names + JSON schemas to write specific workflow steps; cannot invoke
+ *     (an authoring session must never produce external side effects).
+ *   - `none`:           skill-edit, KB-image, CLI dispatch, reflect, anon, and
+ *     any future kind — neither block nor tools.
+ *   Add a new conversation kind that needs connectors? Extend this function explicitly + add
+ *   an entry to CLAUDE.md §5's session-id table.
+ *
+ * session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id), so the
+ * kind keyword is anchored at the start. */
+export function connectorExposureFromSessionId(sessionId: string): 'tools+block' | 'discover+block' | 'none' {
+  if (/^(gconv|gmember)-/.test(sessionId)) return 'tools+block';
+  // Agent-edit gets `list_connector_tools` (read-only, no side effects) so the editor LLM can
+  // learn each connector's action names and write specific workflow steps — but NOT
+  // `call_connector_tool`, since an authoring session must never produce external side
+  // effects. See `connector-meta-tools.ts::buildConnectorSurface` mode handling.
+  if (/^agent-/.test(sessionId)) return 'discover+block';
+  return 'none';
+}
+
+/** Programmatic execution is a task-runtime capability, not an authoring or
+ * auxiliary-model capability. Its child calls remain constrained to the
+ * current actor's active tool surface. */
+export function programmaticExecutionExposureFromSessionId(sessionId: string): boolean {
+  return /^(gconv|gmember|gworker)-/.test(sessionId);
+}
+
+/** Named tasks get only APP_AUTHORING_SYSTEM_SKILLS, filtered at composition.
+ * Anonymous/internal workers never inherit product authoring protocols. */
+export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
+  return /^(gconv|gmember|agent|skill)-/.test(sessionId);
+}
+
+/** Task runtimes can discover shared non-System, non-private Skills lazily.
+ * Authoring sessions and anonymous workers retain their narrower surfaces. */
+export function skillSearchExposureFromSessionId(sessionId: string): boolean {
+  return /^(gconv|gmember)-/.test(sessionId);
+}
+
+/**
+ * Factory dispatcher for Orkas's external (pi-ai-unaware) providers.
+ * Extend the switch when a new id is added to `EXTERNAL_API_PROVIDERS`.
+ * Async because the underlying factories await core-agent dynamic import.
+ */
+async function buildExternalProvider(
+  choice: ChatEntryChoice,
+  usageContext?: OrkasApiUsageContext,
+  userCacheKey?: string,
+): Promise<LLMProvider> {
+  const { provider: providerId, apiKey, model: modelId } = choice;
+  switch (providerId) {
+    case 'orkas-api':
+      return await createOrkasApiProvider({ apiKey, modelId, usageContext, userCacheKey });
+    case 'moonshot':
+      return await createMoonshotProvider({ apiKey, modelId, userCacheKey });
+    case 'deepseek':
+      return await createDeepSeekProvider({ apiKey, modelId, userCacheKey });
+    case 'doubao':
+      return await createDoubaoProvider({ apiKey, modelId, userCacheKey });
+    case 'custom':
+      if (!choice.customConfig) throw new Error('custom model configuration is incomplete');
+      return await createCustomOpenAICompatibleProvider({
+        apiKey,
+        modelId,
+        ...choice.customConfig,
+        userCacheKey,
+      });
+    default:
+      return createConfiguredOpenAICompatibleProvider({ providerId, apiKey, modelId, userCacheKey });
+  }
+}
+
+/**
+ * Build an `LLMProvider` that wraps every entry behind cross-provider
+ * fallback rotation. `build()` closures are deferred so we only pay the
+ * construction cost for candidates we actually try — if the primary key
+ * works on first request, fallbacks never get built.
+ *
+ * Candidates may target different `(provider, model)` pairs — e.g. the
+ * primary might be `openai/gpt-5.4` and the next fallback
+ * `anthropic/claude-opus-4.7`. rotating-provider overrides `params.model`
+ * with each candidate's own model id before delegating, so AgentRunner
+ * (which only knows the primary's model) is none the wiser.
+ *
+ * The wrapper is registered under `primary.provider` as far as
+ * ProviderRegistry is concerned. That's just a routing label — once
+ * AgentRunner retrieves it, all rotation is handled internally.
+ *
+ * On success (`onSuccess`), we bump `lastUsed` on the winning entry
+ * and clear any prior cooldown on that profile (the key just proved it
+ * works — don't keep skipping it).
+ */
+async function buildRotatingProvider(
+  mod: CA,
+  providerId: string,
+  group: ChatEntryChoice[],
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
+  onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void,
+  firstEventTimeoutMs?: number,
+  userId?: string,
+  retryLimits?: { networkRetryAttempts: number; normalEmptyRetryAttempts: number },
+  usageContext?: OrkasApiUsageContext,
+  cid?: string,
+  requireImageInput = false,
+  onRequestFailure?: (failure: ProviderRequestFailure) => void,
+): Promise<LLMProvider> {
+  const userCacheKey = providerUserCacheKey(userId);
+  const candidates: RotatingCandidate[] = group.map((choice) => {
+    const candProviderId = choice.provider;
+    const candModelId = choice.model;
+    const isExternal = isExternalApiProvider(candProviderId);
+    const resolvedModel = isExternal
+      ? null
+      : resolveConfiguredPiModel(mod, candProviderId, candModelId);
+    const candidateModel = isExternal
+      ? buildExternalProviderModel(candProviderId, candModelId, choice.customConfig)
+      : resolvedModel?.model;
+    const candidateMaxTokens = candidateModel?.maxTokens;
+    const maxInputImages = modelInputImageLimit(candProviderId, candModelId, candidateModel);
+    let currentApiKey = choice.apiKey;
+    return {
+      profileId: choice.profileId,
+      cooldownId: choice.profileId,
+      providerId: candProviderId,
+      modelId: candModelId,
+      contextWindow: candidateModel?.contextWindow,
+      maxInputImages,
+      ...(candProviderId === 'custom' && userId && choice.customConfig
+        ? { imageSupport: customModelImageSupport({ userId, profileId: choice.profileId,
+            modelId: candModelId, apiKey: choice.apiKey, config: choice.customConfig }) }
+        : {}),
+      ...(typeof candidateMaxTokens === 'number'
+        && Number.isFinite(candidateMaxTokens)
+        && candidateMaxTokens > 0
+        ? { maxTokens: Math.trunc(candidateMaxTokens) }
+        : {}),
+      ...(choice.refreshApiKey ? { refreshCredential: async () => {
+        const refreshed = await choice.refreshApiKey!(currentApiKey);
+        if (!refreshed) return false;
+        currentApiKey = refreshed;
+        return true;
+      } } : {}),
+      build: async () => {
+        if (isExternal) {
+          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext, userCacheKey), cid);
+        }
+        if (resolvedModel?.isConfiguredFallback) {
+          log.info('using configured model fallback', {
+            provider: candProviderId,
+            model: candModelId,
+            templateProvider: resolvedModel.catalogProviderId,
+            templateModel: resolvedModel.templateModelId,
+          });
+        }
+        return withTaskBudget(mod.createPiProvider({
+          provider: candProviderId,
+          ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
+          apiKey: currentApiKey,
+          userCacheKey,
+          onPayload: omitReservedOutputLimitForProvider(
+            candProviderId,
+            buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
+          ),
+          googleNativeSearch: shouldUseGoogleNativeSearch,
+        }), cid);
+      },
+    };
+  });
+
+  return createRotatingProvider({
+    providerId,
+    candidates,
+    requireImageInput,
+    ...retryLimits,
+    ...(process.env.ORKAS_MODEL_EVAL_PINNED_ROUTE === '1'
+      && providerId === 'custom'
+      && candidates.length === 1
+      ? {
+          // The local managed-eval bridge already owns one bounded retry on
+          // the same concrete upstream. Do not multiply that provider call
+          // budget in the desktop rotation layer; the comparison coordinator
+          // owns the single whole-case recovery attempt.
+          networkRetryAttempts: 0,
+          normalEmptyRetryAttempts: 0,
+        }
+      : {}),
+    onSuccess: (profileId, candidate) => {
+      clearCooldown(candidate.cooldownId || profileId);
+    },
+    ...(onCandidateChosen ? { onCandidateChosen } : {}),
+    ...(onCandidatesObserved ? { onCandidatesObserved } : {}),
+    ...(onRequestFailure ? { onRequestFailure } : {}),
+    ...(Number.isFinite(firstEventTimeoutMs) ? { firstEventTimeoutMs } : {}),
+  });
+}
+
+/** Pure app inference: reuse provider construction, with one configured candidate
+ * and no automatic generation retries. No Agent session or prompt assembly. */
+export async function generateWebAppText(
+  uid: string,
+  input: { prompt: string; maxTokens?: number },
+  signal: AbortSignal,
+  progress: (event: { type: 'delta'; text: string }) => void,
+): Promise<{ text: string; usage: Record<string, number>; stopReason: string }> {
+  const { getActiveUserId } = await import('../../features/users');
+  const check = () => {
+    if (signal.aborted || getActiveUserId() !== uid) throw new Error('app generation cancelled');
+  };
+  check();
+  if (!input.prompt || (input.maxTokens !== undefined && (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1))) throw new Error('invalid app model input');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('app model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group, undefined, undefined, undefined,
+    undefined, uid, { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 });
+  check();
+  let text = '';
+  let stopReason = '';
+  const usage: Record<string, number> = {};
+  for await (const event of provider.stream({ model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.prompt }] }],
+    tools: [], maxTokens: input.maxTokens, reasoning: 'off', signal })) {
+    check();
+    if (event.type === 'error') throw event.error;
+    if (event.type === 'tool_use_start' || event.type === 'tool_use_delta' || event.type === 'tool_use_end') {
+      throw new Error('unexpected app model tool request');
+    }
+    if (event.type === 'text_delta') {
+      text += event.text;
+      // Provider chunks can exceed the bridge event budget; split deterministically.
+      for (let at = 0; at < event.text.length; at += 4000) progress({ type: 'delta', text: event.text.slice(at, at + 4000) });
+    }
+    if (event.type === 'message_start' || event.type === 'message_end') {
+      for (const key of ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
+        const value = event.usage?.[key];
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[key] = value;
+      }
+    }
+    if (event.type === 'message_end') {
+      if (event.stopReason === 'tool_use' || event.content?.some(part => part.type === 'tool_use')) throw new Error('unexpected app model tool request');
+      stopReason = event.stopReason;
+    }
+  }
+  check();
+  if (!stopReason) throw new Error('incomplete app model response');
+  return { text, usage, stopReason };
+}
+
+/** One tools-free Skill repair request. The feature supplies only the rejected
+ * proposal and current request; no task replay, session, roster or discovery. */
+export async function completeSkillCreationCorrection(input: {
+  userId: string;
+  cid: string;
+  turnId: string;
+  message: string;
+  signal: AbortSignal;
+}): Promise<string> {
+  const { getActiveUserId } = await import('../../features/users');
+  const check = () => {
+    if (input.signal.aborted || getActiveUserId() !== input.userId) {
+      throw new Error('Skill correction cancelled');
+    }
+  };
+  check();
+  if (!input.message || input.message.length > 64_000) throw new Error('Skill correction input limit');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('Skill correction model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group,
+    undefined, undefined, undefined, 45_000, input.userId,
+    { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 }, undefined, input.cid);
+  check();
+  const result = await provider.complete({
+    model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
+    tools: [], maxTokens: 8192, reasoning: 'off', signal: input.signal,
+    requestMetadata: { creditContext: {
+      conversationId: input.cid, turnId: input.turnId,
+    } },
+  });
+  check();
+  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
+    throw new Error('Skill correction incomplete');
+  }
+  const text = result.content.map(part => (part as { text: string }).text).join('').trim();
+  if (!text || text.length > 64_000) throw new Error('Skill correction output limit');
+  return text;
+}
+
+/** One tools-free dispatch-planning request (D29): split a user-orchestrated
+ * group-chat message into dependent tasks. It uses only the user's primary
+ * model candidate with no retries: a planning failure falls back to the
+ * Commander, so it must never silently move a bring-your-own-key user onto
+ * another provider. No session, history replay, tools, or skills enter it. */
+export async function completeDispatchPlan(input: {
+  userId: string;
+  cid: string;
+  turnId: string;
+  message: string;
+  signal: AbortSignal;
+}): Promise<string> {
+  const { getActiveUserId } = await import('../../features/users');
+  const check = () => {
+    if (input.signal.aborted || getActiveUserId() !== input.userId) {
+      throw new Error('Dispatch planning cancelled');
+    }
+  };
+  check();
+  if (!input.message || input.message.length > 64_000) throw new Error('Dispatch planning input limit');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('Dispatch planning model unavailable');
+  const mod = await ca();
+  const primary = group[0];
+  const provider = await buildRotatingProvider(mod, primary.provider, group,
+    undefined, undefined, undefined, 20_000, input.userId,
+    { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 }, undefined, input.cid);
+  check();
+  const result = await provider.complete({
+    model: primary.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
+    tools: [], maxTokens: 2048, reasoning: 'off', signal: input.signal,
+    requestMetadata: { creditContext: {
+      conversationId: input.cid, turnId: input.turnId,
+    } },
+  });
+  check();
+  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
+    throw new Error('Dispatch planning incomplete');
+  }
+  return result.content.map(part => (part as { text: string }).text).join('').trim();
+}
+
+/** Check if metacognition feature is enabled.
+ *
+ *  Single source of truth lives in `features/metacognition.isFeatureEnabled`
+ *  (combines env `ORKAS_METACOGNITION='0'` kill switch + per-user preference
+ *  written from settings UI). This thin wrapper exists to avoid changing
+ *  every existing call site at once. */
+/** Check if metacognition feature is enabled (env var toggle). */
+export function isMetacognitionEnabled(): boolean {
+  return metacognition.isFeatureEnabled();
+}
+
+/** Select the transport with the same actual-model and active-tool gates as the payload hook. */
+export function shouldUseGoogleNativeSearch(
+  model: { api?: string; id?: string; provider?: string },
+  tools: readonly { name: string }[],
+): boolean {
+  return model.api === 'google-generative-ai'
+    && !!nativeSearchToolForModel(model, {})
+    && isNativeSearchEnabled() && !hasAnySearchProfile()
+    && tools.some(tool => tool.name === 'web_search');
+}
+
+/**
+ * Builds a pi-ai `onPayload` callback: pi-ai invokes it after handing us
+ * the result of `buildParams` and before sending the request. An activated
+ * search definition (initial or deferred) uses the native schema only when
+ * the toggle and actual model/API permit it and no search profile takes
+ * precedence. Native injection is reported to client.ts's archive recorder.
+ * Unsupported and unknown candidates retain the executable Orkas function.
+ *
+ * On a miss we return params unchanged (pi-ai treats an undefined return
+ * as no-op, so a no-op return is also legal).
+ */
+export function buildNativeSearchOnPayload(
+  providerId: string,
+  modelId: string,
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
+): (params: unknown, model: { api?: string; id?: string; provider?: string }) => unknown {
+  return (params, model) => {
+    const repaired = repairOpenAIToolMessageOrder(params);
+    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[]; reasoning?: { effort?: unknown } } & Record<string, unknown>;
+    const api = model?.api;
+    const tool = nativeSearchToolForModel(model, cur);
+    const google = api === 'google-generative-ai' || api === 'google-vertex';
+    const googleConfig = google && cur.config && typeof cur.config === 'object'
+      ? cur.config as { tools?: unknown[]; toolConfig?: Record<string, unknown> } : undefined;
+    const route = routeSearchPayloadTools({
+      tools: google ? googleConfig?.tools : cur.tools,
+      input: cur.input,
+      nativeEnabled: isNativeSearchEnabled(),
+      paidSearchConfigured: hasAnySearchProfile(),
+      nativeTool: tool,
+    });
+    if (route.route !== 'native' || !api || !tool) return repaired;
+    const toolName = nativeSearchToolName(tool) || 'native_web_search';
+    // Payload shape + size stamped into each injection so post-incident
+    // grepping can correlate fetch failures to body size / turn length.
+    // Cheap — one JSON.stringify of an already-serialisable object.
+    let approxBodyBytes = -1;
+    try { approxBodyBytes = JSON.stringify(repaired).length; } catch { /* circular — give up */ }
+    const msgCount = Array.isArray(cur.messages)
+      ? cur.messages.length
+      : (Array.isArray(cur.input) ? cur.input.length : (Array.isArray(cur.contents) ? cur.contents.length : -1));
+    const requestTools = google ? googleConfig?.tools : cur.tools;
+    const toolsBefore = Array.isArray(requestTools) ? requestTools.length : 0;
+    const toolsAfter = Array.isArray(route.tools) ? route.tools.length : 0;
+    runnerLog.info('native web search selected', {
+      provider: providerId, model: modelId, api, tool: toolName,
+      msgCount, toolsBefore, toolsAfter, replacedOrkasSearch: route.replacedOrkasSearch,
+      approxBodyBytes,
+    });
+    try {
+      onNativeSearchInjected?.({ provider: providerId, model: modelId, api, tool: toolName });
+    } catch (err) {
+      runnerLog.warn(`onNativeSearchInjected callback failed: ${(err as Error).message}`);
+    }
+    if (google) {
+      return { ...cur, config: { ...googleConfig, tools: route.tools,
+        toolConfig: { ...googleConfig?.toolConfig, includeServerSideToolInvocations: true,
+          functionCallingConfig: { ...(googleConfig?.toolConfig?.functionCallingConfig as object), mode: 'VALIDATED' } } } };
+    }
+    return { ...cur, tools: route.tools, ...(route.input !== undefined ? { input: route.input } : {}) };
+  };
+}

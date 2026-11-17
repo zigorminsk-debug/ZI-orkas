@@ -1,0 +1,608 @@
+/**
+ * Structural detection for commands that can change state outside the local
+ * conversation workspace: databases, remote hosts/files, deployed services,
+ * external APIs, registries, and infrastructure control planes.
+ *
+ * Keep this deliberately narrower than a keyword scan. A word such as
+ * "DELETE" in `echo`, documentation, or a search pattern is not an action.
+ */
+
+import { pythonSqliteResources, type SqliteResource } from './python-sqlite-resources';
+
+export type ExternalMutationKind =
+  | 'database_write'
+  | 'remote_command'
+  | 'remote_file_write'
+  | 'service_change'
+  | 'deployment_change'
+  | 'external_api_write'
+  | 'remote_publish'
+  | 'external_launch';
+
+export interface ExternalMutationFinding {
+  kind: ExternalMutationKind;
+  action: string;
+  target?: string;
+  /** Internal provenance only; the host authorizes the resource and removes it
+   * before serializing the existing permission payload. */
+  resource?: SqliteResource;
+}
+
+const HELP_FLAGS = new Set(['--help', '-h', '-?', '/?', '--version']);
+const CURL_WRITE_METHODS = new Set(['post', 'put', 'patch', 'delete']);
+const CURL_WRITE_FLAGS = new Set([
+  '-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode',
+  '-F', '--form', '--form-string', '-T', '--upload-file', '--json',
+  '-body', '-infile', '-form',
+]);
+const SSH_OPTIONS_WITH_VALUE = new Set([
+  '-B', '-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-R', '-S', '-W', '-w',
+]);
+const DATABASE_CLIENTS = new Set(['mysql', 'mysql.exe', 'mariadb', 'psql', 'sqlcmd', 'sqlcmd.exe', 'mongosh', 'mongo']);
+const SQL_ARG_FLAGS = new Set(['-e', '--execute', '-c', '--command', '-q', '--query']);
+const SERVICE_ACTIONS = new Set(['restart', 'reload', 'start', 'stop', 'enable', 'disable', 'delete']);
+
+const SQL_WRITE_RE = /\b(insert\s+into|update\s+[a-z0-9_$"`.\[\]-]+\s+set|delete\s+from|replace\s+into|merge\s+into|upsert\b|create\s+(?:table|index|view|schema|database|user|role)\b|alter\s+(?:table|view|schema|database|user|role)\b|drop\s+(?:table|index|view|schema|database|user|role)\b|truncate\s+(?:table\s+)?|grant\s+|revoke\s+|rename\s+table\b)\b/i;
+
+function commandName(raw: string): string {
+  return (raw.split(/[\\/]/).pop() || raw).toLowerCase();
+}
+
+function cleanTarget(raw: string | undefined): string | undefined {
+  const value = String(raw || '').trim().replace(/^[`'"\[]|[`'"\],;)]$/g, '');
+  if (!value || value.includes('$(') || value.includes('${')) return undefined;
+  return value.slice(0, 120);
+}
+
+function sqlFinding(text: string): ExternalMutationFinding | null {
+  const match = SQL_WRITE_RE.exec(text);
+  if (!match) return null;
+  const phrase = match[1].toLowerCase().replace(/\s+/g, ' ');
+  const action = phrase.split(' ')[0];
+  const statement = text.slice(match.index);
+  const target = cleanTarget(
+    /(?:insert\s+into|update|delete\s+from|replace\s+into|merge\s+into)\s+([a-z0-9_$"`.\[\]-]+)/i.exec(statement)?.[1]
+      || /(?:create|alter|drop|truncate|rename)\s+(?:(?:table|index|view|schema|database|user|role)\s+)?(?:if\s+(?:not\s+)?exists\s+)?([a-z0-9_$"`.\[\]-]+)/i.exec(statement)?.[1],
+  );
+  return { kind: 'database_write', action, ...(target ? { target } : {}) };
+}
+
+function firstAction(args: readonly string[], optionsWithValues: ReadonlySet<string> = new Set()): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (!arg) continue;
+    if (optionsWithValues.has(arg)) { index++; continue; }
+    if (arg.startsWith('-')) continue;
+    return arg.toLowerCase();
+  }
+  return undefined;
+}
+
+function hasHelp(args: readonly string[]): boolean {
+  return args.some((arg) => HELP_FLAGS.has(arg.toLowerCase()));
+}
+
+function databaseMutation(args: readonly string[]): ExternalMutationFinding | null {
+  for (let i = 0; i < args.length; i++) {
+    const lower = args[i].toLowerCase();
+    if (SQL_ARG_FLAGS.has(lower) && args[i + 1]) {
+      const finding = sqlFinding(args[i + 1]);
+      if (finding) return finding;
+      i++;
+      continue;
+    }
+    const equal = /^(?:--execute|--command|--query)=(.*)$/is.exec(args[i]);
+    if (equal) {
+      const finding = sqlFinding(equal[1]);
+      if (finding) return finding;
+    }
+  }
+  return null;
+}
+
+function curlMutation(args: readonly string[]): ExternalMutationFinding | null {
+  if (hasHelp(args)) return null;
+  for (let i = 0; i < args.length; i++) {
+    const lower = args[i].toLowerCase();
+    if ((lower === '-x' || lower === '--request' || lower === '-method') && CURL_WRITE_METHODS.has((args[i + 1] || '').toLowerCase())) {
+      return { kind: 'external_api_write', action: (args[i + 1] || '').toUpperCase() };
+    }
+    const method = /^(?:--request=|--method=)(post|put|patch|delete)$/i.exec(args[i]);
+    if (method) return { kind: 'external_api_write', action: method[1].toUpperCase() };
+    if (CURL_WRITE_FLAGS.has(args[i]) || CURL_WRITE_FLAGS.has(lower) || lower.startsWith('--data=') || lower.startsWith('--form=') || lower.startsWith('--upload-file=')) {
+      return { kind: 'external_api_write', action: lower.includes('upload') || args[i] === '-T' ? 'UPLOAD' : 'POST' };
+    }
+  }
+  return null;
+}
+
+function remoteDestination(args: readonly string[]): string | undefined {
+  if (args.some((arg) => arg === '--dry-run' || arg === '-n')) return undefined;
+  let endOfFlags = false;
+  const operands: string[] = [];
+  for (const arg of args) {
+    if (!endOfFlags && arg === '--') { endOfFlags = true; continue; }
+    if (!endOfFlags && arg.startsWith('-')) continue;
+    operands.push(arg);
+  }
+  const destination = operands.at(-1);
+  if (!destination || /^[a-z][a-z0-9+.-]*:\/\//i.test(destination) || /^[a-z]:[\\/]/i.test(destination)) return undefined;
+  return /^[^\s/:]+@[^\s:]+:.+|^[a-z0-9_.-]+:.+/i.test(destination) ? cleanTarget(destination) : undefined;
+}
+
+function sshPayload(args: readonly string[]): { host?: string; command?: string } {
+  let index = 0;
+  for (; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--') { index++; break; }
+    if (!arg.startsWith('-')) break;
+    if (SSH_OPTIONS_WITH_VALUE.has(arg)) index++;
+  }
+  const host = cleanTarget(args[index]);
+  const command = args.slice(index + 1).join(' ').trim();
+  return { host, ...(command ? { command } : {}) };
+}
+
+interface ShellStage {
+  words: string[];
+  redirectTargets: string[];
+}
+
+function shellStages(command: string): ShellStage[] {
+  const raw = command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||>>|[;&|>]|[^\s;&|>]+/g) || [];
+  const stages: ShellStage[] = [];
+  let words: string[] = [];
+  let redirectTargets: string[] = [];
+  let expectRedirect = false;
+  const flush = () => {
+    if (words.length || redirectTargets.length) stages.push({ words, redirectTargets });
+    words = [];
+    redirectTargets = [];
+    expectRedirect = false;
+  };
+  for (const token of raw) {
+    if (new Set([';', '&&', '||', '&', '|']).has(token)) { flush(); continue; }
+    if (token === '>' || token === '>>') { expectRedirect = true; continue; }
+    const value = token.replace(/^['"]|['"]$/g, '');
+    if (expectRedirect) { redirectTargets.push(value); expectRedirect = false; continue; }
+    words.push(value);
+  }
+  flush();
+  return stages;
+}
+
+function effectiveRemoteCommand(words: readonly string[]): { cmd: string; args: string[] } | null {
+  let remaining = [...words];
+  const optionsWithValues = new Set([
+    '-C', '-D', '-g', '-h', '-p', '-R', '-T', '-u', '--chdir', '--close-from',
+    '--group', '--host', '--prompt', '--role', '--type', '--unset', '--user',
+  ]);
+  while (remaining.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(remaining[0])) remaining.shift();
+  while (remaining.length) {
+    const wrapper = commandName(remaining[0]);
+    if (!new Set(['sudo', 'doas', 'env', 'command', 'builtin', 'exec', 'nohup']).has(wrapper)) break;
+    remaining.shift();
+    while (remaining.length) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(remaining[0])) { remaining.shift(); continue; }
+      if (remaining[0] === '--') { remaining.shift(); break; }
+      if (!remaining[0].startsWith('-')) break;
+      const option = remaining.shift()!;
+      if (optionsWithValues.has(option) && remaining.length) remaining.shift();
+    }
+  }
+  if (!remaining.length) return null;
+  return { cmd: commandName(remaining[0]), args: remaining.slice(1) };
+}
+
+function shellLikeMutation(command: string): ExternalMutationFinding | null {
+  const text = command.trim();
+  if (!text || /(?:^|\s)--dry-run(?:\s|=|$)/i.test(text)) return null;
+  for (const stage of shellStages(text)) {
+    const effective = effectiveRemoteCommand(stage.words);
+    if (!effective) continue;
+    const direct = classifyExternalMutationCommand(effective.cmd, effective.args);
+    if (direct) return direct;
+    if (stage.redirectTargets.length) {
+      const target = cleanTarget(stage.redirectTargets.at(-1));
+      return { kind: 'remote_command', action: 'redirect', ...(target ? { target } : {}) };
+    }
+    const { cmd, args } = effective;
+    if (new Set(['rm', 'mv', 'cp', 'install', 'chmod', 'chown', 'truncate']).has(cmd) && !hasHelp(args)) {
+      const target = cleanTarget(args.filter((arg) => !arg.startsWith('-')).at(-1));
+      return { kind: 'remote_command', action: cmd, ...(target ? { target } : {}) };
+    }
+    if (cmd === 'sed' && args.some((arg) => /^-[a-z]*i[a-z]*$/i.test(arg) || arg === '--in-place')) {
+      const target = cleanTarget(args.filter((arg) => !arg.startsWith('-')).at(-1));
+      return { kind: 'remote_command', action: 'sed', ...(target ? { target } : {}) };
+    }
+    if (cmd === 'tee' && !hasHelp(args)) {
+      const target = cleanTarget(args.filter((arg) => !arg.startsWith('-')).at(-1));
+      return { kind: 'remote_command', action: 'tee', ...(target ? { target } : {}) };
+    }
+  }
+  return null;
+}
+
+/** Git global options bind values before the subcommand. Argument text (for
+ * example a log search for "push") does not select an operation. */
+export function gitCommandAction(args: readonly string[]): { action?: string; index: number } {
+  const values = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === '--') { index++; break; }
+    if (!arg.startsWith('-')) break;
+    if (values.has(arg)) { index += 2; continue; }
+    index++;
+  }
+  return { action: args[index]?.toLowerCase(), index };
+}
+
+function gitPushIsPreview(args: readonly string[], actionIndex: number): boolean {
+  const values = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
+  for (let i = actionIndex + 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (values.has(arg)) { i++; continue; }
+    if (['--help', '-h', '--dry-run', '-n'].includes(arg)) return true;
+  }
+  const globalValues = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
+  for (let i = 0; i < actionIndex; i++) {
+    if (globalValues.has(args[i])) { i++; continue; }
+    if (args[i] === '--help' || args[i] === '--version') return true;
+  }
+  return false;
+}
+
+/** Classify one already-tokenized executable and its quote-stripped args. */
+export function classifyExternalMutationCommand(cmdRaw: string, args: readonly string[]): ExternalMutationFinding | null {
+  const cmd = commandName(cmdRaw);
+  const dryRun = args.some((arg) => arg === '--dry-run' || arg.startsWith('--dry-run='));
+
+  if ((cmd === 'open' || cmd === 'xdg-open') && !hasHelp(args)) {
+    const target = cleanTarget(args.find((arg) => arg && !arg.startsWith('-')));
+    return target ? { kind: 'external_launch', action: 'open', target } : null;
+  }
+  if (cmd === 'gio' && args[0]?.toLowerCase() === 'open' && !hasHelp(args)) {
+    const target = cleanTarget(args.slice(1).find((arg) => arg && !arg.startsWith('-')));
+    return target ? { kind: 'external_launch', action: 'open', target } : null;
+  }
+  if (cmd === 'start-process' && !hasHelp(args)) {
+    const optionsWithValues = new Set(['-argumentlist', '-credential', '-filepath', '-redirectstandarderror', '-redirectstandardinput', '-redirectstandardoutput', '-verb', '-windowstyle', '-workingdirectory']);
+    let target: string | undefined;
+    for (let index = 0; index < args.length; index++) {
+      const arg = args[index];
+      const lower = arg.toLowerCase();
+      if (lower === '-whatif' || lower === '-whatif:$true') return null;
+      if (optionsWithValues.has(lower)) {
+        if (lower === '-filepath') target = cleanTarget(args[index + 1]);
+        index++;
+        continue;
+      }
+      if (!arg.startsWith('-') && !target) target = cleanTarget(arg);
+    }
+    return target ? { kind: 'external_launch', action: 'start', target } : null;
+  }
+
+  // SHUTDOWN changes a service even when it targets localhost. It is not the
+  // operating-system shutdown executable, and endpoint locality is not ownership.
+  if (cmd === 'redis-cli' || cmd === 'redis-cli.exe') {
+    const valueOptions = new Set([
+      '-h', '-p', '-t', '-s', '-a', '-u', '-r', '-i', '-n', '-d', '-D', '-X',
+      '--user', '--pass', '--name', '--sni', '--cacert', '--cacertdir', '--cert',
+      '--key', '--tls-ciphers', '--tls-ciphersuites', '--show-pushes',
+    ]);
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === '--help' || arg === '--version') return null;
+      if (valueOptions.has(arg)) { i++; continue; }
+      if (arg.startsWith('-')) continue;
+      const action = args.includes('--quoted-input') ? arg.replace(/^["']|["']$/g, '') : arg;
+      return action.toLowerCase() === 'shutdown' ? { kind: 'service_change', action: 'shutdown' } : null;
+    }
+    return null;
+  }
+  if (DATABASE_CLIENTS.has(cmd)) {
+    if (args.some((arg) => arg === '--help' || arg === '--version' || arg === '-?')) return null;
+    return databaseMutation(args);
+  }
+  if (cmd === 'curl' || cmd === 'curl.exe' || cmd === 'invoke-restmethod' || cmd === 'irm' || cmd === 'invoke-webrequest' || cmd === 'iwr') {
+    return curlMutation(args);
+  }
+  if (cmd === 'ssh' || cmd === 'ssh.exe') {
+    const remote = sshPayload(args);
+    if (!remote.command) return null;
+    const nested = shellLikeMutation(remote.command);
+    return nested ? { ...nested, target: nested.target || remote.host } : null;
+  }
+  if (cmd === 'scp' || cmd === 'scp.exe' || cmd === 'rsync') {
+    const target = remoteDestination(args);
+    return target ? { kind: 'remote_file_write', action: 'upload', target } : null;
+  }
+  if (cmd === 'service') {
+    const target = cleanTarget(args.find((arg) => arg && !arg.startsWith('-')));
+    const action = args.find((arg) => SERVICE_ACTIONS.has(arg.toLowerCase()))?.toLowerCase();
+    if (action) return { kind: 'service_change', action, ...(target ? { target } : {}) };
+  }
+  if (cmd === 'systemctl' || cmd === 'supervisorctl' || cmd === 'pm2') {
+    const actionIndex = args.findIndex((arg) => SERVICE_ACTIONS.has(arg.toLowerCase()));
+    if (actionIndex >= 0) {
+      const action = args[actionIndex].toLowerCase();
+      const target = cleanTarget(args.slice(actionIndex + 1).find((arg) => arg && !arg.startsWith('-')));
+      return { kind: 'service_change', action, ...(target ? { target } : {}) };
+    }
+  }
+  if (cmd === 'kubectl') {
+    if (dryRun) return null;
+    const action = firstAction(args, new Set([
+      '--context', '--cluster', '--user', '--namespace', '-n', '--kubeconfig', '--server', '-s',
+      '--token', '--as', '--as-group', '--request-timeout', '--cache-dir',
+    ]));
+    const rolloutIndex = args.findIndex((arg) => arg.toLowerCase() === 'rollout');
+    const mutatingRollout = rolloutIndex >= 0
+      && new Set(['restart', 'undo', 'pause', 'resume']).has((args[rolloutIndex + 1] || '').toLowerCase());
+    if (action && (new Set(['apply', 'create', 'delete', 'edit', 'patch', 'replace', 'scale', 'set', 'taint', 'label', 'annotate', 'cordon', 'uncordon', 'drain']).has(action) || mutatingRollout)) {
+      return { kind: 'deployment_change', action: mutatingRollout ? `rollout ${args[rolloutIndex + 1].toLowerCase()}` : action };
+    }
+  }
+  if (cmd === 'helm') {
+    if (dryRun) return null;
+    const action = firstAction(args, new Set([
+      '--namespace', '-n', '--kube-context', '--kubeconfig', '--registry-config',
+      '--repository-cache', '--repository-config',
+    ]));
+    if (action && new Set(['install', 'upgrade', 'uninstall', 'rollback']).has(action)) return { kind: 'deployment_change', action };
+  }
+  if (cmd === 'terraform' || cmd === 'tofu') {
+    const action = firstAction(args);
+    if (action && new Set(['apply', 'destroy', 'import', 'taint', 'untaint']).has(action)) return { kind: 'deployment_change', action };
+  }
+  if (cmd === 'ansible-playbook') {
+    if (dryRun || args.some((arg) => new Set(['--check', '--syntax-check', '--list-hosts', '--list-tasks', '--list-tags']).has(arg.toLowerCase()))) return null;
+    return { kind: 'deployment_change', action: 'run playbook' };
+  }
+  if (cmd === 'git') {
+    const { action, index } = gitCommandAction(args);
+    if (action === 'push' && !gitPushIsPreview(args, index)) return { kind: 'remote_publish', action: 'push' };
+  }
+  if ((cmd === 'docker' || cmd === 'podman') && args[0]?.toLowerCase() === 'push') return { kind: 'remote_publish', action: 'push image' };
+  if ((cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn') && !dryRun && new Set(['publish', 'unpublish']).has((args[0] || '').toLowerCase())) {
+    return { kind: 'remote_publish', action: args[0].toLowerCase() };
+  }
+  if (cmd === 'gh' && args[0]?.toLowerCase() === 'release' && new Set(['create', 'delete', 'edit', 'upload']).has((args[1] || '').toLowerCase())) {
+    return { kind: 'remote_publish', action: `release ${args[1].toLowerCase()}` };
+  }
+  if (cmd === 'vercel' && !dryRun && !hasHelp(args)) {
+    const action = firstAction(args);
+    if (!action || new Set(['deploy', 'promote', 'rollback', 'remove']).has(action)) {
+      return { kind: 'deployment_change', action: action || 'deploy' };
+    }
+    if ((action === 'env' || action === 'alias' || action === 'domains')
+      && args.some((arg) => new Set(['add', 'rm', 'remove', 'set']).has(arg.toLowerCase()))) {
+      return { kind: 'deployment_change', action: `${action} change` };
+    }
+  }
+  return null;
+}
+
+// Preserve offsets and literal arguments while excluding example text from
+// executable call matching. Interpolations are expressions, not literal text.
+// This is a bounded lexical inspection, not a language interpreter or sandbox.
+function scriptCodeMask(source: string): Uint8Array {
+  const code = new Uint8Array(source.length).fill(1);
+  const scan = (start: number, interpolation: boolean, depth: number): number => {
+    // Retain conservative inspection of the remaining text at the nesting cap.
+    if (depth >= 32) return source.length;
+    let braces = 0;
+    let lineHasCode = interpolation;
+    for (let i = start; i < source.length;) {
+      const char = source[i];
+      if (char === '\n') { lineHasCode = false; i++; continue; }
+      if (!lineHasCode && (char === '#' || source.startsWith('//', i))) {
+        const end = source.indexOf('\n', i);
+        const next = end < 0 ? source.length : end;
+        code.fill(0, i, next);
+        i = next;
+        continue;
+      }
+      const blockEnd = source.startsWith('/*', i) ? '*/' : source.startsWith('<!--', i) ? '-->' : '';
+      if (blockEnd) {
+        const end = source.indexOf(blockEnd, i + 2);
+        const next = end < 0 ? source.length : end + blockEnd.length;
+        code.fill(0, i, next);
+        i = next;
+        continue;
+      }
+      if (!/\s/.test(char)) lineHasCode = true;
+      if (interpolation && char === '}' && braces-- === 0) return i + 1;
+      if (char === '{') braces++;
+      if (char !== '"' && char !== "'" && char !== '`') { i++; continue; }
+      const quote = char !== '`' && source.startsWith(char.repeat(3), i) ? char.repeat(3) : char;
+      const formatted = char !== '`' && /(?:^|\W)(?:f|fr|rf)$/i.test(source.slice(Math.max(0, i - 3), i));
+      let segment = i;
+      i += quote.length;
+      while (i < source.length) {
+        // Python backslashes do not escape replacement-field braces. JS
+        // template escapes do, including an escaped `${` sequence.
+        if (source[i] === '\\') { i += formatted && source[i + 1] === '{' ? 1 : 2; continue; }
+        // Do not let an unmatched quote in a trailing comment hide executable
+        // code on following lines. Multiline source uses triple/template quotes.
+        if (source[i] === '\n' && quote.length === 1 && char !== '`') break;
+        if (source.startsWith(quote, i)) { i += quote.length; break; }
+        if (formatted && source.startsWith('{{', i)) { i += 2; continue; }
+        const expression = char === '`' && source.startsWith('${', i) ? 2
+          : formatted && source[i] === '{' ? 1 : 0;
+        if (expression) {
+          code.fill(0, segment, i + expression);
+          i = scan(i + expression, true, depth + 1);
+          segment = i;
+        } else i++;
+      }
+      code.fill(0, segment, i);
+    }
+    return source.length;
+  };
+  scan(0, false, 0);
+  return code;
+}
+
+function* executableMatches(source: string, pattern: RegExp, code: Uint8Array) {
+  for (const match of source.matchAll(pattern)) {
+    if (code[match.index!]) yield match;
+  }
+}
+
+const SCRIPT_LITERAL = /(?:[rubf]{0,2})?(?:"""([\s\S]{0,4000}?)"""|'''([\s\S]{0,4000}?)'''|'((?:\\.|[^'\\\n]){0,4000})'|"((?:\\.|[^"\\\n]){0,4000})"|`((?:\\.|[^`\\]){0,4000})`)/.source;
+
+function matchedLiteral(match: RegExpMatchArray): string | undefined {
+  return match.slice(1).find(value => value !== undefined)?.replace(/\\(['"`\\])/g, '$1');
+}
+
+function literalCallArguments(source: string, callPattern: RegExp, code: Uint8Array): string[] {
+  const results: string[] = [];
+  for (const match of executableMatches(source, callPattern, code)) {
+    const value = matchedLiteral(match);
+    if (value) results.push(value);
+  }
+  return results;
+}
+
+function assignedLiteral(source: string, variable: string, code: Uint8Array): string | undefined {
+  const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp('\\b' + escaped + '\\s*=\\s*' + SCRIPT_LITERAL, 'gi');
+  for (const match of executableMatches(source, pattern, code)) return matchedLiteral(match);
+  return undefined;
+}
+
+/**
+ * Inspect script source for concrete write APIs. This intentionally requires
+ * an executable call shape (execute/exec_command/upload/HTTP verb), so a SQL
+ * migration mentioned only in a comment or README string does not prompt.
+ */
+export function classifyExternalMutationScript(sourceRaw: string, options?: { language?: 'python' }): ExternalMutationFinding[] {
+  return inspectScript(String(sourceRaw || ''), 0, options?.language);
+}
+
+function inspectScript(source: string, depth: number, language?: 'python'): ExternalMutationFinding[] {
+  const code = depth < 4 ? scriptCodeMask(source) : new Uint8Array(source.length).fill(1);
+  const resources = language === 'python' ? pythonSqliteResources(source, code) : new Map<number, SqliteResource>();
+  const findings: ExternalMutationFinding[] = [];
+  const add = (finding: ExternalMutationFinding | null) => {
+    if (!finding) return;
+    if (!findings.some((item) => item.kind === finding.kind && item.action === finding.action && item.target === finding.target
+      && item.resource?.database === finding.resource?.database)) findings.push(finding);
+  };
+  const addSql = (literal: string | undefined, at: number) => {
+    if (!literal) return;
+    const finding = sqlFinding(literal);
+    if (finding) add({ ...finding, ...(resources.has(at) ? { resource: resources.get(at)! } : {}) });
+  };
+
+  const executeCalls = new RegExp('(?:\\.\\s*(?:execute|executemany|executescript|query)|\\bmysqli_query)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
+  for (const match of executableMatches(source, executeCalls, code)) addSql(matchedLiteral(match), match.index!);
+
+  const remoteExecCalls = new RegExp('\\.\\s*(?:exec_command|execCommand)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gim');
+  for (const literal of literalCallArguments(source, remoteExecCalls, code)) {
+    add(shellLikeMutation(literal));
+    for (const interpolation of literal.matchAll(/\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}/g)) {
+      const value = assignedLiteral(source, interpolation[1], code);
+      if (value) add(sqlFinding(value) || shellLikeMutation(value));
+    }
+  }
+
+  const variableSink = /(?:\.\s*(?:execute|executemany|executescript|query|exec_command|execCommand)|\bmysqli_query)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gim;
+  for (const match of executableMatches(source, variableSink, code)) {
+    const value = assignedLiteral(source, match[1], code);
+    if (value) {
+      if (sqlFinding(value)) addSql(value, match.index!);
+      else add(shellLikeMutation(value));
+    }
+  }
+
+  if (executableMatches(source, /(?:\bsftp\s*\.\s*put|\.\s*(?:upload_file|uploadFile|put_object|upload_fileobj))\s*\(/gi, code).next().value
+    && executableMatches(source, /\b(?:sftp|paramiko|boto3|ssh2|scp)\b/gi, code).next().value) {
+    add({ kind: 'remote_file_write', action: 'upload' });
+  }
+  const httpCalls = /\b(?:requests|httpx|axios)\s*\.\s*(post|put|patch|delete)\s*\(|\bfetch\s*\([^)]{0,1000}\bmethod\s*:\s*['"](POST|PUT|PATCH|DELETE)['"]/gi;
+  for (const match of executableMatches(source, httpCalls, code)) {
+    add({ kind: 'external_api_write', action: (match[1] || match[2]).toUpperCase() });
+  }
+
+  // A literal becomes executable again at an explicit evaluation sink. Bound
+  // recursion; at the cap retain the previous conservative text inspection.
+  if (depth < 4) {
+    const evaluations = new RegExp('\\b(?:exec|eval|Function)\\s*\\(\\s*' + SCRIPT_LITERAL, 'gi');
+    const evaluated = literalCallArguments(source, evaluations, code);
+    for (const match of executableMatches(source, /\b(?:exec|eval|Function)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\b/gi, code)) {
+      const value = assignedLiteral(source, match[1], code);
+      if (value) evaluated.push(value);
+    }
+    for (const value of new Set(evaluated)) for (const finding of inspectScript(value, depth + 1)) add(finding);
+  }
+
+  return findings;
+}
+
+/** Find literal script entrypoints that the shell command will execute. */
+function referencedExecutableScriptsInternal(command: string, depth: number): string[] {
+  const results: string[] = [];
+  const add = (raw: string | undefined) => {
+    const value = String(raw || '').trim().replace(/^['"]|['"]$/g, '');
+    if (value && !results.includes(value)) results.push(value);
+  };
+  const rawWords = command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||<<<|<<-?|>>|[\r\n;&|<>]|[^\s;&|<>]+/g) || [];
+  const words = rawWords.map((raw) => /^[\r\n]$/.test(raw) ? ';' : raw.replace(/^['"]|['"]$/g, ''));
+  const separators = new Set([';', '&&', '||', '&', '|']);
+  const interpreters = /^(?:python(?:3(?:\.\d+)?)?|py|node|ruby|perl|php|bash|dash|ksh|sh|zsh|pwsh|powershell|source|\.)(?:\.exe)?$/i;
+  const posixShells = /^(?:bash|dash|ksh|sh|zsh)(?:\.exe)?$/i;
+  const powerShells = /^(?:pwsh|powershell)(?:\.exe)?$/i;
+  const scriptExtension = /\.(?:py|js|cjs|mjs|ts|rb|pl|php|sh|bash|zsh|ps1)$/i;
+  const optionsWithValues = new Set([
+    '-w', '-x', '-q', '--require', '--import', '--loader', '--conditions',
+    '-executionpolicy', '-windowstyle', '-workingdirectory',
+  ]);
+  for (let i = 0; i < words.length; i++) {
+    const current = words[i];
+    const executable = commandName(current);
+    if (scriptExtension.test(current) && (/^(?:\.\.?[\\/]|[A-Za-z]:[\\/])/.test(current) || i === 0 || separators.has(words[i - 1]))) {
+      add(current);
+      continue;
+    }
+    if (!interpreters.test(executable)) continue;
+    // An interpreter may execute a script received through a file redirect,
+    // including a file produced earlier in the same shell invocation.
+    for (let j = i + 1; j < words.length && !separators.has(words[j]); j++) {
+      if (words[j] === '<' && words[j + 1]) add(words[++j]);
+    }
+    if (depth < 4 && (posixShells.test(executable) || powerShells.test(executable))) {
+      const commandIndex = words.findIndex((word, index) => (
+        index > i && (posixShells.test(executable)
+          ? /^-[a-z]*c[a-z]*$/i.test(word)
+          : /^(?:-command|-c)$/i.test(word))
+      ));
+      if (commandIndex >= 0 && words[commandIndex + 1]) {
+        for (const nested of referencedExecutableScriptsInternal(words[commandIndex + 1], depth + 1)) add(nested);
+        continue;
+      }
+    }
+    for (let j = i + 1; j < words.length && !separators.has(words[j]); j++) {
+      const candidate = words[j];
+      const lower = candidate.toLowerCase();
+      if (lower === '-c' || lower === '--command' || lower === '-e' || lower === '--eval' || lower === '-m' || lower === '--module') break;
+      if ((lower === '-file' || lower === '-f') && words[j + 1]) {
+        add(words[j + 1]);
+        break;
+      }
+      if (optionsWithValues.has(lower)) { j++; continue; }
+      if (['<', '>', '>>', '<<', '<<-', '<<<'].includes(candidate)) { j++; continue; }
+      if (candidate.startsWith('-')) continue;
+      add(candidate);
+      break;
+    }
+  }
+  return results;
+}
+
+export function referencedExecutableScripts(command: string): string[] {
+  return referencedExecutableScriptsInternal(command, 0);
+}

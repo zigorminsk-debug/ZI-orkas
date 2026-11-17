@@ -1,0 +1,405 @@
+name: Build & Release ZI-Orkas
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'arena/**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish or update a GitHub Release with all installers'
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release tag name (e.g. v2026.11.16; leave blank for v<package.json>)'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark GitHub Release as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: write
+
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  verify:
+    name: Verify Contracts & Typecheck
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Read app version & target release tag
+        id: meta
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="v${VER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies (lockfile-strict)
+        run: npm ci --ignore-scripts
+
+      - name: Run typecheck & security/resource gates
+        run: |
+          npm run typecheck
+          npm run web-app-sdk:check
+          npm run builtin:manifest:check
+          npm run officecli:policy-check
+          node -e "require('./scripts/media-transfer-policy.cjs').verifyMediaTransferPolicy(process.cwd())"
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: win32-x64
+            label: Windows x64 (NSIS .exe)
+            os: windows-2022
+            platform: win32
+            arch: x64
+            officecli: win32-x64
+            eb_args: --win nsis --x64
+          - id: darwin-arm64
+            label: macOS Apple Silicon (.dmg + .zip)
+            os: macos-15
+            platform: darwin
+            arch: arm64
+            officecli: darwin-arm64
+            eb_args: --mac dmg zip --arm64
+          - id: darwin-x64
+            label: macOS Intel x64 (.dmg + .zip)
+            os: macos-15
+            platform: darwin
+            arch: x64
+            officecli: darwin-x64
+            eb_args: --mac dmg zip --x64
+          - id: linux-x64
+            label: Linux x64 (.AppImage + .deb)
+            os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            officecli: linux-x64
+            eb_args: --linux AppImage deb --x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux packaging & smoke dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 rpm libfuse2 xvfb \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils \
+            libatspi2.0-0 libdrm2 libgbm1 libasound2
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Show Node & npm versions
+        shell: bash
+        run: node -v && npm -v
+
+      - name: Cache bundled runtimes & Whisper/LibRaw archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/orkas-runtime
+            .cache/phone-passkey
+          key: zi-orkas-runtime-${{ matrix.id }}-${{ hashFiles('package-lock.json', 'vendor/**') }}
+          restore-keys: |
+            zi-orkas-runtime-${{ matrix.id }}-
+
+      - name: Install npm dependencies
+        shell: bash
+        run: npm ci
+
+      - name: Prepare target native dependencies (${{ matrix.id }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.id }}" in
+            win32-x64)
+              node scripts/prepare-win-native-deps.cjs
+              node scripts/ensure-sqlite-electron-abi.mjs
+              ;;
+            darwin-arm64)
+              node scripts/prepare-mac-native-deps.cjs --arch arm64
+              node scripts/ensure-sqlite-electron-abi.mjs
+              ;;
+            darwin-x64)
+              node scripts/prepare-mac-native-deps.cjs --arch x64
+              ELECTRON_VER="$(node -p "require('./node_modules/electron/package.json').version")"
+              SDK_ROOT="$(xcrun --sdk macosx --show-sdk-path)"
+              export SDKROOT="$SDK_ROOT"
+              export CPLUS_INCLUDE_PATH="${SDK_ROOT}/usr/include/c++/v1${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+              node ./node_modules/@electron/rebuild/lib/cli.js \
+                --version "$ELECTRON_VER" \
+                --module-dir . \
+                --which-module better-sqlite3 \
+                --arch x64 \
+                --force \
+                --build-from-source
+              rm -f node_modules/better-sqlite3/build/Release/test_extension.node
+              lipo -archs node_modules/better-sqlite3/build/Release/better_sqlite3.node | grep -qw x86_64
+              ;;
+            linux-x64)
+              node scripts/prepare-linux-native-deps.cjs --arch x64
+              node scripts/ensure-sqlite-electron-abi.mjs
+              ;;
+          esac
+
+      - name: Ensure offline BGE embedding model & OfficeCLI binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/fetch-embedding-model.mjs
+          node scripts/fetch-officecli.cjs --platform=${{ matrix.officecli }} --prune
+          if [[ "${{ matrix.arch }}" == "arm64" || "${{ matrix.platform }}" != "darwin" ]]; then
+            node bin/officecli-policy-gate.cjs --require-host-binary
+          else
+            node bin/officecli-policy-gate.cjs
+          fi
+
+      - name: Install isolated electron-builder@26.18.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          EB_DIR="${RUNNER_TEMP}/zi-orkas-eb"
+          mkdir -p "$EB_DIR"
+          npm --prefix "$EB_DIR" install --no-save electron-builder@26.18.0
+          echo "EB_CLI=${EB_DIR}/node_modules/electron-builder/cli.js" >> "$GITHUB_ENV"
+
+      - name: Package ZI-Orkas desktop artifacts (${{ matrix.id }})
+        shell: bash
+        env:
+          ORKAS_FORCE_ADHOC_CODESIGN: '1'
+        run: |
+          set -euo pipefail
+          node "$EB_CLI" ${{ matrix.eb_args }} \
+            --publish never \
+            -c.npmRebuild=false \
+            -c.mac.forceCodeSigning=false
+          ls -lh dist/
+
+      - name: Packaged application launch & KB vector smoke check
+        shell: bash
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="${RUNNER_TEMP}/zi-orkas-smoke-${{ matrix.id }}"
+          rm -rf "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR"
+          export SMOKE_FILE="${SMOKE_DIR}/launch-smoke.json"
+          export TARGET_ID="${{ matrix.id }}"
+
+          if [[ "$TARGET_ID" == "darwin-x64" ]]; then
+            if ! /usr/bin/pgrep -q oahd; then
+              sudo softwareupdate --install-rosetta --agree-to-license || true
+            fi
+          fi
+
+          node -e '
+            const { spawnSync } = require("node:child_process");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const id = process.env.TARGET_ID;
+            const smokeFile = path.resolve(process.env.SMOKE_FILE);
+            let cmd, args;
+            if (id === "win32-x64") {
+              cmd = path.resolve("dist/win-unpacked/ZI-Orkas.exe");
+              args = [];
+            } else if (id === "darwin-arm64") {
+              cmd = path.resolve("dist/mac-arm64/ZI-Orkas.app/Contents/MacOS/ZI-Orkas");
+              args = [];
+            } else if (id === "darwin-x64") {
+              cmd = "arch";
+              args = ["-x86_64", path.resolve("dist/mac/ZI-Orkas.app/Contents/MacOS/ZI-Orkas")];
+            } else if (id === "linux-x64") {
+              cmd = "xvfb-run";
+              args = ["-a", path.resolve("dist/linux-unpacked/zi-orkas"), "--no-sandbox", "--disable-gpu"];
+            } else {
+              throw new Error("Unknown target: " + id);
+            }
+            console.log("[smoke] launching:", cmd, args.join(" "));
+            const res = spawnSync(cmd, args, {
+              stdio: "inherit",
+              timeout: 240_000,
+              env: {
+                ...process.env,
+                ORKAS_PACKAGED_LAUNCH_SMOKE_FILE: smokeFile,
+                ORKAS_PACKAGED_LAUNCH_STARTED_AT_MS: String(Date.now()),
+              },
+            });
+            console.log("[smoke] exit:", res.status, "signal:", res.signal || "none");
+            if (!fs.existsSync(smokeFile)) {
+              throw new Error("[smoke] launch smoke file was not produced: " + smokeFile);
+            }
+            const proof = JSON.parse(fs.readFileSync(smokeFile, "utf8"));
+            console.log("=== Packaged Launch Smoke Proof (" + id + ") ===");
+            console.log(JSON.stringify(proof, null, 2));
+          '
+
+      - name: Collect distributable files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          for f in dist/*.exe dist/*.dmg dist/*.zip dist/*.AppImage dist/*.deb; do
+            case "$(basename "$f")" in
+              *.blockmap) continue ;;
+            esac
+            cp -v "$f" release-assets/
+          done
+          for marker in dist/*/.orkas-native-deps-verified.json; do
+            cp -v "$marker" "release-assets/native-gate-${{ matrix.id }}.json"
+          done
+          ls -lh release-assets/
+          COUNT="$(find release-assets -maxdepth 1 -type f ! -name '*.json' | wc -l | tr -d ' ')"
+          if [[ "$COUNT" -lt 1 ]]; then
+            echo "No installer artifacts found for ${{ matrix.id }}" >&2
+            exit 1
+          fi
+
+      - name: Upload ${{ matrix.id }} artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZI-Orkas-${{ matrix.id }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Checksums & GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: collected
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt & build summary
+        run: |
+          set -euo pipefail
+          mkdir -p installers
+          shopt -s nullglob
+          for f in collected/*.exe collected/*.dmg collected/*.zip collected/*.AppImage collected/*.deb; do
+            mv "$f" installers/
+          done
+          cd installers
+          sha256sum * | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          {
+            echo "## ZI-Orkas v${{ needs.verify.outputs.version }} — Cross-Platform Build Summary"
+            echo ""
+            echo "| File | Size | SHA-256 |"
+            echo "| --- | --- | --- |"
+            for f in *; do
+              [[ "$f" == "SHA256SUMS.txt" ]] && continue
+              SIZE="$(du -h "$f" | cut -f1)"
+              HASH="$(sha256sum "$f" | awk '{print $1}')"
+              echo "| \`$f\` | $SIZE | \`$HASH\` |"
+            done
+            echo ""
+            echo "All 4 targets passed native dependency gates, packaged resource/entrypoint contracts, and live Electron + SQLite + BGE vector KB launch smoke checks."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unified SHA256SUMS.txt artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZI-Orkas-SHA256SUMS
+          path: installers/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+          {
+            echo "## ZI-Orkas ${TAG}"
+            echo ""
+            echo "Full-featured local-first multi-agent desktop AI team for **Windows**, **macOS (Apple Silicon & Intel)**, and **Linux** — including self-hosted GitHub Pages web-app publishing, standalone ZIP export, project collaboration bundles, and cross-device workspace sync snapshots."
+            echo ""
+            echo "### Downloads"
+            echo "- **Windows 10/11 (x64)**: \`ZI-Orkas-Setup-${VERSION}-win-x64.exe\`"
+            echo "- **macOS 13+ (Apple Silicon M1–M4)**: \`ZI-Orkas-${VERSION}-mac-arm64.dmg\` / \`.zip\`"
+            echo "- **macOS 13+ (Intel x64)**: \`ZI-Orkas-${VERSION}-mac-x64.dmg\` / \`.zip\`"
+            echo "- **Linux (x64, glibc >= 2.34 / Ubuntu 22.04+)**: \`ZI-Orkas-${VERSION}-linux-x64.AppImage\` / \`.deb\`"
+            echo ""
+            echo "### macOS First Launch Note (Ad-hoc Signed Build)"
+            echo "\`\`\`bash"
+            echo "xattr -dr com.apple.quarantine /Applications/ZI-Orkas.app"
+            echo "\`\`\`"
+            echo ""
+            echo "### SHA-256 Checksums"
+            echo "\`\`\`text"
+            cat installers/SHA256SUMS.txt
+            echo "\`\`\`"
+          } > "$NOTES_FILE"
+
+          EXTRA_FLAGS=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            EXTRA_FLAGS+=(--prerelease)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" installers/* --clobber
+            gh release edit "$TAG" --title "ZI-Orkas ${TAG}" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" installers/* \
+              --target "${{ github.sha }}" \
+              --title "ZI-Orkas ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              "${EXTRA_FLAGS[@]}"
+          fi

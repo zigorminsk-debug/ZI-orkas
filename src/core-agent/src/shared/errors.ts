@@ -1,0 +1,555 @@
+import { providerCredentialFailure, providerErrorFacts } from "./provider-error-facts.js";
+
+/** Base error class for core-agent errors. */
+export class CoreAgentError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly cause?: Error,
+  ) {
+    super(message);
+    this.name = "CoreAgentError";
+  }
+}
+
+export class AuthError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "AUTH_ERROR", cause);
+    this.name = "AuthError";
+  }
+}
+
+/** Host marker for a committed model call; only AgentRunner may recover it. */
+export const COMMITTED_STREAM_RATE_LIMIT_CODE = "COMMITTED_STREAM_RATE_LIMIT";
+
+export class RateLimitError extends CoreAgentError {
+  public readonly retryAfterMs?: number;
+
+  constructor(message: string, retryAfterMs?: number, cause?: Error) {
+    super(message, "RATE_LIMIT", cause);
+    this.name = "RateLimitError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export class ContextOverflowError extends CoreAgentError {
+  constructor(message: string, cause?: Error, public readonly admissionChecked = false) {
+    super(message, "CONTEXT_OVERFLOW", cause);
+    this.name = "ContextOverflowError";
+  }
+}
+
+/** The provider's first candidate changed after this request was prepared, and
+ * the new one was skipped only for capacity. Core prepares the same request
+ * once more for it; `cause` is the failure to surface if that cannot help. */
+export class ProviderCandidateChangedError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "PROVIDER_CANDIDATE_CHANGED", cause);
+    this.name = "ProviderCandidateChangedError";
+  }
+}
+
+export class OutputLimitError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "OUTPUT_LIMIT", cause);
+    this.name = "OutputLimitError";
+  }
+}
+
+export class ProviderError extends CoreAgentError {
+  public readonly provider: string;
+  public readonly statusCode?: number;
+
+  constructor(message: string, provider: string, statusCode?: number, cause?: Error) {
+    super(message, "PROVIDER_ERROR", cause);
+    this.name = "ProviderError";
+    this.provider = provider;
+    this.statusCode = statusCode;
+  }
+}
+
+/** Storage retries belong to Session, never to provider/tool replay. */
+export class SessionPersistenceError extends CoreAgentError {
+  constructor(public readonly storageCode?: string) {
+    super("Task progress could not be saved. Restore available storage and retry to continue.", "SESSION_PERSISTENCE_FAILED");
+    this.name = "SessionPersistenceError";
+  }
+}
+
+/** Structural check crosses the host CommonJS/core ESM module boundary. */
+export function isToolResultPersistenceError(err: unknown): err is Error & { code: string } {
+  return errorCodeOf(err) === "TOOL_RESULT_PERSISTENCE_FAILED";
+}
+
+export class StorageFullError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "STORAGE_FULL", cause);
+    this.name = "StorageFullError";
+  }
+}
+
+export class TimeoutError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "TIMEOUT", cause);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Code carried by `RetryExhaustedError`; also honored structurally (see
+ * `classifyRetryableErrorWithPolicy`) so the classification survives module
+ * duplication across the main-process / #core-agent import boundary, where
+ * `instanceof` can fail. */
+export const RETRY_EXHAUSTED_CODE = "RETRY_EXHAUSTED";
+
+/**
+ * A failure whose inner retry budget is already spent. Thrown by layers that
+ * sit BELOW the agent runner and run their own transient-failure retries —
+ * e.g. the rotating provider, which retries each credential candidate on
+ * network-class errors before rotating to the next one. Classified
+ * non-retryable: the transient window was fully probed where the failure
+ * happened, so an outer runner retry would only replay the whole rotation
+ * (candidates × per-candidate retries) as pure amplification with no new
+ * chance of success.
+ */
+export class RetryExhaustedError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, RETRY_EXHAUSTED_CODE, cause);
+    this.name = "RetryExhaustedError";
+  }
+}
+
+export function formatError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return String(err);
+}
+
+/** Return only a bounded machine error code for logs. Error messages commonly
+ * embed credentials, provider payloads, or local paths and are not log-safe. */
+export function errorCodeForLog(err: unknown): string {
+  if (!err || typeof err !== "object") return "UNKNOWN";
+  const code = (err as Record<string, unknown>).code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)
+    ? code
+    : "UNKNOWN";
+}
+
+export type RetryableErrorKind =
+  | "rate_limit"
+  | "timeout"
+  | "connection_dropped"
+  | "service_unavailable"
+  | "server_error"
+  | "network";
+
+export interface RetryErrorPolicyConfig {
+  permanent_statuses: number[];
+  /** Deprecated wire compatibility only; never used for retry decisions. */
+  permanent_message_patterns: string[];
+  permanent_code_patterns: string[];
+}
+
+const TRANSIENT_PROVIDER_STATUS_FOR_REASON = new Set([
+  408, // request timeout
+  409, // conflict / transient write race on some gateways
+  425, // too early
+  429,
+  500,
+  502,
+  503,
+  504,
+  520,
+  521,
+  522,
+  523,
+  524,
+  529,
+  598,
+  599,
+]);
+
+const DEFAULT_PERMANENT_PROVIDER_STATUS = [
+  400, // bad request / malformed payload
+  401,
+  402,
+  403,
+  404,
+  405,
+  406,
+  410,
+  411,
+  413,
+  414,
+  415,
+  422,
+] as const;
+
+const TRANSIENT_CODE_RE =
+  /^(?:UND_ERR_(?:SOCKET|CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT)|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE|PROVIDER_EMPTY_TRANSPORT)$/i;
+
+const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
+  [
+    "service_unavailable",
+    /\b(502|503|504|520|521|522|523|524|529|598|599)\b|bad gateway|service unavailable|gateway timeout|overloaded|upstream.?connect|connection.?refused/i,
+  ],
+  [
+    "timeout",
+    /\bcodex sse response headers timed out after \d+ms\b|\bsse response headers timed out\b|\bresponse headers? (timed out|timeout)\b|\bheaders? (timed out|timeout)\b|\brequest timed out\b|\btimed out\b|\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/i,
+  ],
+  [
+    "connection_dropped",
+    /\bterminated\b|\bfetch failed\b|stream ended without finish_reason|missing finish_reason|without finish_reason|missing final (chunk|event)|without final (chunk|event)|socket (hang up|closed|close)|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|\b(read )?(econnreset|epipe)\b|\bund_err_socket\b/i,
+  ],
+  [
+    "network",
+    /network.?(error|failure)|enetunreach|enetdown|eai_again|econnrefused/i,
+  ],
+  [
+    "server_error",
+    /\b500\b|internal server error/i,
+  ],
+];
+
+const DEFAULT_PERMANENT_CODE_PATTERNS = [
+  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|UND_ERR_ABORTED|UND_ERR_INVALID_ARG|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
+];
+
+export const DEFAULT_RETRY_ERROR_POLICY: RetryErrorPolicyConfig = Object.freeze({
+  permanent_statuses: [...DEFAULT_PERMANENT_PROVIDER_STATUS],
+  permanent_message_patterns: [],
+  permanent_code_patterns: [...DEFAULT_PERMANENT_CODE_PATTERNS],
+});
+
+interface CompiledRetryErrorPolicy {
+  config: RetryErrorPolicyConfig;
+  permanentProviderStatus: Set<number>;
+  permanentCodePatterns: RegExp[];
+}
+
+function retryKindForProviderStatus(statusCode: number | undefined): RetryableErrorKind | null {
+  if (!statusCode || !TRANSIENT_PROVIDER_STATUS_FOR_REASON.has(statusCode)) return null;
+  if (statusCode === 429) return "rate_limit";
+  if (statusCode === 408 || statusCode === 524 || statusCode === 598 || statusCode === 599) return "timeout";
+  if (statusCode === 502 || statusCode === 503 || statusCode === 504 || statusCode === 520 || statusCode === 521 || statusCode === 522 || statusCode === 523 || statusCode === 529) {
+    return "service_unavailable";
+  }
+  return "server_error";
+}
+
+function cloneRetryErrorPolicyConfig(config: RetryErrorPolicyConfig): RetryErrorPolicyConfig {
+  return {
+    permanent_statuses: [...config.permanent_statuses],
+    permanent_message_patterns: [...config.permanent_message_patterns],
+    permanent_code_patterns: [...config.permanent_code_patterns],
+  };
+}
+
+function normalizePatternList(value: unknown, fallback: readonly string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  return value
+    .map((item) => typeof item === "string" ? item.trim() : "")
+    .filter(Boolean);
+}
+
+function normalizeStatusList(value: unknown, fallback: readonly number[]): number[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const item of value) {
+    const n = typeof item === "number" ? item : Number(item);
+    if (!Number.isInteger(n) || n < 100 || n > 599 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function normalizeRetryErrorPolicyConfig(config?: Partial<RetryErrorPolicyConfig> | null): RetryErrorPolicyConfig {
+  const raw = config && typeof config === "object" ? config : {};
+  return {
+    permanent_statuses: normalizeStatusList(raw.permanent_statuses, DEFAULT_RETRY_ERROR_POLICY.permanent_statuses),
+    permanent_message_patterns: normalizePatternList(raw.permanent_message_patterns, DEFAULT_RETRY_ERROR_POLICY.permanent_message_patterns),
+    permanent_code_patterns: normalizePatternList(raw.permanent_code_patterns, DEFAULT_RETRY_ERROR_POLICY.permanent_code_patterns),
+  };
+}
+
+function compilePattern(source: string): RegExp | null {
+  try {
+    return new RegExp(source, "i");
+  } catch {
+    return null;
+  }
+}
+
+function compileRetryErrorPolicy(config?: Partial<RetryErrorPolicyConfig> | null): CompiledRetryErrorPolicy {
+  const normalized = normalizeRetryErrorPolicyConfig(config);
+  return {
+    config: normalized,
+    permanentProviderStatus: new Set(normalized.permanent_statuses),
+    permanentCodePatterns: normalized.permanent_code_patterns.map(compilePattern).filter(Boolean) as RegExp[],
+  };
+}
+
+let activeRetryErrorPolicy = compileRetryErrorPolicy(DEFAULT_RETRY_ERROR_POLICY);
+
+export function configureRetryErrorPolicy(config?: Partial<RetryErrorPolicyConfig> | null): void {
+  activeRetryErrorPolicy = compileRetryErrorPolicy(config ?? DEFAULT_RETRY_ERROR_POLICY);
+}
+
+export function getRetryErrorPolicy(): RetryErrorPolicyConfig {
+  return cloneRetryErrorPolicyConfig(activeRetryErrorPolicy.config);
+}
+
+function retryKindForMessage(message: string): RetryableErrorKind | null {
+  for (const [kind, pattern] of TRANSIENT_MESSAGE_REASON_PATTERNS) {
+    if (pattern.test(message)) return kind;
+  }
+  return null;
+}
+
+function errorMessageOf(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message || "";
+  if (err && typeof err === "object") {
+    const rec = err as Record<string, unknown>;
+    if (typeof rec.message === "string") return rec.message;
+    if (typeof rec.error === "string") return rec.error;
+  }
+  return "";
+}
+
+function errorCodeOf(err: unknown): string {
+  if (!err || typeof err !== "object") return "";
+  const rec = err as Record<string, unknown>;
+  return typeof rec.code === "string" ? rec.code : "";
+}
+
+function errorStatusOf(err: unknown): number | undefined {
+  if (err instanceof ProviderError) return err.statusCode;
+  if (!err || typeof err !== "object") return undefined;
+  const rec = err as Record<string, unknown>;
+  const raw = rec.statusCode ?? rec.status ?? rec.httpStatus ?? rec.http_status;
+  const status = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(status) ? status : undefined;
+}
+
+function errorCauseOf(err: unknown): unknown {
+  if (!err || typeof err !== "object") return null;
+  const rec = err as Record<string, unknown>;
+  if ("cause" in rec) return rec.cause;
+  if (rec.error && typeof rec.error === "object") return rec.error;
+  return null;
+}
+
+/** HTTP status of the provider response, searched through the wrapper/cause
+ * chain (SDK adapters wrap the original response inconsistently). Used to
+ * attribute terminal run failures to an endpoint-level HTTP rejection. */
+export function providerHttpStatusOf(err: unknown): number | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    const status = errorStatusOf(current);
+    if (typeof status === "number" && status >= 100 && status <= 599) return status;
+    current = errorCauseOf(current);
+  }
+  return undefined;
+}
+
+/** A structured HTTP 451 rejection is terminal, independently of retry policy.
+ * A transient wrapper must not reopen retries or route around that rejection. */
+export function isProviderLegalRestrictionError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    if (errorStatusOf(current) === 451) return true;
+    current = errorCauseOf(current);
+  }
+  return false;
+}
+
+const PROVIDER_SAFETY_CODE_RE =
+  /^(?:PROVIDER_EMPTY_SAFETY|CONTENT[_\s-]?(?:FILTER|POLICY(?:[_\s-]?VIOLATION)?)|SAFETY(?:[_\s-]?VIOLATION)?|RESPONSIBLE[_\s-]?AI[_\s-]?POLICY[_\s-]?VIOLATION|RESPONSIBLEAIPOLICYVIOLATION|PROHIBITED[_\s-]?CONTENT|PROMPT[_\s-]?(?:FILTER|BLOCKED)|MODERATION[_\s-]?(?:BLOCKED|REJECTED)|BLOCKED[_\s-]?BY[_\s-]?POLICY|BLOCKLIST|IMAGE[_\s-]?SAFETY)$/i;
+
+const PROVIDER_SAFETY_MESSAGE_RE =
+  /content[_\s-]?(?:policy|filter|moderation)|content management policy|responsible[_\s-]?ai[_\s-]?policy|prohibited[_\s-]?content|(?:prompt|request|response|candidate).{0,100}(?:blocked|filtered).{0,100}(?:safety|policy|moderation)|(?:prompt|request|response|candidate).{0,100}rejected.{0,100}(?:safety (?:policy|filter|reason)|content (?:policy|filter)|moderation)|(?:safety|moderation) (?:policy|filter).{0,100}(?:blocked|filtered|rejected|violation)|safety[_\s-]?violation|blocked (?:by|due to|for|because of).{0,40}(?:safety|content) (?:policy|filter|reasons?)/i;
+
+/**
+ * Detect a model/provider safety decision independently from the mutable
+ * retry-policy blacklist.
+ *
+ * A deployment may replace that blacklist at runtime, but it must never turn
+ * a provider refusal into a transient network failure and retry or rotate to
+ * another model. Provider SDKs are inconsistent about whether they preserve
+ * status, code, message, or a nested `error`, so inspect all of those shapes.
+ */
+export function isProviderSafetyError(err: unknown): boolean {
+  const pending: unknown[] = [err];
+  const seen = new Set<unknown>();
+  let inspected = 0;
+
+  while (pending.length > 0 && inspected < 16) {
+    const cur = pending.shift();
+    if (cur == null || seen.has(cur)) continue;
+    seen.add(cur);
+    inspected++;
+
+    const code = errorCodeOf(cur);
+    if (code && PROVIDER_SAFETY_CODE_RE.test(code)) return true;
+
+    const message = errorMessageOf(cur);
+    if (message && (PROVIDER_SAFETY_CODE_RE.test(message.trim()) || PROVIDER_SAFETY_MESSAGE_RE.test(message))) {
+      return true;
+    }
+
+    if (cur && typeof cur === "object") {
+      const rec = cur as Record<string, unknown>;
+      if (rec.cause != null) pending.push(rec.cause);
+      if (rec.error != null && rec.error !== rec.cause) pending.push(rec.error);
+    }
+  }
+
+  return false;
+}
+
+const STORAGE_FULL_CODE_RE = /^(?:ENOSPC|SQLITE_FULL|STORAGE_FULL|E_STORAGE_FULL|ERR_FILE_NO_SPACE)$/i;
+const STORAGE_FULL_MESSAGE_RE =
+  /\bno space left on device\b|\bdatabase or disk is full\b|\bnot enough space on the disk\b|\bdisk is full\b|\bstorage is full\b|\bERR_FILE_NO_SPACE\b/i;
+
+/** Detect an exhausted-storage failure through wrappers and cause chains.
+ *
+ * This is intentionally a hard runtime rule rather than part of the
+ * server-configurable retry policy: retrying or switching model candidates
+ * cannot restore writable space and only adds latency and duplicate spend. */
+export function isStorageFullError(err: unknown, includeDisplayText = true): boolean {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur && depth < 8) {
+    if (errorStatusOf(cur) === 507) return true;
+
+    const code = errorCodeOf(cur);
+    if (code && STORAGE_FULL_CODE_RE.test(code)) return true;
+
+    const message = errorMessageOf(cur);
+    if (includeDisplayText && message && STORAGE_FULL_MESSAGE_RE.test(message)) return true;
+
+    cur = errorCauseOf(cur);
+    depth++;
+  }
+  return false;
+}
+
+const TERMINAL_RECOVERY_CODE_RE = /^(?:CONTEXT_OVERFLOW|context_length_exceeded|OUTPUT_LIMIT|RETRY_EXHAUSTED|SESSION_PERSISTENCE_FAILED|TASK_TOKEN_LIMIT_REACHED|TOOL_RESULT_PERSISTENCE_FAILED|ABORT_ERR|UND_ERR_ABORTED|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|PROVIDER_(?:OUTPUT_UNCERTAIN|NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|RETRIES_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED))$/i;
+
+/** Hard runtime barriers also apply when an adapter proves a remote rejection.
+ * Authentication itself is recovered by the credential owner, before Runner. */
+export function isTerminalRecoveryError(err: unknown): boolean {
+  return isProviderLegalRestrictionError(err) || isProviderSafetyError(err) || isStorageFullError(err, false)
+    || providerErrorFacts(err, false).codes.some(code => TERMINAL_RECOVERY_CODE_RE.test(code));
+}
+
+function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknown): boolean {
+  const { codes } = providerErrorFacts(err, false);
+  let current = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    const status = errorStatusOf(current);
+    if (status !== undefined && policy.permanentProviderStatus.has(status)) return true;
+    current = errorCauseOf(current);
+  }
+  return codes.some(code =>
+    code === 'AUTH_ERROR' || TERMINAL_RECOVERY_CODE_RE.test(code)
+    || policy.permanentCodePatterns.some(pattern => pattern.test(code)));
+}
+
+/** Legacy display normalization only. Never use prose to decide retry/rotation. */
+export function classifyTransientNetworkErrorForDisplay(err: unknown): RetryableErrorKind | null {
+  let cur = err;
+  for (let depth = 0; cur && depth < 8; depth++) {
+    const kind = retryKindForMessage(errorMessageOf(cur));
+    if (kind) return kind;
+    cur = errorCauseOf(cur);
+  }
+  return classifyTransientNetworkError(err);
+}
+
+export function classifyTransientNetworkError(err: unknown): RetryableErrorKind | null {
+  return classifyTransientNetworkErrorWithPolicy(err);
+}
+
+export function classifyTransientNetworkErrorWithPolicy(
+  err: unknown,
+  _config?: Partial<RetryErrorPolicyConfig> | null,
+): RetryableErrorKind | null {
+  const { status, codes } = providerErrorFacts(err, false);
+  const statusKind = retryKindForProviderStatus(status);
+  if (statusKind) return statusKind;
+  for (const code of codes) {
+    if (code === "TIMEOUT" || /^(?:ETIMEDOUT|UND_ERR_(?:CONNECT|HEADERS|BODY)_TIMEOUT)$/i.test(code)) return "timeout";
+    if (TRANSIENT_CODE_RE.test(code)) {
+      if (/^(?:ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EAI_AGAIN)$/i.test(code)) return "network";
+      return "connection_dropped";
+    }
+  }
+  return null;
+}
+
+/** Only explicit throttling ends a run as a rate-limit failure. */
+export function isProviderRateLimitError(err: unknown): boolean {
+  return !isProviderSafetyError(err) && providerCredentialFailure(err, false) === "rate_limit";
+}
+
+export function classifyRetryableError(err: unknown): RetryableErrorKind | null {
+  return classifyRetryableErrorWithPolicy(err, activeRetryErrorPolicy.config);
+}
+
+export function classifyRetryableErrorWithPolicy(
+  err: unknown,
+  config?: Partial<RetryErrorPolicyConfig> | null,
+): RetryableErrorKind | null {
+  const policy = config ? compileRetryErrorPolicy(config) : activeRetryErrorPolicy;
+  if (err == null || isProviderLegalRestrictionError(err) || isProviderRateLimitError(err)) return null;
+  if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError || err instanceof StorageFullError) return null;
+
+  // Retry budget already spent below us (for example after provider rotation).
+  // Check the structural code as well as instanceof so duplicated module loads
+  // cannot silently re-enable the outer retry loop.
+  if (
+    err instanceof RetryExhaustedError
+    || errorCodeOf(err) === "SESSION_PERSISTENCE_FAILED"
+    || errorCodeOf(err) === "TASK_TOKEN_LIMIT_REACHED"
+    || isToolResultPersistenceError(err)
+    || errorCodeOf(err) === RETRY_EXHAUSTED_CODE
+    || errorCodeOf(err) === "PROVIDER_NETWORK_EXHAUSTED"
+    || errorCodeOf(err) === "PROVIDER_RETRIES_EXHAUSTED"
+  ) return null;
+
+  // Provider safety decisions are never retryable. This is a hard product
+  // invariant rather than a server-configurable policy entry: retrying or
+  // rotating could bypass the selected provider's safeguard.
+  if (isProviderSafetyError(err)) return null;
+
+  // Storage exhaustion is never retryable, even when a runtime policy
+  // replaces the ordinary permanent-status/message/code blacklists.
+  if (isStorageFullError(err, false)) return null;
+
+  // Structured permanent facts take precedence over transient wrappers.
+  if (providerCredentialFailure(err, false)) return null;
+  if (hasPermanentFailureSignal(policy, err)) return null;
+
+  const transientKind = classifyTransientNetworkError(err);
+  if (transientKind) return transientKind;
+
+  if (err instanceof TimeoutError) return "timeout";
+
+  // Default to retrying unknown model/provider/runtime failures. The
+  // blacklist above guards deterministic failures; abrupt termination is
+  // worse than a possible duplicate partial response.
+  return "network";
+}
+
+export function isRetryableError(err: unknown): boolean {
+  return classifyRetryableError(err) !== null;
+}
+
+/** Detect transient status/code evidence through bounded SDK cause chains. */
+export function isTransientNetworkError(err: unknown): boolean {
+  return classifyTransientNetworkError(err) !== null;
+}

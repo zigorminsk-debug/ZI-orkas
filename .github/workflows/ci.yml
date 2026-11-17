@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches-ignore:
+      - 'gh-pages'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck & Packaging Contracts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies (lockfile-strict)
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck (main + core-agent)
+        run: npm run typecheck
+
+      - name: Check Web App SDK documentation contract
+        run: npm run web-app-sdk:check
+
+      - name: Check built-in marketplace & skill manifest
+        run: npm run builtin:manifest:check
+
+      - name: Check OfficeCLI security & runtime policy
+        run: npm run officecli:policy-check
+
+      - name: Check media transfer, renderer JS & cross-platform gates
+        run: |
+          set -euo pipefail
+          for f in src/renderer/modules/*.js scripts/*.cjs bin/*.cjs; do
+            [ -f "$f" ] && node --check "$f"
+          done
+          node -e "
+            require('./scripts/media-transfer-policy.cjs').verifyMediaTransferPolicy(process.cwd());
+            const npg = require('./bin/native-package-gate.cjs');
+            const pdg = require('./bin/packaged-dependency-gate.cjs');
+            for (const [p, a] of [['win32','x64'],['darwin','arm64'],['darwin','x64'],['linux','x64']]) {
+              const key = p + '-' + a;
+              if (!pdg.TARGETS.has(key)) throw new Error('Missing dependency target: ' + key);
+              npg.sharpPreparationFiles(p, a, '0.35.5');
+              npg.requiredNativeVerificationEntries(p, a);
+            }
+            console.log('[ci] verified all 4 platform contracts successfully');
+          "

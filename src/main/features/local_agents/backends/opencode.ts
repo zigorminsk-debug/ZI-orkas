@@ -1,0 +1,532 @@
+/**
+ * OpenCode CLI backend.
+ *
+ * OpenCode runs through its one-shot NDJSON transport in automatic mode:
+ *
+ *   opencode run --auto --format json [--standalone] [--dir <absolute-cwd>] [--session <id>]
+ *
+ * The run protocol cannot carry an interactive permission decision back to
+ * the CLI. Orkas therefore treats this adapter as fixed full access instead
+ * of presenting an approval selector that could leave the process blocked.
+ *
+ * Notes:
+ *   - Prompt is sent over stdin, avoiding OS command-line length limits and
+ *     keeping user content out of process arguments.
+ *   - The selected project directory is passed explicitly because OpenCode
+ *     otherwise prefers an inherited PWD over the process cwd. 1.x takes
+ *     `--dir`; 2.x removed it from `run` and rejects the whole invocation, so
+ *     the flag follows `run --help` and PWD carries the directory instead.
+ *   - 2.x `run` attaches to a shared background service when one is running.
+ *     That service never receives this run's environment (Orkas bridge MCP
+ *     config, PWD), so 2.x gets `--standalone`: a private per-run server.
+ *   - Model selection is left to OpenCode's own configuration.
+ *   - Resume: `--session <id>` (different flag name from claude).
+ *   - Output: NDJSON events on stdout. We care about:
+ *       step_start, text (part.text), tool_use (part.tool/callID/state),
+ *       error (error.data.message), step_finish (token usage).
+ *   - sessionID may appear at top-level event or under part.
+ */
+
+import * as path from 'node:path';
+import { createLogger } from '../../../logger.js';
+import { logErrorSummary } from '../../../util/log-redact.js';
+import {
+  type LocalBackend,
+  type BackendRunOptions,
+  type LocalEvent,
+  StderrTail,
+  spawnCli,
+  bindAbort,
+  armKillWatchdog,
+  LineSplitter,
+  isFileReadToolName,
+} from './base.js';
+
+const log = createLogger('local-agents:opencode');
+
+const opencodeRunBackend: LocalBackend = {
+  async run(opts: BackendRunOptions): Promise<void> {
+    const args = buildOpencodeArgs(opts);
+    const env = buildOpencodeEnv(
+      opts.bridge, process.env, opencodeRunShape(opts).projectDirFlag ? undefined : opts.cwd,
+    );
+    const child = spawnCli(opts.binPath, args, opts.cwd, env);
+    const detachAbort = bindAbort(child, opts.signal);
+    const tail = new StderrTail();
+    const startedAt = Date.now();
+
+    let exited = false;
+    let textOut = '';
+    let resultStatus: 'completed' | 'failed' | undefined;
+    let resultError: string | undefined;
+    let protocolRecordCount = 0;
+    let observedSessionId: string | undefined;
+    // Most-recent per-step usage snapshot; step_finish events fire
+    // throughout the turn, each carrying the cumulative-so-far. We
+    // forward the latest as `done.usage` at termination.
+    let lastUsage: Record<string, number | string> | undefined;
+
+    opts.onEvent({
+      type: 'process-info',
+      pid: child.pid ?? -1,
+      cwd: opts.cwd,
+      cmd: opts.binPath,
+      args,
+    });
+
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      deadlineAt: opts.deadlineAt,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
+
+    // Native `run` reads piped input through EOF (including resumed runs).
+    // Do not truncate long history or reinterpret prompt text as CLI options.
+    child.stdin.end(opts.prompt, 'utf8');
+
+    const splitter = new LineSplitter();
+    const stdoutLine = (line: string) => {
+      if (exited) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let obj: any;
+      try { obj = JSON.parse(trimmed); }
+      catch {
+        // Non-NDJSON line on stdout — surface so users see CLI's
+        // own logging / startup banner instead of a silent gap.
+        opts.onEvent({ type: 'raw-line', line: trimmed });
+        return;
+      }
+      protocolRecordCount = Math.min(1_000_000, protocolRecordCount + 1);
+      const ev = mapOpencodeEvent(obj);
+      if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
+      const events = ev?.events || (ev?.event ? [ev.event] : []);
+      for (const event of events) {
+        opts.onEvent(event);
+        if (event.type === 'text-delta' && typeof (event as any).text === 'string') {
+          textOut += (event as any).text as string;
+        }
+        if (event.type === 'status' && (event as any).status === 'usage') {
+          const u = (event as any).usage;
+          if (u && typeof u === 'object') lastUsage = u;
+        }
+      }
+      if (ev?.terminal) {
+        resultStatus = ev.terminal.status;
+        resultError = ev.terminal.error;
+      }
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => splitter.push(chunk, stdoutLine));
+    // EOF may terminate a complete record without a trailing newline. Parse it
+    // through the normal mapper before close publishes the terminal result.
+    child.stdout.on('end', () => splitter.flush(stdoutLine));
+
+    const stderrLines = new LineSplitter(64 * 1024);
+    const stderrLine = (line: string) => {
+      if (line) opts.onEvent({ type: 'stderr-line', line });
+    };
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      if (exited) return;
+      tail.push(chunk);
+      stderrLines.push(chunk, stderrLine);
+    });
+
+    return new Promise<void>(resolve => {
+      const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
+        if (exited) return;
+        exited = true;
+        stderrLines.flush(stderrLine);
+        watchdog.disarm();
+        detachAbort();
+        opts.onEvent({
+          type: 'done', status,
+          durationMs: Date.now() - startedAt,
+          sessionId: observedSessionId,
+          ...(lastUsage ? { usage: lastUsage } : {}),
+          ...extra,
+        });
+        resolve();
+      };
+      child.on('error', err => {
+        log.warn('spawn error', { error: logErrorSummary(err) });
+        finish('failed', {
+          error: (err as Error).message,
+          stderrTail: tail.toString(),
+          failureKind: 'cli_spawn',
+          retrySafe: true,
+        });
+      });
+      child.on('close', code => {
+        const exitDiagnostic = {
+          exitCode: Number.isSafeInteger(code) && code !== null && code >= 0 && code <= 65535 ? code : null,
+          protocolRecordCount,
+          protocolErrorSeen: !!resultError,
+        };
+        if (opts.signal.aborted) return finish('cancelled', { output: textOut });
+        if (watchdog.fired()) return finish('timeout', {
+          timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`,
+          output: textOut, stderrTail: tail.toString(),
+        });
+        if (code === 0 && (resultStatus === 'completed' || resultStatus === undefined)) {
+          return finish('completed', { output: textOut, ...exitDiagnostic });
+        }
+        const err = resultError
+          || (code !== 0 ? `opencode exited with code ${code}` : 'opencode closed without final event');
+        finish('failed', { error: err, output: textOut, stderrTail: tail.toString(), ...exitDiagnostic });
+      });
+    });
+  },
+};
+
+export const opencodeBackend: LocalBackend = opencodeRunBackend;
+
+/** Inline runtime configuration is merged by OpenCode after its config files.
+ * Preserve inherited JSON/JSONC settings and other MCP servers; never write a
+ * global/project config or place the bridge configuration in prompt/argv.
+ * https://opencode.ai/docs/config/#precedence-order */
+export function buildOpencodeEnv(
+  bridge: BackendRunOptions['bridge'],
+  inherited: NodeJS.ProcessEnv = process.env,
+  projectDir?: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...inherited, OPENCODE_PERMISSION: JSON.stringify('allow') };
+  // Without `--dir`, OpenCode resolves `process.env.PWD ?? process.cwd()` on
+  // every platform. spawnCli syncs PWD on POSIX only, so set it here as well.
+  if (projectDir) env.PWD = path.resolve(projectDir);
+  if (!bridge) return env;
+  const raw = inherited.OPENCODE_CONFIG_CONTENT || '{}';
+  let config: Record<string, unknown>;
+  try {
+    // Match strings first so URLs, escaped quotes, and comment-looking text
+    // remain literal. JSON.parse still owns syntax validation after removing
+    // JSONC comments and trailing commas outside strings.
+    const uncommented = raw.replace(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g,
+      (part) => part.startsWith('/') ? ' ' : part);
+    const json = uncommented.replace(/("(?:\\[\s\S]|[^"\\])*")|,\s*(?=[}\]])/g,
+      (_part, quoted) => quoted || '');
+    config = JSON.parse(json);
+    if (!config || typeof config !== 'object' || Array.isArray(config)
+      || (config.mcp !== undefined && (!config.mcp || typeof config.mcp !== 'object' || Array.isArray(config.mcp)))) {
+      throw new Error('invalid config shape');
+    }
+  } catch {
+    // Never include inline config in an error: it can contain credentials.
+    throw new Error('OpenCode inline configuration must be a JSON/JSONC object with an object-valued mcp section');
+  }
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+    ...config,
+    mcp: {
+      ...config.mcp as Record<string, unknown>,
+      orkas: {
+        type: 'local', command: [bridge.server.command, ...bridge.server.args],
+        environment: bridge.server.env, enabled: true,
+      },
+    },
+  });
+  return env;
+}
+
+export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
+  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel' | 'cwd' | 'cliFlags'
+>): string[] {
+  const shape = opencodeRunShape(opts);
+  const args = [
+    'run',
+    '--auto',
+    '--format', 'json',
+  ];
+  if (shape.standalone) args.push('--standalone');
+  if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
+  if (opts.modelOverride) args.push('--model', opts.modelOverride);
+  if (opts.thinkingLevel) args.push('--variant', opts.thinkingLevel);
+  // Put the host-owned flag before custom arguments so a user-supplied `--`
+  // terminator cannot turn it into prompt text. Stale custom --dir variants
+  // are removed below, so there is at most one authoritative value.
+  if (shape.projectDirFlag) args.push('--dir', path.resolve(opts.cwd));
+  if (opts.customArgs && opts.customArgs.length) {
+    args.push(...withoutCustomProjectDir(opts.customArgs));
+  }
+  return args;
+}
+
+/** `run --help` is authoritative for these flags (compatibility.ts). Without
+ * discovered flags, keep the 1.x contract. An empty successful discovery sends
+ * no `--dir`; the runner rejects failed probes before dispatch. A saved `--standalone`/`--server`
+ * is the user's server choice; adding ours would make OpenCode reject the run. */
+function opencodeRunShape(opts: Pick<BackendRunOptions, 'cliFlags' | 'customArgs'>): {
+  projectDirFlag: boolean;
+  standalone: boolean;
+} {
+  const customArgs = opts.customArgs || [];
+  const terminator = customArgs.indexOf('--');
+  const optionArgs = terminator < 0 ? customArgs : customArgs.slice(0, terminator);
+  const customServerMode = optionArgs.some(arg => arg === '--standalone' || arg === '--server'
+    || arg.startsWith('--standalone=') || arg.startsWith('--server='));
+  return {
+    projectDirFlag: opts.cliFlags === undefined || opts.cliFlags.includes('--dir'),
+    standalone: !!opts.cliFlags?.includes('--standalone') && !customServerMode,
+  };
+}
+
+/** Remove stale user-saved directory overrides before custom arguments are
+ * appended. Keeping both relies on OpenCode's duplicate
+ * flag precedence, which has changed between CLI parsers and can silently run
+ * a task in the wrong project. */
+function withoutCustomProjectDir(customArgs: readonly string[]): string[] {
+  const filtered: string[] = [];
+  for (let index = 0; index < customArgs.length; index += 1) {
+    const arg = customArgs[index];
+    if (arg === '--dir') {
+      // Drop the paired stale value, but preserve a following option when
+      // this custom flag was left dangling (`--dir --verbose`).
+      if (index + 1 < customArgs.length && !customArgs[index + 1].startsWith('-')) index += 1;
+      continue;
+    }
+    if (arg.startsWith('--dir=')) continue;
+    filtered.push(arg);
+  }
+  return filtered;
+}
+
+/** Pure mapper for opencode NDJSON events. Exposed for unit testing. */
+export function mapOpencodeEvent(obj: any):
+  | undefined
+  | {
+      event?: LocalEvent;
+      events?: LocalEvent[];
+      captureSessionId?: string;
+      terminal?: { status: 'completed' | 'failed'; error?: string };
+    } {
+  if (!obj || typeof obj !== 'object') return undefined;
+  const out: ReturnType<typeof mapOpencodeEvent> = {};
+  // SessionID can sit at top level or inside .part — accept either.
+  const sid = (typeof obj.sessionID === 'string' && obj.sessionID)
+    || (obj.part && typeof obj.part.sessionID === 'string' ? obj.part.sessionID : '');
+  if (sid) out!.captureSessionId = sid;
+  switch (obj.type) {
+    case 'text': {
+      const text = obj.part?.text;
+      if (typeof text === 'string' && text.length) {
+        out!.event = { type: 'text-delta', text };
+      }
+      return out;
+    }
+    case 'tool_use': {
+      const part = obj.part || {};
+      const state = part.state || {};
+      const status = String(state.status || '');
+      const input = minimalOpencodeToolInput(state.input);
+      // Current OpenCode JSON output commonly emits only the terminal tool
+      // state. Keep non-terminal states compatible with older builds, while
+      // making every terminal record self-contained for replay/rendering.
+      if (
+        status === 'completed'
+        || status === 'success'
+        || status === 'done'
+        || status === 'error'
+        || status === 'failed'
+      ) {
+        const output = typeof state.output === 'string'
+          ? state.output
+          : (state.output != null ? JSON.stringify(state.output) : '');
+        const durationMs = opencodeToolDurationMs(state.time);
+        const error = opencodeToolError(state.error);
+        const isError = status === 'error' || status === 'failed' || !!error;
+        const toolEvent: LocalEvent = {
+          type: 'tool-event',
+          tool: String(part.tool || 'tool'),
+          callId: String(part.callID || part.id || ''),
+          phase: 'result',
+          ...(input ? { input } : {}),
+          output,
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(error ? { error } : {}),
+          ...(isError ? { isError: true } : {}),
+        };
+        const mediaItems = opencodeImageAttachments(state.attachments);
+        // Same guard as the claude backend: a file-read tool's attachments are
+        // the file it read, not media the agent produced.
+        if (mediaItems.length && !isFileReadToolName(part.tool)) {
+          out!.event = toolEvent;
+          out!.events = [toolEvent, {
+            type: 'media-output',
+            source: 'opencode',
+            callId: String(part.callID || part.id || ''),
+            items: mediaItems,
+          }];
+        } else {
+          out!.event = toolEvent;
+        }
+      } else {
+        out!.event = {
+          type: 'tool-event',
+          tool: String(part.tool || 'tool'),
+          callId: String(part.callID || part.id || ''),
+          phase: 'use',
+          input: input ?? {},
+        };
+      }
+      return out;
+    }
+    case 'error': {
+      // 1.x: { name, data: { message } }; 2.x: { type, message }.
+      const errObj = obj.error || {};
+      const msg = errObj.data?.message || errObj.message || errObj.name || errObj.type
+        || 'opencode reported error';
+      out!.terminal = { status: 'failed', error: String(msg) };
+      return out;
+    }
+    case 'step_finish': {
+      // Carries per-step token usage. Surface as a status:'usage' event
+      // when we can pull numbers out, so the rail renders a live
+      // running counter; otherwise fall back to a debug log so users
+      // still see that a step completed.
+      const usage = extractOpencodeUsage(obj.part || obj);
+      if (usage) {
+        out!.event = { type: 'status', status: 'usage', usage };
+      } else {
+        out!.event = {
+          type: 'log',
+          level: 'debug',
+          message: `step_finish: ${JSON.stringify(obj.part || obj).slice(0, 160)}`,
+          source: 'opencode',
+        };
+      }
+      return out;
+    }
+    case 'step_start':
+      out!.event = { type: 'status', status: 'running' };
+      return out;
+    default:
+      // Genuinely unknown opencode event — keep visible at level=info
+      // so we notice when the wire format drifts (matches the codex
+      // treatment).
+      if (typeof obj.type === 'string' && obj.type) {
+        out!.event = {
+          type: 'log',
+          level: 'info',
+          message: `${obj.type}: ${JSON.stringify(obj).slice(0, 200)}`,
+          source: 'opencode',
+        };
+        return out;
+      }
+      return out!.captureSessionId ? out : undefined;
+  }
+}
+
+function opencodeImageAttachments(raw: unknown): Array<Record<string, string>> {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry): Array<Record<string, string>> => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const attachment = entry as Record<string, unknown>;
+    const mediaType = typeof attachment.mime === 'string' ? attachment.mime.trim() : '';
+    const uri = typeof attachment.url === 'string' ? attachment.url.trim() : '';
+    if (!mediaType.toLowerCase().startsWith('image/') || !uri) return [];
+    const name = typeof attachment.filename === 'string' ? attachment.filename.trim() : '';
+    return [{ uri, mediaType, ...(name ? { name } : {}) }];
+  });
+}
+
+const OPENCODE_COMMAND_INPUT_KEYS = ['command', 'cmd', 'script'] as const;
+const OPENCODE_PATH_INPUT_KEYS = ['path', 'file', 'file_path', 'filePath', 'filename'] as const;
+const MAX_OPENCODE_TOOL_INPUT_CHARS = 4_096;
+const MAX_OPENCODE_TOOL_INPUT_FILES = 64;
+
+/** Preserve only the input facts needed for a concise command/file process row.
+ * OpenCode completed events can carry the full write body inside `state.input`;
+ * that body must not enter persisted process events. */
+function minimalOpencodeToolInput(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  for (const key of [...OPENCODE_COMMAND_INPUT_KEYS, ...OPENCODE_PATH_INPUT_KEYS]) {
+    const value = boundedOpencodeToolInputString(source[key]);
+    if (value) out[key] = value;
+  }
+
+  if (Array.isArray(source.files)) {
+    const files = source.files.slice(0, MAX_OPENCODE_TOOL_INPUT_FILES).flatMap((entry): unknown[] => {
+      const stringPath = boundedOpencodeToolInputString(entry);
+      if (stringPath) return [stringPath];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const file = entry as Record<string, unknown>;
+      const pathOnly: Record<string, string> = {};
+      for (const key of OPENCODE_PATH_INPUT_KEYS) {
+        const value = boundedOpencodeToolInputString(file[key]);
+        if (value) pathOnly[key] = value;
+      }
+      return Object.keys(pathOnly).length ? [pathOnly] : [];
+    });
+    if (files.length) out.files = files;
+  }
+
+  return Object.keys(out).length ? out : undefined;
+}
+
+function boundedOpencodeToolInputString(raw: unknown): string | undefined {
+  return typeof raw === 'string' && raw
+    ? raw.slice(0, MAX_OPENCODE_TOOL_INPUT_CHARS)
+    : undefined;
+}
+
+function opencodeToolDurationMs(raw: unknown): number | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const time = raw as Record<string, unknown>;
+  const start = time.start;
+  const end = time.end;
+  if (
+    typeof start !== 'number'
+    || !Number.isFinite(start)
+    || typeof end !== 'number'
+    || !Number.isFinite(end)
+    || end < start
+  ) return undefined;
+  return end - start;
+}
+
+function opencodeToolError(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw || undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const error = raw as Record<string, any>;
+  const message = error.data?.message ?? error.message ?? error.name;
+  return typeof message === 'string' && message ? message : undefined;
+}
+
+/** Extract token usage from an opencode `step_finish` event's `part`
+ *  block. Opencode's wire format isn't entirely stable across versions;
+ *  we accept the shapes observed in practice (tokens nested under
+ *  `tokens.{input,output,cache}`) and inline at the top level.
+ *  Exposed for unit testing. */
+export function extractOpencodeUsage(part: any): undefined | Record<string, number | string> {
+  if (!part || typeof part !== 'object') return undefined;
+  const candidates: any[] = [];
+  if (part.tokens) candidates.push(part.tokens);
+  if (part.usage) candidates.push(part.usage);
+  candidates.push(part);
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const input = numOrUndef(c.input, c.inputTokens, c.input_tokens);
+    const output = numOrUndef(c.output, c.outputTokens, c.output_tokens);
+    const cacheRead = numOrUndef(c.cache, c.cacheRead, c.cache_read, c.cache_read_input_tokens);
+    if (input === undefined && output === undefined && cacheRead === undefined) continue;
+    const out: Record<string, number | string> = {};
+    if (input !== undefined) out.input = input;
+    if (output !== undefined) out.output = output;
+    if (cacheRead !== undefined) out.cacheRead = cacheRead;
+    const model = part.model || part.providerID || part.modelID;
+    if (typeof model === 'string' && model) out.model = model;
+    return out;
+  }
+  return undefined;
+}
+
+function numOrUndef(...vals: any[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return undefined;
+}

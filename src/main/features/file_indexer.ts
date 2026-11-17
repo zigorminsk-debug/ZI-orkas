@@ -1,0 +1,1074 @@
+/**
+ * On-demand file indexer — lazy cache + unified char-offset reader behind the
+ * file tools (read_files / search_files / grep_files). The model
+ * drives reading via explicit `charStart` / `charEnd` regardless of file
+ * kind; nothing is pre-split.
+ *
+ * Cache layout (attachment + workspace unified):
+ *
+ *   <uid>/local/file_cache/<sha1(absPath).slice(0,16)>/
+ *     meta.json   { absPath, mtime, size, kind, source: 'attachment'|'workspace',
+ *                   cid?, totalChars?, pageMap?, cacheVersion, lastAccessed }
+ *     text.md     (pdf / docx / xlsx / pptx) — full extracted text; enables
+ *                 range reads without re-parsing. text files read directly
+ *                 from source; images never cached (realtime color-preserving compression).
+ *
+ * Scope is recorded in `meta.source` / `meta.cid` for cleanup routing only —
+ * the cache location does NOT depend on scope. Tool-layer path-sandbox is
+ * the mechanism that decides which files a given conversation may touch.
+ *
+ * Responsibility split:
+ *   - `getCachedMeta` / `peekMeta`  — pure read-only; never materialises. Used
+ *     by manifest + search_files so "list a file" doesn't pay extract cost.
+ *   - `statFile`                    — `ensureFresh` + return FileMeta. Triggers
+ *     extract when needed. For rich documents this is the only path that runs
+ *     pdfjs / mammoth / OOXML parsers.
+ *   - `readRange`                   — pure slice by char offsets. For rich docs
+ *     throws `NeedStatError` when cache is missing so the caller decides
+ *     whether to extract first.
+ *
+ * Eviction:
+ *   - source revision changed         → lazy rebuild on next access
+ *   - cacheVersion != EXTRACT_CACHE_VERSION → lazy rebuild on next access
+ *   - source file missing              → drop on access + pruneOrphans sweep
+ *   - conversation deleted             → purgeByCid() drops entries for its cid
+ *   - attachment deleted               → invalidateFileCache(absPath) explicit
+ */
+
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileSystemForPath } from '../util/user-file-fs';
+import { finished } from 'node:stream/promises';
+
+import { userChatAttachmentsDir, userFileCacheDir, projectChatAttachmentsDir } from '../paths';
+import { listProjectIds } from '../util/project-layout';
+import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { macosTccSensitivePath } from '../util/macos-tcc';
+import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
+import { docxBufferToMarkdown, DOCX_EXTRACTION_VERSION } from '../util/extract-docx';
+import { extractOffice } from '../util/office-extract';
+import { toCompressedJpeg } from '../util/image-transform';
+import { isUtf8File } from '../util/file-import';
+
+const log = createLogger('file_indexer');
+
+export { EXTRACT_CACHE_VERSION };
+
+/** Thrown by `readRange` when the target is rich-document kind and no cache exists yet.
+ *  Caller decides whether to `statFile` (which triggers extract) or surface
+ *  an error to the model. */
+export class NeedStatError extends Error {
+  constructor(public readonly absPath: string, public readonly kind: FileKind) {
+    super(`cache missing — prepare extraction before readRange: ${absPath}`);
+    this.name = 'NeedStatError';
+  }
+}
+
+/** Media bytes have no text representation. Images use `readImageAsJpeg`;
+ *  audio/video remain path-addressed inputs for media tools. */
+export class NoTextError extends Error {
+  constructor(public readonly absPath: string, public readonly kind: FileKind = 'image') {
+    super(`${kind} kind has no text representation: ${absPath}`);
+    this.name = 'NoTextError';
+  }
+}
+
+/** Thrown when the file extension is uploadable/listable but cannot be
+ *  converted to text by the current model-side extractor. */
+export class UnsupportedFileKindError extends Error {
+  constructor(public readonly absPath: string, public readonly kind: FileKind) {
+    super(`${kind} is not readable by the model: ${absPath}`);
+    this.name = 'UnsupportedFileKindError';
+  }
+}
+
+/** Thrown by `readRange` when the source bytes are invalid for the requested encoding. */
+export class TextEncodingMismatchError extends Error {
+  constructor(public readonly absPath: string, public readonly encoding: string) {
+    super(`not valid ${encoding}: ${absPath}`);
+    this.name = 'TextEncodingMismatchError';
+  }
+}
+
+/** Canonical WHATWG name for an encoding label, or null when the runtime has no such decoder. */
+export function resolveTextEncoding(label: unknown): string | null {
+  if (typeof label !== 'string') return null;
+  try { return new TextDecoder(label).encoding; }
+  catch { return null; }
+}
+
+const TEXT_EXTS: ReadonlySet<string> = new Set([
+  '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
+  '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
+]);
+const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+// Match the attachment media contract without importing its feature lifecycle.
+const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
+const PDF_EXT = '.pdf';
+const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm', '.xls']);
+const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
+const LEGACY_OFFICE_EXTS: ReadonlySet<string> = new Set(['.doc', '.ppt']);
+
+// ── Types ────────────────────────────────────────────────────────────────
+
+export type FileKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'legacy_office' | 'image' | 'video' | 'audio';
+export type SourceScope = 'attachment' | 'workspace';
+
+export interface FileMeta {
+  kind: FileKind;
+  absPath: string;
+  bytes: number;
+  mtime: number;
+  source: SourceScope;
+  cid?: string;
+  /** Total character length of the text representation. Populated after
+   *  materialisation for text / rich documents; undefined for media (no text). */
+  totalChars?: number;
+  /** pdf only: the extractor (pdfjs) produced empty text on EVERY page —
+   *  almost always a font-mapping failure (embedded / subset / CJK cmap
+   *  gaps), not a genuinely blank document. `totalChars` is still non-zero
+   *  because the page delimiters count. The file tools surface this so the
+   *  model can retry with a different reader (bash + PyMuPDF). Absent = at
+   *  least one page yielded text. */
+  extractionEmpty?: boolean;
+}
+
+export interface TextReadResult {
+  content: string;
+  meta: FileMeta;
+  /** Hash of the complete source bytes for editable plain-text files. This is
+   *  intentionally absent for extracted rich-document text, which cannot be
+   *  edited in place. */
+  sourceHash?: string;
+  /** Echo of the applied range (what was actually returned, clamped to
+   *  `[0, totalChars)`). */
+  range: { charStart: number; charEnd: number };
+  /** End of the requested range before maxContentChars clipping, clamped to
+   * EOF. Keeps bounded preparation distinct from request completion. */
+  requestedCharEnd?: number;
+  /** 1-based line number of the first returned character (the line `charStart`
+   *  falls on). Lets `read_files` show absolute line numbers even for a slice
+   *  that begins mid-file. Always 1 for a whole-file read. */
+  startLine: number;
+  /** Canonical encoding this page was decoded from, when one was requested.
+   *  Such a page has no `sourceHash`: it is not the file's editable bytes. */
+  encoding?: string;
+  /** The plain UTF-8 view of this file replaced invalid bytes, so it may be garbled. */
+  notUtf8?: boolean;
+}
+
+export interface ImageReadResult {
+  base64: string;
+  mediaType: 'image/jpeg';
+  width: number;
+  height: number;
+  /** Original file size on disk (not the compressed preview size). */
+  bytes: number;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+export function kindOf(absPath: string): FileKind {
+  const e = path.extname(absPath).toLowerCase();
+  if (e === PDF_EXT) return 'pdf';
+  if (DOCX_EXTS.has(e)) return 'docx';
+  if (SPREADSHEET_EXTS.has(e)) return 'spreadsheet';
+  if (PRESENTATION_EXTS.has(e)) return 'presentation';
+  if (LEGACY_OFFICE_EXTS.has(e)) return 'legacy_office';
+  if (IMAGE_EXTS.has(e)) return 'image';
+  if (VIDEO_EXTS.has(e)) return 'video';
+  if (AUDIO_EXTS.has(e)) return 'audio';
+  if (TEXT_EXTS.has(e)) return 'text';
+  // Unknown extension: treat as text so the model can still peek at it.
+  return 'text';
+}
+
+function cacheHashFor(absPath: string): string {
+  return crypto.createHash('sha1').update(absPath).digest('hex').slice(0, 16);
+}
+
+function cacheDirFor(userId: string, absPath: string): string {
+  return path.join(userFileCacheDir(userId), cacheHashFor(absPath));
+}
+
+function deriveScope(userId: string, absPath: string): { source: SourceScope; cid?: string } {
+  const attachmentRoots = [
+    userChatAttachmentsDir(userId),
+    ...listProjectIds(userId).map((pid) => projectChatAttachmentsDir(userId, pid)),
+  ];
+  for (const attachmentsRoot of attachmentRoots) {
+    if (!absPath.startsWith(attachmentsRoot + path.sep)) continue;
+    // layout: <attachmentsRoot>/<cid>/<file>  — cid is the first dir segment
+    const rest = absPath.slice(attachmentsRoot.length + 1);
+    const segs = rest.split(path.sep).filter(Boolean);
+    return segs.length >= 2 ? { source: 'attachment', cid: segs[0] } : { source: 'attachment' };
+  }
+  return { source: 'workspace' };
+}
+
+// ── On-disk meta ────────────────────────────────────────────────────────
+
+interface OnDiskMeta {
+  absPath: string;
+  mtime: number;
+  size: number;
+  kind: FileKind;
+  source: SourceScope;
+  cid?: string;
+  totalChars?: number;
+  /** Complete UTF-8 text hash for editable plain-text files. Rich-document
+   *  caches deliberately omit it because their extracted text is read-only. */
+  sourceHash?: string;
+  /** Plain text only: whether the source is strictly valid UTF-8. Absent in
+   *  caches written before this field; `readRange` fills it in on next use. */
+  utf8Valid?: boolean;
+  /** Plain-text source change time. Missing legacy values rebuild lazily. */
+  ctime?: number;
+  /** Rich-document stat identity; missing legacy values rebuild on demand. */
+  sourceVersion?: string;
+  /** Derived DOCX numbering revision; legacy entries rebuild lazily. */
+  docxExtractionVersion?: number;
+  /** pdf only — see FileMeta.extractionEmpty. */
+  extractionEmpty?: boolean;
+  /** Per-page [charStart, charEnd) offsets into text.md. Populated for pdf only.
+   *  Kept as a materialise by-product so grep / future per-page features don't
+   *  have to re-scan; the file tools never expose it to the model. */
+  pageMap?: Array<{ page: number; charStart: number; charEnd: number }>;
+  cacheVersion: number;
+  lastAccessed: number;
+}
+
+function readMeta(dir: string): OnDiskMeta | null {
+  try {
+    const raw = fs.readFileSync(path.join(dir, 'meta.json'), 'utf8');
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return null;
+    return obj as OnDiskMeta;
+  } catch { return null; }
+}
+
+function writeMeta(dir: string, meta: OnDiskMeta): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, 'meta.json');
+  const tmp = p + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(meta), 'utf8');
+  fs.renameSync(tmp, p);
+}
+
+function touchMeta(dir: string, patch?: Partial<OnDiskMeta>): void {
+  const meta = readMeta(dir);
+  if (!meta) return;
+  meta.lastAccessed = Date.now();
+  if (patch) Object.assign(meta, patch);
+  try { writeMeta(dir, meta); } catch { /* best-effort */ }
+}
+
+function removeDir(dir: string): boolean {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    log.warn('file cache cleanup deferred', { path: logPathRef(dir), error: logErrorSummary(err) });
+    return false;
+  }
+}
+
+function metaToPublic(meta: OnDiskMeta): FileMeta {
+  const out: FileMeta = {
+    kind: meta.kind,
+    absPath: meta.absPath,
+    bytes: meta.size,
+    mtime: meta.mtime,
+    source: meta.source,
+  };
+  if (meta.cid) out.cid = meta.cid;
+  if (meta.totalChars !== undefined) out.totalChars = meta.totalChars;
+  if (meta.extractionEmpty) out.extractionEmpty = true;
+  return out;
+}
+
+// ── Source validation / cache freshness ─────────────────────────────────
+
+function isRichDocument(kind: FileKind): boolean {
+  return kind === 'pdf' || kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation';
+}
+
+function richSourceVersion(stat: fs.Stats): string {
+  // Detect in-place saves and atomic replacements without hashing the whole
+  // source on every cache hit. Keep sub-millisecond source precision here.
+  return JSON.stringify([stat.size, stat.mtimeMs, stat.ctimeMs, stat.birthtimeMs, stat.dev, stat.ino]);
+}
+
+function isFresh(meta: OnDiskMeta, stat: fs.Stats): boolean {
+  return meta.cacheVersion === EXTRACT_CACHE_VERSION
+      && (meta.kind !== 'docx' || meta.docxExtractionVersion === DOCX_EXTRACTION_VERSION)
+      && meta.size === stat.size
+      && meta.mtime === Math.floor(stat.mtimeMs)
+      && (meta.kind !== 'text' || meta.ctime === stat.ctimeMs)
+      && (!isRichDocument(meta.kind) || meta.sourceVersion === richSourceVersion(stat));
+}
+
+/** Stat the source; throw if missing/not a file. Normalises mtime to ms-int. */
+function statSource(absPath: string): { size: number; mtime: number; stat: fs.Stats } {
+  const stat = fileSystemForPath(absPath).statSync(absPath);
+  if (!stat.isFile()) throw new Error(`not a file: ${absPath}`);
+  return { size: stat.size, mtime: Math.floor(stat.mtimeMs), stat };
+}
+
+// Whole-file async reads are faster for small text. Above this internal
+// performance cutoff, metadata scans and bounded slices stream so a paged read
+// never retains the complete source in memory. This is not a model-visible
+// limit and does not change range semantics.
+const TEXT_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024;
+
+interface Utf8Analysis {
+  totalChars: number;
+  sourceHash: string;
+  utf8Valid: boolean;
+}
+
+interface Utf8Slice {
+  content: string;
+  charStart: number;
+  charEnd: number;
+  startLine: number;
+  requestedCharEnd?: number;
+}
+
+function hashUtf8Text(body: string): string {
+  return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
+}
+
+async function closeReadStream(stream: fs.ReadStream): Promise<void> {
+  if (stream.closed) return;
+  stream.destroy();
+  try {
+    await finished(stream);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ABORT_ERR') throw error;
+  }
+}
+
+/** Yield a source's text in order without retaining it. With `encoding`, the
+ * bytes are decoded strictly and an invalid sequence throws. */
+async function* textChunks(absPath: string, encoding?: string): AsyncGenerator<string> {
+  const decoder = encoding ? new TextDecoder(encoding, { fatal: true }) : undefined;
+  const stream = fileSystemForPath(absPath).createReadStream(absPath, decoder ? undefined : { encoding: 'utf8' });
+  try {
+    for await (const chunk of stream) {
+      const text = decoder ? decoder.decode(chunk as Buffer, { stream: true }) : String(chunk);
+      if (text) yield text;
+    }
+    const tail = decoder?.decode();
+    if (tail) yield tail;
+  } catch (error) {
+    if (encoding && (error as NodeJS.ErrnoException).code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      throw new TextEncodingMismatchError(absPath, encoding);
+    }
+    throw error;
+  } finally {
+    await closeReadStream(stream);
+  }
+}
+
+async function readTextBody(absPath: string, encoding?: string): Promise<string> {
+  if (!encoding) return fileSystemForPath(absPath).promises.readFile(absPath, 'utf8');
+  try {
+    return new TextDecoder(encoding, { fatal: true }).decode(await fileSystemForPath(absPath).promises.readFile(absPath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      throw new TextEncodingMismatchError(absPath, encoding);
+    }
+    throw error;
+  }
+}
+
+/** Count characters and hash decoded UTF-8 text without retaining a large
+ * source. Hashing decoded text preserves the existing edit_file hash contract.
+ * Lossy decoding turns every invalid sequence into U+FFFD, so only text holding
+ * one needs the strict second pass. */
+async function analyseUtf8File(
+  absPath: string,
+  sizeBytes: number,
+  bufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
+): Promise<Utf8Analysis> {
+  if (sizeBytes <= bufferLimit) {
+    const body = await fileSystemForPath(absPath).promises.readFile(absPath, 'utf8');
+    return {
+      totalChars: body.length,
+      sourceHash: hashUtf8Text(body),
+      utf8Valid: !body.includes('\uFFFD') || await isUtf8File(absPath),
+    };
+  }
+
+  const hash = crypto.createHash('sha256');
+  let totalChars = 0;
+  let sawReplacement = false;
+  const stream = fileSystemForPath(absPath).createReadStream(absPath, { encoding: 'utf8' });
+  for await (const chunk of stream) {
+    const text = String(chunk);
+    totalChars += text.length;
+    hash.update(text, 'utf8');
+    sawReplacement ||= text.includes('\uFFFD');
+  }
+  return {
+    totalChars,
+    sourceHash: `sha256:${hash.digest('hex')}`,
+    utf8Valid: !sawReplacement || await isUtf8File(absPath),
+  };
+}
+
+function startLineFor(body: string, charStart: number): number {
+  let line = 1;
+  for (let i = 0; i < charStart; i++) {
+    if (body.charCodeAt(i) === 10) line++;
+  }
+  return line;
+}
+
+async function readUtf8CharSlice(
+  absPath: string,
+  sizeBytes: number,
+  totalChars: number,
+  charStart: number,
+  charEnd: number,
+  maxContentChars?: number,
+  encoding?: string,
+): Promise<Utf8Slice> {
+  const requestedCharEnd = charEnd;
+  charEnd = Math.min(charEnd, charStart + (maxContentChars ?? Infinity));
+  // A genuine whole-file consumer still needs the whole body. Streaming and
+  // then joining it would add chunk/event overhead without reducing memory.
+  const wholeFile = charStart === 0 && charEnd === totalChars;
+  if (sizeBytes <= Math.min(TEXT_STREAM_THRESHOLD_BYTES, maxContentChars ?? Infinity)
+    || (wholeFile && maxContentChars === undefined)) {
+    const body = await readTextBody(absPath, encoding);
+    return {
+      content: body.slice(charStart, charEnd),
+      charStart,
+      charEnd,
+      startLine: startLineFor(body, charStart),
+      requestedCharEnd,
+    };
+  }
+
+  if (charEnd === 0) {
+    return { content: '', charStart, charEnd, startLine: 1, requestedCharEnd };
+  }
+
+  const content: string[] = [];
+  let absoluteChar = 0;
+  let startLine = 1;
+  for await (const text of textChunks(absPath, encoding)) {
+    const chunkStart = absoluteChar;
+    const chunkEnd = chunkStart + text.length;
+
+    const prefixEnd = Math.max(0, Math.min(text.length, charStart - chunkStart));
+    for (let i = 0; i < prefixEnd; i++) {
+      if (text.charCodeAt(i) === 10) startLine++;
+    }
+
+    const takeStart = Math.max(0, charStart - chunkStart);
+    const takeEnd = Math.min(text.length, charEnd - chunkStart);
+    if (takeEnd > takeStart) content.push(text.slice(takeStart, takeEnd));
+
+    absoluteChar = chunkEnd;
+    if (absoluteChar >= charEnd) break;
+  }
+
+  return { content: content.join(''), charStart, charEnd, startLine, requestedCharEnd };
+}
+
+function sliceUtf8Lines(
+  body: string,
+  requestedStart: number,
+  requestedEnd: number,
+  maxContentChars?: number,
+): Utf8Slice {
+  let currentLine = 1;
+  let charStart = requestedStart === 1 ? 0 : body.length;
+  let charEnd = body.length;
+  for (let index = 0; index < body.length; index++) {
+    if (body.charCodeAt(index) !== 10) continue;
+    currentLine++;
+    if (currentLine === requestedStart) charStart = index + 1;
+    if (currentLine === requestedEnd + 1) {
+      charEnd = index;
+      break;
+    }
+  }
+  if (requestedStart > currentLine) charStart = body.length;
+  const requestedCharEnd = charEnd;
+  charEnd = Math.min(charEnd, charStart + (maxContentChars ?? Infinity));
+  return {
+    content: body.slice(charStart, charEnd),
+    charStart,
+    charEnd,
+    startLine: Math.min(requestedStart, currentLine),
+    requestedCharEnd,
+  };
+}
+
+async function readUtf8LineSlice(
+  absPath: string,
+  sizeBytes: number,
+  totalChars: number,
+  requestedStart: number,
+  requestedEnd: number,
+  maxContentChars?: number,
+  encoding?: string,
+): Promise<Utf8Slice> {
+  if (sizeBytes <= Math.min(TEXT_STREAM_THRESHOLD_BYTES, maxContentChars ?? Infinity)) {
+    return sliceUtf8Lines(
+      await readTextBody(absPath, encoding),
+      requestedStart,
+      requestedEnd,
+      maxContentChars,
+    );
+  }
+
+  const content: string[] = [];
+  let retainedChars = 0;
+  let currentLine = 1;
+  let absoluteChar = 0;
+  let charStart: number | undefined = requestedStart === 1 ? 0 : undefined;
+  let charEnd: number | undefined;
+
+  for await (const text of textChunks(absPath, encoding)) {
+    const chunkStart = absoluteChar;
+    const chunkEnd = chunkStart + text.length;
+
+    for (let searchFrom = 0; searchFrom < text.length;) {
+      const newline = text.indexOf('\n', searchFrom);
+      if (newline === -1) break;
+      const newlineChar = chunkStart + newline;
+      if (charStart !== undefined && currentLine === requestedEnd) {
+        charEnd = newlineChar;
+        break;
+      }
+      currentLine++;
+      if (charStart === undefined && currentLine === requestedStart) {
+        charStart = newlineChar + 1;
+      }
+      searchFrom = newline + 1;
+    }
+
+    if (charStart !== undefined) {
+      const takeStart = Math.max(0, charStart - chunkStart);
+      const takeEnd = Math.min(text.length, (charEnd ?? chunkEnd) - chunkStart,
+        takeStart + (maxContentChars ?? Infinity) - retainedChars);
+      if (takeEnd > takeStart) {
+        content.push(text.slice(takeStart, takeEnd));
+        retainedChars += takeEnd - takeStart;
+      }
+    }
+
+    absoluteChar = chunkEnd;
+    if (charEnd !== undefined) break;
+  }
+
+  if (charStart === undefined) {
+    charStart = totalChars;
+    charEnd = totalChars;
+  } else if (charEnd === undefined) {
+    charEnd = totalChars;
+  }
+
+  return {
+    content: content.join(''),
+    charStart,
+    charEnd: charStart + retainedChars,
+    requestedCharEnd: charEnd,
+    startLine: Math.min(requestedStart, currentLine),
+  };
+}
+
+// ── Materialisation (rich docs build text.md + pdf pageMap) ─────────────
+
+async function materialise(
+  userId: string,
+  absPath: string,
+  kind: FileKind,
+  stat: { size: number; mtime: number; stat: fs.Stats },
+  textBufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
+): Promise<OnDiskMeta> {
+  const t0 = Date.now();
+  const dir = cacheDirFor(userId, absPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const { source, cid } = deriveScope(userId, absPath);
+  const base: OnDiskMeta = {
+    absPath,
+    mtime: stat.mtime,
+    size: stat.size,
+    kind,
+    source,
+    ...(cid ? { cid } : {}),
+    cacheVersion: EXTRACT_CACHE_VERSION,
+    lastAccessed: Date.now(),
+    ...(kind === 'text' ? { ctime: stat.stat.ctimeMs } : {}),
+    ...(isRichDocument(kind) ? { sourceVersion: richSourceVersion(stat.stat) } : {}),
+    ...(kind === 'docx' ? { docxExtractionVersion: DOCX_EXTRACTION_VERSION } : {}),
+  };
+  let extracted: string | undefined;
+
+  if (kind === 'pdf') {
+    const buf = await fileSystemForPath(absPath).promises.readFile(absPath);
+    const pages = await pdfBufferToPages(buf);
+    // Build text.md with page delimiters + pageMap [charStart, charEnd).
+    const pageMap: Array<{ page: number; charStart: number; charEnd: number }> = [];
+    let acc = '';
+    for (let i = 0; i < pages.length; i++) {
+      const header = `--- page ${i + 1} ---\n`;
+      const charStart = acc.length;
+      acc += header + pages[i] + (i < pages.length - 1 ? '\n\n' : '');
+      pageMap.push({ page: i + 1, charStart, charEnd: acc.length });
+    }
+    extracted = acc;
+    base.totalChars = acc.length;
+    base.pageMap = pageMap;
+    // Every page came back blank → pdfjs almost certainly failed to map the
+    // fonts (vs a genuinely blank doc). Flag it so the file tools can steer
+    // the model to a different reader. Guard pages.length so a 0-page parse
+    // doesn't trip `[].every() === true`.
+    if (pages.length > 0 && pages.every((p) => p.trim().length === 0)) {
+      base.extractionEmpty = true;
+    }
+  } else if (kind === 'docx') {
+    const buf = await fileSystemForPath(absPath).promises.readFile(absPath);
+    const md = await docxBufferToMarkdown(buf);
+    extracted = md;
+    base.totalChars = md.length;
+  } else if (kind === 'spreadsheet') {
+    const md = await extractOffice('spreadsheet-markdown', signal => fileSystemForPath(absPath).promises.readFile(absPath, { signal }));
+    extracted = md;
+    base.totalChars = md.length;
+  } else if (kind === 'presentation') {
+    const md = await extractOffice('pptx-markdown', signal => fileSystemForPath(absPath).promises.readFile(absPath, { signal }));
+    extracted = md;
+    base.totalChars = md.length;
+  } else if (kind === 'legacy_office') {
+    throw new UnsupportedFileKindError(absPath, kind);
+  } else if (kind === 'text') {
+    // No text.md for text kind — source IS the text.
+    const analysis = await analyseUtf8File(absPath, stat.size, textBufferLimit);
+    base.totalChars = analysis.totalChars;
+    base.sourceHash = analysis.sourceHash;
+    base.utf8Valid = analysis.utf8Valid;
+  }
+  // image: no cache payload at all.
+
+  // An awaited analysis must not replace a newer cache published meanwhile.
+  // ensureFresh owns bounded recovery from this uncommitted source version.
+  if (!isFresh(base, statSource(absPath).stat)) return base;
+  if (extracted !== undefined) {
+    const candidate = path.join(dir, `text-${crypto.randomUUID()}.tmp`);
+    try {
+      await fs.promises.writeFile(candidate, extracted, 'utf8');
+      if (!isFresh(base, statSource(absPath).stat)) return base;
+      // No await between payload and metadata publication. Main-process
+      // readers cannot interleave a different cache revision with this pair;
+      // readers already awaiting I/O recheck the source before returning.
+      fs.renameSync(candidate, path.join(dir, 'text.md'));
+      writeMeta(dir, base);
+    } finally { fs.rmSync(candidate, { force: true }); }
+  } else {
+    writeMeta(dir, base);
+  }
+  log.info('materialise', {
+    user_id: maskId(userId),
+    kind,
+    chars: base.totalChars ?? 0,
+    ...(kind === 'pdf' ? { pages: base.pageMap?.length ?? 0 } : {}),
+    ...(base.extractionEmpty ? { extraction: 'empty_pages' } : {}),
+    duration_ms: Date.now() - t0,
+    path: logPathRef(absPath),
+  });
+  return base;
+}
+
+async function prepareFresh(
+  userId: string,
+  absPath: string,
+  textBufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
+  analysisBudget = { remaining: 3 },
+): Promise<OnDiskMeta> {
+  let src = statSource(absPath);
+  const dir = cacheDirFor(userId, absPath);
+  const kind = kindOf(absPath);
+
+  // Media bodies never enter the text cache, including legacy misclassified entries.
+  if (kind === 'image' || kind === 'video' || kind === 'audio') {
+    const { source, cid } = deriveScope(userId, absPath);
+    return {
+      absPath,
+      mtime: src.mtime,
+      size: src.size,
+      kind,
+      source,
+      ...(cid ? { cid } : {}),
+      cacheVersion: EXTRACT_CACHE_VERSION,
+      lastAccessed: Date.now(),
+    };
+  }
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const existing = readMeta(dir);
+    // Older analysis failures were cached as empty text. Nonempty source
+    // bytes cannot have an empty UTF-8 view, so rebuild that invalid cache.
+    const falseEmpty = kind === 'text' && src.size > 0 && existing?.totalChars === 0;
+    if (existing && existing.absPath === absPath && isFresh(existing, src.stat) && !falseEmpty) {
+      // Touch lastAccessed but don't rewrite the (expensive) pageMap.
+      touchMeta(dir);
+      return existing;
+    }
+    if (kind === 'text' && --analysisBudget.remaining < 0) {
+      throw new Error('file changed while preparing text metadata');
+    }
+    // Keep the previous rich payload until its replacement is ready. An
+    // already-started page read must not mistake cache deletion for a missing
+    // source; its final source-version check will reject the obsolete page.
+    if (existing && !isRichDocument(kind)) removeDir(dir);
+    const prepared = await materialise(userId, absPath, kind, src, textBufferLimit);
+    // Analysis awaits I/O; an editor or another reader may replace the source
+    // and cache before it finishes. Never pair old metadata with a new page.
+    src = statSource(absPath);
+    if (isFresh(prepared, src.stat)) return prepared;
+  }
+  throw new Error('file changed while preparing text metadata');
+}
+
+// Share only active rich-document preparation, not a persistent in-memory
+// cache. Unrelated sources remain concurrent and failures release the entry.
+const richPreparations = new Map<string, Promise<OnDiskMeta>>();
+async function ensureFresh(
+  userId: string,
+  absPath: string,
+  textBufferLimit = TEXT_STREAM_THRESHOLD_BYTES,
+  analysisBudget = { remaining: 3 },
+): Promise<OnDiskMeta> {
+  if (!isRichDocument(kindOf(absPath))) return prepareFresh(userId, absPath, textBufferLimit, analysisBudget);
+  const key = cacheDirFor(userId, absPath);
+  let pending = richPreparations.get(key);
+  if (!pending) {
+    pending = prepareFresh(userId, absPath, textBufferLimit, analysisBudget);
+    richPreparations.set(key, pending);
+    const release = () => { if (richPreparations.get(key) === pending) richPreparations.delete(key); };
+    void pending.then(release, release);
+  }
+  return pending;
+}
+
+// ── Public API ──────────────────────────────────────────────────────────
+
+/** Read-only cache probe — returns the existing fresh meta if one is on disk,
+ *  otherwise null. Never triggers extract. Used by the manifest builder and
+ *  search_files so "list a file" doesn't pay extract cost.
+ *
+ *  `null` covers: source missing, media kinds (never cached), no meta.json,
+ *  or meta present but stale (mtime/size/version mismatch). */
+function peekMeta(userId: string, absPath: string): OnDiskMeta | null {
+  let src: { size: number; mtime: number; stat: fs.Stats };
+  try { src = statSource(absPath); } catch { return null; }
+  const kind = kindOf(absPath);
+  if (kind === 'image' || kind === 'video' || kind === 'audio') return null;
+  const dir = cacheDirFor(userId, absPath);
+  const existing = readMeta(dir);
+  if (existing && existing.absPath === absPath && isFresh(existing, src.stat)) {
+    return existing;
+  }
+  return null;
+}
+
+async function ensureTextReadMeta(
+  userId: string,
+  absPath: string,
+  textBufferLimit: number,
+): Promise<OnDiskMeta> {
+  // Legacy caches need one analysis to fill missing fields. An editor or a
+  // concurrent reader can replace their version while that analysis awaits I/O.
+  const analysisBudget = { remaining: 3 };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const meta = await ensureFresh(userId, absPath, textBufferLimit, analysisBudget);
+    if (meta.sourceHash && meta.utf8Valid !== undefined) return meta;
+
+    if (--analysisBudget.remaining < 0) {
+      throw new Error('file changed while preparing text metadata');
+    }
+    const analysis = await analyseUtf8File(absPath, meta.size, textBufferLimit);
+    const current = peekMeta(userId, absPath);
+    if (!current || current.mtime !== meta.mtime || current.size !== meta.size || current.ctime !== meta.ctime) continue;
+
+    // peekMeta checks both the source and cached version. Keep this check and
+    // write synchronous so another in-process rebuild cannot interleave them.
+    touchMeta(cacheDirFor(userId, absPath), { ...analysis });
+    return { ...current, ...analysis };
+  }
+  throw new Error('file changed while preparing text metadata');
+}
+
+/** Public view of `peekMeta`. Returns `null` rather than throwing so callers
+ *  can simply omit `total_chars` when the cache isn't ready. */
+export function getCachedMeta(userId: string, absPath: string): FileMeta | null {
+  const m = peekMeta(userId, absPath);
+  return m ? metaToPublic(m) : null;
+}
+
+/** Force-fresh meta — triggers text extraction if cache is missing or stale.
+ *  For image kind throws `NoTextError` since image has no text
+ *  representation (use `readImageAsJpeg` instead). Audio/video return only
+ *  source metadata without reading or caching their bodies. */
+export async function statFile(userId: string, absPath: string): Promise<FileMeta> {
+  if (kindOf(absPath) === 'image') throw new NoTextError(absPath);
+  if (kindOf(absPath) === 'legacy_office') throw new UnsupportedFileKindError(absPath, 'legacy_office');
+  const meta = await ensureFresh(userId, absPath);
+  return metaToPublic(meta);
+}
+
+/** Unified text-slice reader. `charStart` defaults to 0, `charEnd` defaults
+ *  to `totalChars`. The returned `range` echoes the clamped values.
+ *
+ *  Contract by kind:
+ *   - text        → always works (metadata preparation is async and bounded)
+ *   - rich docs   → throws `NeedStatError` when no cache exists. Callers
+ *                   must `statFile` first (which extracts) and then retry.
+ *                   This keeps extract side-effects out of readRange.
+ *   - image       → throws `NoTextError`. Caller must branch to
+ *                   `readImageAsJpeg`.
+ *   - audio/video → throws `NoTextError`; use a media-capable consumer. */
+export async function readRange(
+  userId: string,
+  absPath: string,
+  opts: {
+    charStart?: number;
+    charEnd?: number;
+    lineStart?: number;
+    lineEnd?: number;
+    /** Internal preparation bound, in UTF-16 units. Does not change the
+     * requested range; requestedCharEnd identifies the unclipped end. */
+    maxContentChars?: number;
+    /** Canonical name from `resolveTextEncoding`. Plain text only: other kinds
+     *  ignore it. `utf-8` is the ordinary read, refused when the source is invalid. */
+    encoding?: string;
+  } = {},
+): Promise<TextReadResult> {
+  const kind = kindOf(absPath);
+  if (kind === 'image' || kind === 'video' || kind === 'audio') throw new NoTextError(absPath, kind);
+  if (kind === 'legacy_office') throw new UnsupportedFileKindError(absPath, kind);
+
+  const maxContentChars = Number.isFinite(opts.maxContentChars)
+    ? Math.max(0, Math.floor(opts.maxContentChars!)) : undefined;
+  // A byte ceiling is conservative for decoded UTF-16 storage. Keep small
+  // files fast, but never buffer a large source just to prepare a bounded page.
+  const textBufferLimit = Math.min(TEXT_STREAM_THRESHOLD_BYTES, maxContentChars ?? Infinity);
+
+  let meta: OnDiskMeta;
+  if (kind === 'text') {
+    // Keeps the first read_files call on a plain .md to one model tool call
+    // without a separate metadata preparation step. Large-file metadata is
+    // streamed once and cached; later pages do not rescan the whole file.
+    meta = await ensureTextReadMeta(userId, absPath, textBufferLimit);
+  } else {
+    // Rich documents require an existing fresh cache. Do NOT extract here.
+    // The model-facing read_files wrapper prepares rich-document extraction
+    // through statFile before reaching this cache-only branch.
+    const peeked = peekMeta(userId, absPath);
+    if (!peeked) throw new NeedStatError(absPath, kind);
+    meta = peeked;
+    // Touch lastAccessed on successful peek (ensureFresh would have done this).
+    try { touchMeta(cacheDirFor(userId, absPath)); } catch { /* best-effort */ }
+  }
+
+  // Each decoded read scans the whole source for its total and validity, keeping
+  // only the requested page. Nothing decoded is stored; the source is the one copy.
+  let encoding = kind === 'text' ? opts.encoding : undefined;
+  if (encoding === 'utf-8') {
+    if (meta.utf8Valid === false) throw new TextEncodingMismatchError(absPath, encoding);
+    encoding = undefined;
+  }
+  let total = meta.totalChars ?? 0;
+  if (encoding) {
+    total = 0;
+    for await (const text of textChunks(absPath, encoding)) total += text.length;
+  }
+  const textPath = kind === 'text'
+    ? absPath
+    : path.join(cacheDirFor(userId, absPath), 'text.md');
+  const textBytes = kind === 'text'
+    ? meta.size
+    : (await fs.promises.stat(textPath)).size;
+
+  const hasLineRange = opts.lineStart !== undefined || opts.lineEnd !== undefined;
+  let slice: Utf8Slice;
+  if (hasLineRange) {
+    const requestedStart = Math.max(1, Math.trunc(Number(opts.lineStart) || 1));
+    const requestedEnd = Math.max(
+      requestedStart,
+      Math.trunc(Number(opts.lineEnd) || requestedStart + 399),
+    );
+    slice = await readUtf8LineSlice(
+      textPath,
+      textBytes,
+      total,
+      requestedStart,
+      requestedEnd,
+      maxContentChars,
+      encoding,
+    );
+  } else {
+    const csRaw = typeof opts.charStart === 'number' ? Math.floor(opts.charStart) : 0;
+    const ceRaw = typeof opts.charEnd === 'number' ? Math.floor(opts.charEnd) : total;
+    const start = Math.max(0, Math.min(csRaw, total));
+    const end = Math.max(start, Math.min(ceRaw, total));
+    slice = await readUtf8CharSlice(textPath, textBytes, total, start, end, maxContentChars, encoding);
+  }
+
+  if (kind === 'text' && !isFresh(meta, statSource(absPath).stat)) {
+    throw new Error('file changed while preparing text metadata');
+  }
+  if (isRichDocument(kind) && !isFresh(meta, statSource(absPath).stat)) {
+    throw new NeedStatError(absPath, kind);
+  }
+  return {
+    content: slice.content,
+    meta: encoding ? { ...metaToPublic(meta), totalChars: total } : metaToPublic(meta),
+    ...(kind === 'text' && meta.sourceHash && !encoding ? { sourceHash: meta.sourceHash } : {}),
+    ...(encoding ? { encoding } : {}),
+    ...(kind === 'text' && !encoding && meta.utf8Valid === false ? { notUtf8: true } : {}),
+    range: { charStart: slice.charStart, charEnd: slice.charEnd },
+    ...(maxContentChars !== undefined ? { requestedCharEnd: slice.requestedCharEnd } : {}),
+    startLine: slice.startLine,
+  };
+}
+
+export async function readImageAsJpeg(
+  userId: string,
+  absPath: string,
+): Promise<ImageReadResult> {
+  void userId; // image kind bypasses cache; userId only used for future per-user policy
+  const kind = kindOf(absPath);
+  if (kind !== 'image') throw new Error(`readImageAsJpeg: not an image: ${absPath}`);
+  const buf = await fileSystemForPath(absPath).promises.readFile(absPath);
+  const out = await toCompressedJpeg(buf, { maxDim: 1024, quality: 70 });
+  return {
+    base64: out.buf.toString('base64'),
+    mediaType: 'image/jpeg',
+    width: out.width,
+    height: out.height,
+    bytes: buf.length,
+  };
+}
+
+/** Full extracted text + meta — used by grep_files to scan many files. Text
+ *  kind reads source directly; rich docs return cached text.md. Image throws. */
+export async function getExtractedText(
+  userId: string,
+  absPath: string,
+): Promise<{ text: string; meta: FileMeta }> {
+  const meta = await ensureFresh(userId, absPath);
+  if (meta.kind === 'image' || meta.kind === 'video' || meta.kind === 'audio') throw new NoTextError(absPath, meta.kind);
+  if (meta.kind === 'legacy_office') throw new UnsupportedFileKindError(absPath, meta.kind);
+  const text = await fileSystemForPath(absPath).promises.readFile(
+    meta.kind === 'text'
+      ? absPath
+      : path.join(cacheDirFor(userId, absPath), 'text.md'),
+    'utf8',
+  );
+  if (isRichDocument(meta.kind) && !isFresh(meta, statSource(absPath).stat)) {
+    throw new NeedStatError(absPath, meta.kind);
+  }
+  return { text, meta: metaToPublic(meta) };
+}
+
+/** Drop the cache entry for a single absolute path. Safe to call even when
+ *  no entry exists. Called on attachment delete / workspace file invalidate. */
+export function invalidateFileCache(userId: string, absPath: string): void {
+  removeDir(cacheDirFor(userId, absPath));
+}
+
+/** Startup sweep: drop cache dirs whose source is gone, whose version is
+ *  obsolete, or whose meta is malformed. Cheap (stat per dir), no network.
+ *
+ *  Optional `workspacePath`: when supplied, additionally drops
+ *  `source==='workspace'` entries whose `absPath` is no longer inside the
+ *  current workspace (e.g. user switched workspace dir, or moved the file
+ *  out of it). Attachment-source entries are NOT subject to this check —
+ *  they live in `<uid>/cloud/chat_attachments/`, separate from workspace.
+ *  Without `workspacePath` the call behaves exactly as before. */
+export async function pruneOrphans(
+  userId: string,
+  opts?: { workspacePath?: string },
+): Promise<{ deleted: number }> {
+  const root = userFileCacheDir(userId);
+  let deleted = 0;
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(root, { withFileTypes: true }); }
+  catch { return { deleted: 0 }; }
+
+  const wsRoot = opts?.workspacePath ? path.resolve(opts.workspacePath) : '';
+
+  for (const e of items) {
+    // This owner writes only 16-hex extraction entries. Other features share
+    // file_cache (notably local-agent-runs) and own their own retention.
+    if (!e.isDirectory() || !/^[a-f0-9]{16}$/.test(e.name)) continue;
+    const dir = path.join(root, e.name);
+    const meta = readMeta(dir);
+    const reason =
+      !meta || typeof meta.absPath !== 'string' || !path.isAbsolute(meta.absPath) ? 'no-meta' :
+      meta.cacheVersion !== EXTRACT_CACHE_VERSION ? 'version' :
+      macosTccSensitivePath(path.resolve(meta.absPath), { recursive: false }) ? 'tcc-protected-source' :
+      !safeExistsSync(meta.absPath) ? 'orphan' :
+      (wsRoot && meta.source === 'workspace' && !_isUnder(meta.absPath, wsRoot)) ? 'out-of-workspace' :
+      null;
+    if (reason && removeDir(dir)) {
+      deleted++;
+      log.debug('file cache entry pruned', { path: logPathRef(dir), reason });
+    }
+  }
+  if (deleted) log.info('orphan file cache pruned', { user_id: maskId(userId), deleted });
+  return { deleted };
+}
+
+/** True iff `abs` is `root` itself or any descendant of it. Uses
+ *  `path.relative` so it's robust against trailing slashes and `..`. */
+function _isUnder(abs: string, root: string): boolean {
+  const rel = path.relative(root, path.resolve(abs));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/** Drop all cache entries tagged with the given cid. Called from
+ *  chat_attachments.purgeByCid when a conversation is deleted. */
+export async function purgeFileCacheByCid(
+  userId: string,
+  cid: string,
+): Promise<{ deleted: number }> {
+  const root = userFileCacheDir(userId);
+  let deleted = 0;
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(root, { withFileTypes: true }); }
+  catch { return { deleted: 0 }; }
+
+  for (const e of items) {
+    if (!e.isDirectory()) continue;
+    const dir = path.join(root, e.name);
+    const meta = readMeta(dir);
+    if (meta && meta.source === 'attachment' && meta.cid === cid && removeDir(dir)) {
+      deleted++;
+    }
+  }
+  if (deleted) log.info('conversation file cache purged', { user_id: maskId(userId), cid: maskId(cid), deleted });
+  return { deleted };
+}
+
+function safeExistsSync(p: string): boolean {
+  try { fileSystemForPath(p).statSync(p); return true; }
+  catch { return false; }
+}

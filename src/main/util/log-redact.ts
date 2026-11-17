@@ -1,0 +1,186 @@
+import * as crypto from 'crypto';
+import * as fs from 'node:fs';
+import * as path from 'path';
+
+import { sanitizeLogTextForUpload } from './log-sanitize';
+
+const MAX_LOG_MESSAGE_LEN = 240;
+
+export function maskId(value: unknown): string {
+  const s = String(value || '');
+  if (!s) return '';
+  if (s === 'anonymous') return 'anonymous';
+  if (s.length <= 8) return `${s.slice(0, 2)}***${s.slice(-2)}`;
+  return `${s.slice(0, 4)}...${s.slice(-4)}`;
+}
+
+function hashForLog(value: unknown): string {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 12);
+}
+
+function normalizePathForLog(value: unknown): string {
+  return String(value || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+export function logCorrelationId(nowMs = Date.now(), seq = 0): string {
+  return `${nowMs.toString(36)}-${seq.toString(36)}`;
+}
+
+export function logPathRef(relPath: unknown): Record<string, unknown> {
+  const raw = String(relPath || '');
+  const rel = normalizePathForLog(raw);
+  const parts = rel.split('/').filter(Boolean);
+  const root = parts[0] === 'cloud' || parts[0] === 'local'
+    ? parts[1] || parts[0]
+    : path.isAbsolute(raw)
+      ? 'absolute'
+      : 'relative';
+  const base = parts[parts.length - 1] || '';
+  const ext = path.extname(base).toLowerCase();
+  return {
+    path_hash: hashForLog(rel),
+    domain: root,
+    depth: parts.length,
+    ext: ext || undefined,
+  };
+}
+
+export function logPathRefs(paths: unknown[], limit = 5): Record<string, unknown> {
+  const items = (paths || []).map(logPathRef).slice(0, limit);
+  return {
+    count: Array.isArray(paths) ? paths.length : 0,
+    sample: items,
+    truncated: Array.isArray(paths) && paths.length > limit,
+  };
+}
+
+export function logRenameRef(from: unknown, to: unknown): Record<string, unknown> {
+  return {
+    from: logPathRef(from),
+    to: logPathRef(to),
+  };
+}
+
+export function sanitizeLogText(value: unknown): string {
+  let text = String(value ?? '');
+  // Normalize sync-specific paths first. The central cloud-path matcher is
+  // intentionally sentence-aware and can otherwise absorb a following
+  // `via <url>` diagnostic into the path hash.
+  text = text.replace(/cloud\/[^\s'",)]+/g, (m) => `<cloud-path:${hashForLog(m)}>`);
+  text = text.replace(/\/sync\/[A-Za-z0-9_/-]+/g, (m) => m.split('?')[0]);
+  text = text.replace(/https?:\/\/[^\s'",)]+/g, (m) => safeUrlAction(m));
+  text = text.replace(/\b(ORKLSEC1|ghp|github_pat|sk|sk-proj|xox[baprs])[-_][-_A-Za-z0-9+/=:.]{12,}\b/g, '***REDACTED***');
+  // Keep this helper safe when it is used before the central logger hook is
+  // initialized (for example in focused tests and startup error paths).
+  text = sanitizeLogTextForUpload(text);
+  if (text.length > MAX_LOG_MESSAGE_LEN) text = `${text.slice(0, MAX_LOG_MESSAGE_LEN)}...`;
+  return text;
+}
+
+export function logErrorRef(err: unknown): Record<string, unknown> {
+  const e = err as any;
+  return {
+    name: e?.name ? String(e.name) : undefined,
+    code: e?.code || e?.Code || undefined,
+    status: e?.status || e?.statusCode || undefined,
+    message: sanitizeLogText(e?.message || String(err ?? '')),
+  };
+}
+
+const CLOSED_ERROR_TYPES = new Set([
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError',
+  'AbortError', 'TimeoutError', 'RequestTimeoutError',
+]);
+const CLOSED_ERROR_CODES = new Set([
+  'EACCES', 'EPERM', 'ENOENT', 'ENOSPC', 'EIO', 'EPIPE', 'EROFS',
+  'ENOTDIR', 'EISDIR', 'EEXIST', 'ECONNRESET', 'ECONNREFUSED',
+  'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ABORT_ERR',
+]);
+
+export function logErrorSummary(err: unknown, options: { closed?: boolean } = {}): Record<string, unknown> {
+  if (options.closed) {
+    // Logging must not run arbitrary exception coercion or interrupt recovery.
+    const field = (key: string): unknown => {
+      try { return (err as Record<string, unknown> | null)?.[key]; } catch { return undefined; }
+    };
+    const name = field('name');
+    const code = field('code') ?? field('Code');
+    const status = field('status') ?? field('statusCode');
+    const rawMessage = field('message');
+    const message = typeof rawMessage === 'string' ? rawMessage : typeof err === 'string' ? err : '';
+    return {
+      error_type: typeof name === 'string' && CLOSED_ERROR_TYPES.has(name) ? name : 'exception',
+      error_code: typeof code === 'string' && CLOSED_ERROR_CODES.has(code) ? code : 'operation_failed',
+      ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { status } : {}),
+      message_hash: hashForLog(message), message_chars: message.length,
+    };
+  }
+  const e = err as any;
+  const message = String(e?.message || err || '');
+  return {
+    name: e?.name ? String(e.name) : undefined,
+    code: e?.code || e?.Code || undefined,
+    status: e?.status || e?.statusCode || undefined,
+    message_hash: hashForLog(message),
+    message_chars: message.length,
+  };
+}
+
+export function logFailureRef(result: {
+  code?: unknown;
+  error_key?: unknown;
+  msg?: unknown;
+  current_generation?: unknown;
+  server_data_version?: unknown;
+  used_bytes?: unknown;
+  quota_bytes?: unknown;
+  delta_bytes?: unknown;
+}): Record<string, unknown> {
+  return {
+    code: result.code,
+    error_key: result.error_key,
+    msg: sanitizeLogText(result.msg || ''),
+    current_generation: result.current_generation,
+    server_data_version: result.server_data_version,
+    used_bytes: result.used_bytes,
+    quota_bytes: result.quota_bytes,
+    delta_bytes: result.delta_bytes,
+  };
+}
+
+export function safeUrlAction(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return '<non-url>';
+  }
+}
+
+/** Fingerprint only shipped first-party file-tool sources, never workspace data.
+ * Together with boot appVersion this distinguishes builds of the same version.
+ * Missing sources yield an explicit gap, never a misleading partial build id. */
+export function fileToolBuildRef(appRoot: string): Record<string, unknown> {
+  const sources = [
+    'src/main/model/core-agent/file-tools.ts',
+    'src/main/model/core-agent/local-tools.ts',
+    'src/main/model/core-agent/read-tracker.ts',
+    'src/core-agent/src/tools/apply-patch.ts',
+    'src/core-agent/src/tools/file-diagnostics.ts',
+    'src/core-agent/src/tools/base.ts',
+    'src/core-agent/src/agent/runner.ts',
+  ];
+  const hash = crypto.createHash('sha256');
+  let unavailable = 0;
+  for (const source of sources) {
+    try {
+      const target = path.join(appRoot, source);
+      if (fs.statSync(target).size > 2 * 1024 * 1024) { unavailable++; continue; }
+      const bytes = fs.readFileSync(target);
+      hash.update(source).update('\0').update(bytes).update('\0');
+    } catch { unavailable++; }
+  }
+  return unavailable
+    ? { status: 'incomplete', unavailable_sources: unavailable }
+    : { status: 'complete', source_hash: hash.digest('hex') };
+}

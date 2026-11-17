@@ -1,0 +1,299 @@
+/**
+ * Model interaction client.
+ *
+ * Thin wrapper over the core-agent backend — see `./core-agent/client.ts`
+ * for the actual implementation. This file exists so feature code can
+ * keep doing `require('../model/client')` / `import { chatWithModel } from
+ * '../model/client'` with no path changes.
+ *
+ * Public API:
+ *   - `chatWithModel(opts)`        — blocking; returns { ok, text, error }
+ *   - `streamChatWithModel(opts)`  — async generator yielding SSE-shape events
+ *
+ * Types (`ChatOptions`, `ChatResult`, `StreamEvent`) are defined here as the
+ * cross-module contract between features/ and model/.
+ */
+
+import type { AgentRunSteerInput, AgentTool, HistoryResource, Message } from '#core-agent';
+import type { SkillRuntimeBinding, SkillSelectionInput } from './core-agent/skill-registry';
+
+import {
+  abortActiveSession as _abortActiveSession,
+  abortActiveSessionsForConversation as _abortActiveSessionsForConversation,
+  chatWithModel as _chatWithModel,
+  streamChatWithModel as _streamChatWithModel,
+} from './core-agent/client';
+
+export interface StreamEvent {
+  type: 'progress' | 'event' | 'delta' | 'commentary-finalized' | 'final' | 'error' | 'done';
+  text?: string;
+  /** Assistant text presentation channel. Pending drafts are visible before
+   * a structured boundary classifies them as commentary or a final answer. */
+  phase?: 'commentary' | 'final_answer' | 'pending';
+  event?: Record<string, unknown>;
+  aborted?: boolean;
+  /** Structured source for terminal failures. */
+  failureKind?: 'model' | 'config';
+  /** Stable low-cardinality reason paired with `failureKind`. */
+  failureCode?: string;
+  /** This terminal failure explicitly exhausted the inner retry policy. */
+  retryExhausted?: boolean;
+  /** Sanitized provider rejection detail displayed only to the user. */
+  detail?: string;
+  /** Runtime phase where the terminal failure occurred. */
+  failurePhase?: 'preflight' | 'provider_wait' | 'model_text' | 'tool_input' | 'tool' | 'compaction';
+  /** Bounded provider code retained only for local failure classification. */
+  failureRawCode?: string;
+  /** Only present on the main-chat `final` event when the assistant text
+   * contained a fenced `agent-input-form` block. Carries the parsed form
+   * payload + the msgIndex at which the assistant message will land, so
+   * the renderer can attach the widget live. */
+  form?: unknown;
+  msgIndex?: number;
+}
+
+export interface ChatResult {
+  ok: boolean;
+  /** Completed text on success, or the safely accumulated partial text when
+   * the provider fails after output has started. Callers must still honor
+   * `ok=false` and must not execute structured mutations from partial text. */
+  text: string;
+  error: string;
+  aborted: boolean;
+}
+
+export interface ChatAttachmentMetadata {
+  hasAttachments: boolean;
+  attachmentTypes: string[];
+}
+
+export interface ChatOptions {
+  userId: string;
+  message: string;
+  sessionId?: string;
+  /** Host-authoritative completed dialogue to mirror into the execution
+   * session before starting a normal turn. Used by in-process named group
+   * actors, whose semantic history includes replies from every visible actor. */
+  conversationHistory?: {
+    source: string;
+    messages: Message[];
+    replaceFromTurnId?: number;
+    checkpoint?: string;
+  };
+  /** Continue a verified failed active turn in the same persistent session.
+   * Falls back to a normal new turn if no active turn remains. */
+  resumeActiveTurn?: boolean;
+  /** Extra system prompt prepended to core-agent's auto-generated skills block.
+   * Use this for conversation-level rules that must stay in context for every
+   * turn (kept on the system channel, not duplicated into each user message). */
+  systemPrompt?: string;
+  /** Human-readable actor name used in user-facing local permission prompts. */
+  agentName?: string;
+  /** Working directory for tool execution (list_files, read_file, bash, etc.).
+   * Defaults to process.cwd() if omitted. */
+  workingDir?: string;
+  /** Image attachments forwarded to vision-capable providers. `data` is base64
+   * (no `data:` prefix). Used by `features/contexts_extract` for vision-based
+   * description of uploaded images in the knowledge base staging area. */
+  images?: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  /** Image-understanding calls must never fall back to a text-only request. */
+  requireImageInput?: boolean;
+  /** Current-turn attachment metadata forwarded only as provider request
+   * metadata. Orkas-managed LLM uses it server-side to route model families;
+   * third-party providers do not receive it. */
+  attachmentMetadata?: ChatAttachmentMetadata;
+  /** Durable, host-verified resources that should survive history summaries. */
+  historyResources?: HistoryResource[];
+  /** Base idle bound (seconds), used to derive the runner-owned tool watchdog
+   *  and to cap the provider-wait and tool-input windows. Default 1800. */
+  idleTimeout?: number;
+  /** Absolute execution deadline owned by the actor dispatch; retries retain it. */
+  executionDeadlineAt?: number;
+  /** Idle window (seconds) while streamed tool-call JSON is incomplete.
+   *  Starts with the first `tool_delta`; each later `tool_delta` renews it,
+   *  while unrelated events do not. Defaults to `idleTimeout`. */
+  toolInputIdleTimeout?: number;
+  /** Short idle window (seconds) applied ONLY after ordinary assistant text
+   *  has begun streaming with NO tool in flight. Catches a provider stream
+   *  that started then went silent mid-generation, without false-killing
+   *  cold starts, post-tool model thinking, tool-input assembly, or
+   *  long/silent tools. Defaults to `idleTimeout`; shorter overrides are explicit. */
+  streamIdleTimeout?: number;
+  /** Middle idle window (seconds) for the provider-wait phase — cold start,
+   *  silent reasoning, and post-tool model calls. Every raw event (thinking
+   *  deltas included) resets the watchdog, so this only fires on a stream
+   *  that produced ZERO events for the whole window: a dead stream, not slow
+   *  reasoning. Defaults to `idleTimeout`. */
+  providerWaitIdleTimeout?: number;
+  /** Max tool-call rounds in a single turn before the run is force-ended with
+   *  "(Tool loop limit reached)". Undefined → core-agent schema default (100).
+   *  Group chat pins this for the commander (120) and named agent workers (100),
+   *  which legitimately run long multi-step builds (e.g. VideoStudio draft/render,
+   *  DeepResearcher gathering); loop_detection still guards true runaway loops. */
+  maxToolLoops?: number;
+  /** Optional soft convergence threshold; the hard tool-loop limit is unchanged. */
+  elapsedConvergenceMs?: number;
+  abortSignal?: AbortSignal | null;
+  /** Legacy openclaw CLI timeout — ignored, retained for signature parity. */
+  timeout?: number;
+  /** Subset of skill ids to inject into this call's system prompt. Undefined
+   * keeps the legacy behavior (every discovered skill is listed). Empty array
+   * produces no skills block — used when the target agent declares
+   * `skill_list: []`. Sourced from the target agent's `skill_list` field
+   * (see `features/agents.ts`). */
+  skillList?: string[];
+  /** Host-owned subset of hidden System Skill protocols exposed to this
+   * session. Undefined preserves the full catalog for Commander; edit
+   * surfaces pass an explicit fixed list. This is independent of the
+   * Agent's user-facing `skillList`. */
+  systemSkillList?: readonly string[];
+  /** Fixed tool groups authored by the target Agent. Undefined selects the
+   * historical fixed compatibility surface; [] is host-only. */
+  toolList?: string[];
+  /** This call can author LLM-managed Agent tool dependencies. The runner
+   * exposes the shared group-id directory without expanding the editor. */
+  agentToolDependencyAuthoring?: boolean;
+  /** User-explicit skill refs selected in the composer. Open/global skills
+   *  named here may be rendered even when an agent skill allowlist is active. */
+  forceOpenSkillRefs?: readonly SkillSelectionInput[];
+  /** Shared host-owned bindings for Skills admitted later by rich steer. */
+  runtimeSkillBindings?: Map<string, SkillRuntimeBinding>;
+  /** Mutable current-turn Agent tool groups granted by explicit user
+   * selections. These activate before the Agent's lower-priority fallback. */
+  runtimeGrantedToolGroups?: string[];
+  /** Extra tools merged into core-agent's builtin tool set for this call.
+   * Currently used by group_chat commander to surface `plan_set` and
+   * agent-management tools alongside the builtin set. */
+  extraTools?: AgentTool[];
+  /** Agent id bound to the conversation. Used to scope metacognition
+   * (COMPETENCE.md / LEARNING_STRATEGIES.md) to the specific agent.
+   * Empty/undefined = default scope ("_default"). */
+  agentId?: string;
+  /** Conversation id. Propagated into the file-tools factory so
+   *  read_file / search_files / grep_files scope to this conv's attachment
+   *  dir in addition to the user's active workspace. */
+  cid?: string;
+  /** Current user-visible conversation title for short-lived credit-history
+   * display metadata. Never logged or used as runtime conversation state. */
+  conversationTitle?: string;
+  /** Epoch milliseconds of the title version, used to reject stale updates. */
+  conversationTitleUpdatedAt?: number;
+  /** Stable id for the visible actor turn. Group chat passes this through as
+   *  part of its turn-scoped execution contract; file output now stays in the
+   *  conversation workspace rather than a turn-specific subdirectory. */
+  turnId?: string;
+  /** Stable id of the inbound conversation message that triggered this run.
+   * Current-scope history tools stop strictly before this record. */
+  historyBoundaryMessageId?: string;
+  /** Host-owned final delivery versus intermediate work for Commander. */
+  outputDelivery?: 'final' | 'process';
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Caller (group_chat
+   *  or skill/agent edit) resolves it once before invoking. */
+  projectId?: string;
+  /** Extra absolute directory roots whitelisted for file-tools on top of
+   *  workspace + attachment. Read AND write are permitted under these roots.
+   *  Per-skill edit chats pass the skill dir so the LLM can read / search /
+   *  overwrite files it manages. */
+  extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see these, but write-side tools
+   *  (edit_file / write_file / bash / create_pdf /
+   *  generate_image) cannot mutate paths inside. Used by group-chat
+   *  commander to inspect agent / skill specs while the structured
+   *  `<agent>` / `<skill>` containers remain the only sanctioned mutation
+   *  channels. */
+  readOnlyExtraRoots?: readonly string[];
+  /** File-tool-only read roots. These are visible to `read_file` /
+   *  `search_files` / `grep_files` / `stat_file`, but are intentionally not
+   *  passed to local-exec tools such as `delete_file`, `bash`, `write_file`,
+   *  `create_pdf`. Used for user-approved read-only
+   *  folder grants. */
+  fileReadOnlyExtraRoots?: readonly string[];
+  /** Mutable, run-scoped read-only roots admitted by rich interrupt-steer.
+   * The array identity is retained by file/local tools and may only be
+   * extended by the trusted main-process attachment/reference resolver. */
+  runtimeReadOnlyRoots?: string[];
+  /** Build the stable superset of tools needed by a rich active-turn ingress
+   * (connector meta-tools that resolve availability when
+   * executed). Group Chat sets this only for top-level CoreAgent turns. */
+  richSteerEnabled?: boolean;
+  /** Fired with the absolute path of every file produced by the local-exec
+   * tools (`write_file`, `create_pdf`, `bash`)
+   * during this run.
+   * `features/chats` uses this to attach a `produced[]` list to the
+   * assistant message so the UI can offer a "reveal in Finder" chip. */
+  onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** Accepts the model's complete final-deliverable declaration for this
+   * turn and returns the subset eligible for resource display. Paths are
+   * absolute before this callback runs. */
+  onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** Predicate: true when the given absolute path was already written by
+   * this caller's session (typically: a `Set` populated by `onFileWritten`
+   * earlier in the same turn). Used by the write-style tools' uniquify
+   * logic to distinguish refinement (overwrite in place) from foreign
+   * collision (rename to `-2 / -3 / ...`). When undefined, every
+   * pre-existing path at the target is treated as a foreign collision. */
+  hasProducedPath?: (absPath: string) => boolean;
+  /** Fired after each successful `create_artifact` call with the new
+   *  artifact's id + title. `features/group_chat` collects these per turn
+   *  and attaches a `artifacts[]` list to the assistant message so the
+   *  renderer embeds each interactive web-app artifact in the bubble. */
+  onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
+  /** Fired only after the custom-connector manager has durably accepted a
+   * user-confirmed server. Group chat uses the stable id to offer a review
+   * shortcut; the callback is not part of installation authorization. */
+  onCustomConnectorAdded?: (connectorId: string) => void;
+  /** A saved automation, so the host can offer the user a route to it. */
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  /** A deleted automation / todo, so the host withdraws an offer staged earlier in the turn. */
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
+  /** Fired at turn start with each skill id that entered the system-prompt
+   *  index, split by source system (`A.custom` / `A.platform` / `B`).
+   *  `features/group_chat` buffers per turn and emits `skill_advertised`
+   *  signals at turn-end (grouped by system). See expert-signals plan
+   *  §4.1 + PC/CLAUDE.md §4 constraint 9. */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B') => void;
+  /** Fired when the agent's `read_file` resolves to a SKILL.md path inside
+   *  any of the three skill roots. Bus buffers per turn and emits one
+   *  `skill_invoked` signal per (system, skill_id) pair at turn-end. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
+  /** Prompt-cache TTL policy. Undefined lets pi-ai pick its default
+   * (`"short"` = Anthropic 5m / OpenAI in-memory). `"long"` opts into
+   * extended retention (Anthropic 1h with 2x write premium / OpenAI 24h).
+   * `"none"` disables caching. Feature layer leaves this undefined today;
+   * a future settings-page toggle will flip it per-user. Providers without
+   * prompt-cache support (e.g. Mistral) silently ignore it. */
+  cacheRetention?: 'none' | 'short' | 'long';
+  /** Thinking/reasoning effort for reasoner models. Undefined lets the
+   *  provider apply its configured default, or omit an explicit effort when
+   *  it has none. Set `'off'` to suppress a provider-configured default; set
+   *  `'low'` / `'high'` to override when the selected provider supports it. */
+  thinkingLevel?: 'off' | 'low' | 'high';
+  /** G8d in-process nested sub-run (a dispatch tool running a worker/agent turn
+   *  inside its caller's turn). When true, the run does NOT acquire a global
+   *  concurrency slot — the parent turn already holds one, and a nested
+   *  acquire would deadlock once the slot pool is exhausted (parent holds a
+   *  slot, waits for the child's slot, pool full). Nested concurrency is bounded
+   *  by the caller's dispatch cap instead. The per-session lock is still taken
+   *  (the nested session is fresh/unique, so it's uncontended). Default false =
+   *  top-level turn = current behavior. */
+  nested?: boolean;
+  /** Host-owned approval source, refreshed only after a real user steer is durably applied. */
+  currentUserMessage?: { text: string };
+  /** interrupt-steer (G9). Called at each safe model/tool-loop boundary. The
+   * group-chat host may asynchronously hydrate rich queued content before it
+   * is atomically folded into this run. */
+  drainSteer?: () =>
+    | AgentRunSteerInput[]
+    | undefined
+    | Promise<AgentRunSteerInput[] | undefined>;
+}
+
+export const chatWithModel = _chatWithModel;
+export const streamChatWithModel = _streamChatWithModel;
+export const abortActiveSession = _abortActiveSession;
+export const abortActiveSessionsForConversation = _abortActiveSessionsForConversation;

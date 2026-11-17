@@ -1,0 +1,1956 @@
+import { onVideoCanvasJob } from './features/video_canvas_jobs';
+import { createShutdownCoordinator } from './util/shutdown';
+import { scheduleChatApiPreload } from './features/model-api-preload';
+/**
+ * Orkas — Electron main entry.
+ *
+ * Boot sequence:
+ *   1. Side-effect import of `./install-data-root` resolves the install
+ *      container (`~/.orkas` on macOS/Linux; on Windows a drive recorded
+ *      in `%LOCALAPPDATA%\Orkas\install-pin.json`), runs the one-shot
+ *      `PC/data` → `<container>/data` migration, and sets
+ *      `ORKAS_WORKSPACE_ROOT`. Both dev and packaged go through this
+ *      single path — the old dev/prod data-root split is gone. The side
+ *      effect lives at module load (not in body code) because esbuild's
+ *      CJS transformer hoists imports — `paths.ts` would otherwise load
+ *      with an unset env var. See install-data-root.cjs header.
+ *   2. Pin CORE_AGENT_AUTH_DIR to <WS_ROOT>/config/ so core-agent's
+ *      credential store lives under data/ (local-only, never synced).
+ *      The env var name is core-agent's public API — kept as
+ *      `AUTH_DIR` for stability even though the dir now also holds
+ *      `user.json` and `web-search-cache.json`.
+ *   3. Create BrowserWindow loading renderer/index.html.
+ *   4. IPC handlers serve invoke + stream calls from the renderer.
+ *
+ * File location: `PC/src/main/index.ts`. `bootstrap.cjs`'s
+ * `require('./src/main')` resolves here automatically via Node's
+ * folder → index resolution rule. `__dirname` points at `PC/src/main/`;
+ * cross-tree references to renderer / resources go through
+ * `paths.SRC_ROOT` — never splice `__dirname` directly.
+ */
+
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { spawn } from 'node:child_process';
+import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, powerSaveBlocker, protocol, session, shell } from 'electron';
+import { installWindowPresentationEvents } from './util/window-presentation';
+// Side-effect import: at module-load time this resolves the install
+// container, runs the one-shot PC/data → <container>/data migration, and
+// sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
+// — any module loaded before this would not see the env var. See
+// install-data-root.cjs header for why the side effect lives at load time
+// rather than in index.ts body (esbuild CJS hoists imports → body runs
+// after paths.ts loads, which is too late to set the env var).
+import './install-data-root.cjs';
+import { resolveCliCommand } from './features/local_agents/spawn-command';
+import { createOptionalTray } from './util/app-tray';
+import { captureWindowsShutdownProcesses } from './util/windows-shutdown-processes';
+import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
+import {
+  hardenedWebPreferences,
+  installExternalNavigationGuard,
+  installHtmlPreviewNavigationGuard,
+  withHtmlPreviewAssetPolicy,
+  withHtmlPreviewPolicy,
+} from './util/window-security';
+import {
+  createRendererChannel,
+  type RendererChannel,
+  type RendererChannelDeps,
+  type RendererChannelOptions,
+} from './util/renderer-channel';
+import { resolveContainedProtocolFile } from './util/protocol-path';
+
+const APP_USER_MODEL_ID = 'com.ziorkas.desktop';
+const APP_DISPLAY_NAME = 'ZI-Orkas';
+const E2E_USER_DATA_DIR = !app.isPackaged
+  ? String(process.env.ORKAS_E2E_USER_DATA_DIR || '').trim()
+  : '';
+const E2E_HIDE_WINDOW = !app.isPackaged
+  && String(process.env.ORKAS_E2E_HIDE_WINDOW || '').trim() === '1';
+const WINDOWS_TASK_BADGE_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPklEQVR4nGNgoAX4jwNQpJkoQ2CK3ru4YMV4DSGkGa8hxGrGacioAVQwgOJopEpCQjcEF8CrmZAhRGkmFQAAcdLnkJb3ml4AAAAASUVORK5CYII=';
+const PACKAGED_LAUNCH_SMOKE_FILE = app.isPackaged
+  ? String(process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE || '').trim()
+  : '';
+const IS_PACKAGED_LAUNCH_SMOKE = !!PACKAGED_LAUNCH_SMOKE_FILE;
+let appTray: Tray | null = null;
+const mainWindows = new Set<BrowserWindow>();
+let isQuitting = false;
+const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const MARKETPLACE_SERVER_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
+
+// Source and packaged builds share one app identity and one server
+// environment: global prod. This keeps local data paths and OS app grouping
+// stable across run modes.
+app.setName('ZI-Orkas');
+try {
+  if (IS_PACKAGED_LAUNCH_SMOKE) {
+    app.setPath('userData', path.join(path.dirname(PACKAGED_LAUNCH_SMOKE_FILE), 'user-data'));
+  } else if (E2E_USER_DATA_DIR) {
+    // Keep unpackaged E2E state and its single-instance lock away from the
+    // developer's normal Orkas profile. Packaged launches ignore this hook.
+    app.setPath('userData', path.resolve(E2E_USER_DATA_DIR));
+  }
+} catch {
+  /* userData may be unavailable in unusual test hosts; the default is fine. */
+}
+
+// Register the KB file protocol BEFORE `app.whenReady()` — privileged
+// schemes can't be added after. `kb-file:///<relpath>` serves a single
+// file out of the current active user's `<uid>/cloud/contexts/`. Used by
+// the renderer's PDF iframe (Chromium's built-in PDFium handles `.pdf`
+// directly when served via a standard scheme). Other bytes types fall
+// back to `shell.openPath`.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'kb-file',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
+  // `chat-media://cid/<encCid>/<encName>` — serves image + video bytes for a
+  // cid attachment. Sent attachments resolve under cloud/chat_attachments/;
+  // composer-only draft cids resolve under local/chat_attachment_drafts/.
+  // `stream:true`
+  // only enables a streamed Response body — it does NOT make Chromium issue
+  // byte-range requests on its own; the handler must advertise
+  // `Accept-Ranges: bytes` and serve `206` itself (see `serveFileRange`).
+  // Without that, `<video preload="metadata">` freezes a few seconds in
+  // because Chromium can't resume past the cancelled metadata-probe fetch.
+  // `corsEnabled` lets an HTML preview (opaque-origin sandbox) load its
+  // same-folder fonts, module scripts and fetch() data; only responses that
+  // carry an explicit grant (`withHtmlPreviewAssetPolicy`) become readable.
+  {
+    scheme: 'chat-media',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
+  },
+  // `chat-app://cid/<encCid>/<encArtifactId>/<relpath>` serves chat artifacts;
+  // `chat-app://saved/<encAppId>/<relpath>` serves user-kept "My Apps" bundles.
+  // Both are embedded in sandboxed iframes.
+  // `standard:true` gives the iframe a real origin (`chat-app://cid`) so it
+  // can use `<script type="module">` / same-origin `fetch` of sibling files /
+  // `localStorage`; `secure:true` lets the `file://` renderer frame it
+  // without a mixed-content block (same as `kb-file://`). `stream:true` for
+  // the Range-aware streamed body (see `serveFileRange`).
+  {
+    scheme: 'chat-app',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
+]);
+
+import * as paths from './paths';
+import { serveFileRange as serveFileRangeCore } from './util/http-range';
+import {
+  type BootResourceClass,
+  configureBootAdmission,
+  noteBootUserActivity,
+  registerDeferred,
+  runBootPhases,
+  scheduleBootBackground,
+} from './util/boot_init';
+import { getBootDeviceProfile } from './util/boot-device-profile';
+
+// `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
+// (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
+// re-reads the env on every call so switching at runtime is safe.
+
+// Skill runner env vars (ORKAS_NODE / ORKAS_BUNDLED_NODE / ORKAS_PC_DIR)
+// are injected per-call into the bash-tool sandbox by
+// `model/core-agent/client.ts::buildSkillSandboxEnv()`. Do NOT set them on
+// `process.env` here: the sandbox strips parent env anyway, and runtime
+// overrides must never leak to Electron's own GPU/Renderer/Utility helpers.
+
+import * as storage from './storage';
+import { initLogger, createLogger } from './logger';
+import { fileToolBuildRef, logErrorSummary } from './util/log-redact';
+initLogger();
+const log = createLogger('orkas');
+const marketplaceBootLog = createLogger('marketplace_boot');
+
+// Replay any pin / migration warnings buffered by install-data-root
+// (which runs before logger.ts can be imported) into the daily log.
+import { flushEarlyDiagnostics } from './install-data-root.cjs';
+{
+  const installLog = createLogger('install-data-root');
+  flushEarlyDiagnostics((m) => installLog.warn(m));
+}
+
+// Raise Anthropic / OpenAI SDK default timeouts before any feature (which may
+// transitively pull in pi-ai) loads them. See sdk-timeout-patch.ts.
+import { installSdkTimeoutPatch } from './model/core-agent/sdk-timeout-patch';
+installSdkTimeoutPatch();
+
+// Keep SSE as the preferred model transport, but do not let a provider-local
+// response-header failfast preempt Orkas' own turn-level abort/watchdog policy.
+import { installSseHeaderTimeoutPatch } from './model/core-agent/sse-header-timeout-patch';
+installSseHeaderTimeoutPatch();
+
+// Install the stable router before diagnostics wrap fetch. Explicit launch
+// proxy settings apply now; Electron system routes become available at ready.
+import { installEnvProxyDispatcher, installSystemProxyDispatcher } from './util/proxy-dispatcher';
+void installEnvProxyDispatcher();
+
+// Provider-fetch diagnostics preserve the router installed above.
+import { installFetchDiag } from './model/core-agent/fetch-diag';
+installFetchDiag();
+
+import { hasActiveWork, prepareForShutdown, resumeAfterFailedShutdown, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
+import { setFetchImplementation } from './util/retry';
+setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
+
+import { prompts } from './prompts/loader';
+import * as ipc from './ipc';
+import * as users from './features/users';
+import * as skillsFeature from './features/skills';
+import * as agentsFeature from './features/agents';
+import * as contextsFeature from './features/contexts';
+import * as chatsFeature from './features/chats';
+import * as conversationTaskBoard from './features/group_chat/task_board';
+import * as searchFeature from './features/search';
+import * as projectFilesFeature from './features/project_files';
+import * as appConfig from './features/config';
+import { getRendererBootTables, t } from './i18n';
+import * as reflectionOrchestrator from './features/reflection-orchestrator';
+import * as autoTasks from './features/auto_tasks';
+import * as projectDriverRunner from './features/project_driver_runner';
+import * as projectTasks from './features/project_tasks';
+import * as projects from './features/projects';
+import * as conversationFiling from './features/conversation_filing';
+import * as systemSkills from './features/system_skills';
+import * as bundledContentStartup from './features/bundled_content_startup';
+import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
+import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
+import { createMarketplaceCatalogReader } from './features/marketplace_catalog';
+import { createLoginStartup, setLoginStartup, shouldHideStartupWindow } from './features/login_startup';
+import * as chatAttachments from './features/chat_attachments';
+import * as chatArtifacts from './features/chat_artifacts';
+import * as savedApps from './features/saved_apps';
+import { appResource, hasIsolatedBrowserStorage } from './features/web_apps/host';
+import * as clientConfigFeature from './features/client_config';
+import * as connectorsFeature from './features/connectors';
+import * as windowState from './features/window_state';
+import { startIdleSleepGuard } from './features/idle_sleep_guard';
+import { createDesktopWindowController, getDesktopWindowController, setDesktopWindowController } from './features/desktop_windows';
+import * as taskNotifications from './features/task_notifications';
+import { installWindowCloseConfirmation } from './features/window_close_confirmation';
+import * as taskUnreadTray from './features/task_unread_tray';
+import * as notificationPermissions from './features/notification_permissions';
+import {
+  startOpenLifecycleTracking,
+  type OpenLifecycleTracking,
+} from './features/open_lifecycle';
+import {
+  consumeColdLaunchConnectorCallback,
+  registerConnectorProtocol,
+} from './features/connectors/protocol';
+// Server-backed account, multi-device sync, remote-control relay, and
+// auto-update features are stripped in the open-source build. Connectors remain available
+// through the open server bridge.
+
+let windowsTaskBadgeIcon: ReturnType<typeof nativeImage.createFromDataURL> | null = null;
+let openLifecycleTracking: OpenLifecycleTracking | null = null;
+
+function setTaskNotificationBadgeCount(count: number): void {
+  const normalized = Math.max(0, Math.trunc(count));
+  if (process.platform === 'win32') {
+    if (normalized > 0 && !windowsTaskBadgeIcon) {
+      windowsTaskBadgeIcon = nativeImage.createFromDataURL(WINDOWS_TASK_BADGE_DATA_URL);
+    }
+    const overlay = normalized > 0 ? windowsTaskBadgeIcon : null;
+    const description = normalized > 0 ? `${normalized} unread task notification${normalized === 1 ? '' : 's'}` : '';
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.setOverlayIcon(overlay, description);
+    }
+    return;
+  }
+  app.setBadgeCount(normalized);
+}
+
+let mainRendererReady = false;
+
+// Renderer channels replay what the window could not take while loading; the
+// owner-scoped ones never hand one account's rows to the next (see
+// util/renderer-channel). Every channel created here is flushed on
+// `did-finish-load`.
+const rendererChannels: RendererChannel[] = [];
+const rendererChannelDeps: RendererChannelDeps = {
+  broadcast: (channel, payload) => ipc.broadcastToRenderer(channel, payload),
+  rendererReady: () => mainRendererReady,
+  activeUserId: () => (users.hasActiveUser() ? users.getActiveUserId() : null),
+};
+function rendererChannel(channel: string, options: RendererChannelOptions): RendererChannel {
+  const created = createRendererChannel(channel, options, rendererChannelDeps);
+  rendererChannels.push(created);
+  return created;
+}
+const taskTerminalUi = rendererChannel('conversation:task_terminal', { maxPending: 100, ownerScoped: true });
+const videoCanvasJob = rendererChannel('conversations:video-canvas-job', { maxPending: 50, ownerScoped: true });
+const conversationFilingFailure = rendererChannel('conversations:filing-failed', { maxPending: 20, ownerScoped: true });
+
+function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
+  // App requests own their result UI and private execution lifecycle.
+  if (paths.appConversationOwner(event.conversation_id)) return;
+  const { user_id: ownerUserId, ...terminal } = event;
+  taskTerminalUi.emit({ type: 'terminal', ...terminal }, ownerUserId);
+}
+
+let modelApiPreloadScheduled = false;
+
+function createWindow(startupHidden = false): BrowserWindow {
+  const dev = !app.isPackaged;
+  const restored = windowState.restoreWindowState();
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 800,
+    ...restored.bounds,
+    title: '',
+    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW && !startupHidden,
+    focusable: !E2E_HIDE_WINDOW,
+    backgroundColor: '#ffffff',
+    icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
+    webPreferences: hardenedWebPreferences({
+      // preload sits next to index.ts in PC/src/main/ — just __dirname + 'preload.js'.
+      preload: path.join(__dirname, 'preload.js'),
+      devTools: dev,
+      additionalArguments: IS_PACKAGED_LAUNCH_SMOKE ? ['--orkas-packaged-launch-smoke'] : [],
+      // Enables Chromium's built-in PDF viewer (PDFium) inside iframes.
+      // Required for `<iframe src="kb-file:///.../report.pdf">` in the KB
+      // viewer. Has no effect on other plugin types since Electron strips
+      // the NPAPI / NaCl code path.
+      plugins: true,
+    }),
+  });
+  mainWindows.add(win);
+  installWindowPresentationEvents(win);
+  win.on('focus', () => taskUnreadTray.refreshTaskUnreadTray());
+  getDesktopWindowController()?.install(win, () => isQuitting);
+  if (process.platform === 'linux') installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
+  windowState.watchWindowState(win);
+  // maximize() also shows a hidden native window.
+  if (restored.isMaximized && !E2E_HIDE_WINDOW && !startupHidden) win.maximize();
+
+  win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
+  win.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    // Embedded previews also trigger did-start-loading, but only a new main
+    // document replaces our subscribers and later emits did-finish-load.
+    if (!isMainFrame || isInPlace) return;
+    mainRendererReady = false;
+  });
+  win.webContents.on('did-finish-load', () => {
+    mainRendererReady = true;
+    for (const channel of rendererChannels) channel.flush();
+    if (!modelApiPreloadScheduled) {
+      modelApiPreloadScheduled = true;
+      scheduleChatApiPreload(async () => {
+        if (win.isDestroyed() || win.webContents.isDestroyed() || win.webContents.isLoadingMainFrame()) return false;
+        return await win.webContents.executeJavaScript(
+          'document.documentElement.dataset.orkasBootReady === "true"',
+        ) === true;
+      });
+    }
+  });
+  win.webContents.on('render-process-gone', () => {
+    mainRendererReady = false;
+  });
+  win.on('closed', () => {
+    mainWindows.delete(win);
+    mainRendererReady = false;
+  });
+
+  // Block HTML <title> from populating the native titlebar — we want a
+  // frame-only look (drag works, but no label across the top).
+  win.on('page-title-updated', (e) => e.preventDefault());
+
+  // External links in chat bubbles / knowledge base / settings always open
+  // in the system default browser:
+  //   - `target="_blank"` / `window.open()`  → setWindowOpenHandler
+  //   - `<a href>` clicks without a target   → will-navigate (otherwise
+  //     Electron navigates the current window away and replaces the UI).
+  // The guard opens only safe HTTP(S) targets and blocks every other
+  // top-level navigation. Explicit mail/phone links use the validated IPC
+  // path instead of weakening this final security boundary.
+  installExternalNavigationGuard(
+    win.webContents,
+    (url) => shell.openExternal(url),
+    (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
+  );
+  installHtmlPreviewNavigationGuard(win.webContents);
+
+  // Hijack Cmd/Ctrl+R / F5 uniformly:
+  //   - Packaged: refresh disabled (the App doesn't need reload).
+  //   - Dev: force reloadIgnoringCache so that after editing
+  //     renderer/*.css or *.js, Cmd+R picks up the new version directly —
+  //     no need to hand-bump the `?v=` cache-busting suffix in renderer.
+  //   - Cmd/Ctrl+Shift+R is NOT intercepted here: it's the renderer-side
+  //     devtools "relaunch" chord (calls `app.relaunch()`), so we let it
+  //     fall through to renderer keydown.
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    if (input.shift) return;
+    const k = (input.key || '').toLowerCase();
+    const mod = input.meta || input.control;
+    const isReload = (mod && k === 'r') || k === 'f5';
+    if (!isReload) return;
+    event.preventDefault();
+    if (dev) win.webContents.reloadIgnoringCache();
+  });
+
+  return win;
+}
+
+function showMainWindow(): BrowserWindow {
+  const win = [...mainWindows].find((candidate) => !candidate.isDestroyed()) || createWindow();
+  if (win.isFocusable()) {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  }
+  return win;
+}
+
+function createAppTray(): void {
+  const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons',
+    process.platform === 'darwin' ? 'whaleTemplate.png' : 'icon.ico');
+  appTray = createOptionalTray({
+    platform: process.platform,
+    iconPath,
+    displayName: APP_DISPLAY_NAME,
+    onActivate: () => { showMainWindow(); },
+    onQuit: () => { setImmediate(() => app.quit()); },
+    labels: () => ({ open: t('desktop.open'), quit: t('desktop.exit') }),
+    warn: message => log.warn(message),
+  });
+}
+
+function openConversationFromTaskNotification(
+  conversationId: string,
+  status: import('./features/group_chat/bus').TaskTerminalStatus,
+  userId: string,
+): void {
+  if (!storage.safeId(conversationId) || !storage.safeId(userId)) {
+    log.warn('task notification carried invalid navigation scope');
+    return;
+  }
+
+  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed()) || createWindow();
+  if (win.isFocusable()) {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  }
+
+  const send = () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    win.webContents.send('conversations:open-from-notification', {
+      conversation_id: conversationId,
+      terminal_status: status,
+      user_id: userId,
+    });
+  };
+  if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
+  else send();
+}
+
+/** `prepareShutdown` is the work a normal quit runs in `before-quit`; exits
+ *  that bypass it (`app.exit`) run it themselves. */
+function registerIpc(
+  prepareShutdown: (mode?: 'quit' | 'relaunch') => Promise<void>,
+  isShutdownQuiescent: () => boolean,
+): void {
+  ipc.register();
+  onVideoCanvasJob(({ userId, ...event }) => videoCanvasJob.emit(event, userId));
+  // Subscribe before opening the renderer. The deferred driver scheduler must
+  // not determine whether foreground or early background writes are visible.
+  projectTasks.onTasksChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
+    projectId: e.pid,
+  }));
+  // A conversation filed under a project by the host has no renderer request to
+  // answer, so the sidebar is told directly.
+  conversationFiling.onConversationFiled((e) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== e.userId) return;
+    ipc.broadcastToRenderer('conversations:filed', { conversation: e.conversation });
+  });
+  conversationFiling.onConversationFilingFailed(({ userId, ...receipt }) => {
+    conversationFilingFailure.emit(receipt, userId);
+  });
+  conversationFiling.onConversationProjectRenamed((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.userId) return;
+    ipc.broadcastToRenderer('projects:renamed', event);
+  });
+  projects.onProjectInstructionsChanged((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.uid) return;
+    ipc.broadcastToRenderer('projects:instructions-changed', { projectId: event.projectId });
+  });
+  conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
+    projectId: e.pid,
+  }));
+
+  ipcMain.handle('orkas.ping', () => {
+    return { ok: true, pong: 'pong', ts: storage.nowIso() };
+  });
+
+  if (IS_PACKAGED_LAUNCH_SMOKE) {
+    let recorded = false;
+    ipcMain.handle('orkas.packagedLaunchSmokeReady', async (event, payload) => {
+      if (recorded) return { ok: true };
+      const owner = BrowserWindow.fromWebContents(event.sender);
+      const readyState = String(payload?.rendererReadyState || '');
+      if (!owner || owner.isDestroyed()) throw new Error('launch smoke sender is not an active BrowserWindow');
+      if (payload?.preloadLoaded !== true || payload?.ping !== 'pong') {
+        throw new Error('launch smoke preload/IPC proof is incomplete');
+      }
+      if (readyState !== 'interactive' && readyState !== 'complete') {
+        throw new Error(`launch smoke renderer is not ready: ${readyState || '(missing)'}`);
+      }
+      const launchStartedAtMs = Number(process.env.ORKAS_PACKAGED_LAUNCH_STARTED_AT_MS);
+      if (!Number.isFinite(launchStartedAtMs) || launchStartedAtMs <= 0) {
+        throw new Error('launch smoke start timestamp is missing');
+      }
+      const appAsar = path.join(process.resourcesPath, 'app.asar');
+      // Electron's patched `fs` exposes an ASAR as a virtual directory, so
+      // stat().isFile() is false even for a healthy physical archive. Prove
+      // the archive is present and that this running main module was actually
+      // resolved from inside it.
+      const mainLoadedFromAsar = __dirname.split(path.sep).includes('app.asar');
+      if (!fs.existsSync(appAsar) || !mainLoadedFromAsar) {
+        throw new Error(`launch smoke main process was not loaded from app.asar: ${appAsar}`);
+      }
+      // Keep renderer readiness independent of the subsequent Library work.
+      // Only this packaged, isolated smoke path writes synthetic Library data.
+      const readyElapsedMs = Math.max(0, Date.now() - launchStartedAtMs);
+      const { runPackagedLibrarySmoke } = await import('./features/library_smoke');
+      const library = await runPackagedLibrarySmoke();
+      const record = {
+        status: 'ready',
+        appIsPackaged: app.isPackaged,
+        appAsar: true,
+        preloadLoaded: true,
+        rendererLoaded: true,
+        ipcPing: 'pong',
+        rendererReadyState: readyState,
+        version: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        readyElapsedMs,
+        library,
+        readyAt: new Date().toISOString(),
+      };
+      const marker = path.resolve(PACKAGED_LAUNCH_SMOKE_FILE);
+      const temp = `${marker}.${process.pid}.tmp`;
+      fs.mkdirSync(path.dirname(marker), { recursive: true });
+      fs.writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+      fs.renameSync(temp, marker);
+      recorded = true;
+      setImmediate(() => app.quit());
+      return { ok: true };
+    });
+  }
+
+  ipcMain.handle('orkas.env', () => {
+    const systemVersion = osVersion();
+    const platform = desktopPlatform();
+    let appLanguage = 'und';
+    let systemLanguage = 'und';
+    const autoUpdateEnabled = false;
+    let taskNotificationsEnabled = true;
+    try {
+      appLanguage = appConfig.getLanguage();
+    } catch (err) {
+      log.warn('app language lookup failed', { error: logErrorSummary(err) });
+    }
+    try {
+      systemLanguage = preferredSystemLanguage(app.getPreferredSystemLanguages());
+    } catch (err) {
+      log.warn('system language lookup failed', { error: logErrorSummary(err) });
+    }
+    try {
+      taskNotificationsEnabled = appConfig.getTaskNotificationsEnabled();
+    } catch (err) {
+      log.warn('task notification preference lookup failed', { error: logErrorSummary(err) });
+    }
+    return {
+      ok: true,
+      isDev: !app.isPackaged,
+      isPackaged: app.isPackaged,
+      version: app.getVersion(),
+      platform,
+      osVersion: systemVersion,
+      arch: process.arch,
+      appLanguage,
+      systemLanguage,
+      autoUpdateEnabled,
+      taskNotificationsEnabled,
+      isE2E: !!E2E_USER_DATA_DIR,
+    };
+  });
+
+  if (!app.isPackaged) {
+    // The relaunch button shells out to run.sh / run.cmd instead of using
+    // `app.relaunch()` so we can reuse `scripts/ensure-deps.cjs` for
+    // dependency self-healing — otherwise pulling new code + relaunching
+    // crashes immediately due to missing packages. The shell script receives
+    // this process as its explicit owner, waits for it to exit, then starts the
+    // replacement without touching any other Electron process.
+    ipcMain.handle('orkas.relaunch', async () => {
+      const isWindows = process.platform === 'win32';
+      const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
+      try {
+        if (!fs.statSync(script).isFile()) throw new Error('Invalid launcher');
+      } catch {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
+      }
+      const resolved = isWindows
+        ? resolveCliCommand(script, [], process.platform, process.env)
+        : { command: 'bash', args: [script], windowsVerbatimArguments: undefined };
+      // install-data-root.cjs must resolve the workspace again in the
+      // replacement process. Inheriting the current resolved roots would
+      // short-circuit that boot decision.
+      const childEnv = { ...process.env };
+      delete childEnv.ORKAS_WORKSPACE_ROOT;
+      delete childEnv.CORE_AGENT_AUTH_DIR;
+      childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid);
+      const child = await new Promise<ReturnType<typeof spawn>>((resolve, reject) => {
+        const launcher = spawn(resolved.command, resolved.args, {
+          cwd: paths.PC_ROOT,
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+          env: childEnv,
+        });
+        launcher.once('error', reject);
+        launcher.once('spawn', () => { launcher.unref(); resolve(launcher); });
+      }).catch(() => {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
+      });
+      log.info('relaunch via shell script');
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          prepareShutdown('relaunch'),
+          new Promise<void>((resolve, reject) => {
+            // run.sh/run.cmd give this owner 15 seconds to leave. Only bound
+            // local cleanup once critical active-task archival has settled.
+            timer = setTimeout(() => {
+              let quiescent = false;
+              try { quiescent = isShutdownQuiescent(); } catch { /* unknown phase retains the app */ }
+              if (quiescent) resolve();
+              else reject(Object.assign(new Error('Active task archival failed'), {
+                code: 'E_SHUTDOWN_ARCHIVE_FAILED',
+              }));
+            }, 10_000);
+          }),
+        ]);
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) {
+          try { child.kill(); } catch { /* retain the original archival failure */ }
+        }
+        throw error;
+      } finally { if (timer) clearTimeout(timer); }
+      app.exit(0);
+      return { ok: true };
+    });
+  }
+
+  // Synchronous boot bundle for i18n. Renderer's preload calls this via
+  // `ipcRenderer.sendSync` BEFORE any DOM scripts run, so the renderer can
+  // populate _currentLang + _tables synchronously at module load — first
+  // paint shows the user's preferred language with no English flash. Using
+  // sendSync (and not the async `config.getLanguage` IPC) is the whole point:
+  // an async round-trip schedules a microtask, paint slips through. Only
+  // the active language + fallback cross this synchronous boundary;
+  // other locale tables load asynchronously if the user switches language.
+  ipcMain.on('orkas:bootI18n', (event) => {
+    try {
+      const lang = appConfig.getLanguage();
+      event.returnValue = { ok: true, lang, tables: getRendererBootTables(lang) };
+    } catch (err) {
+      log.warn('bootI18n failed', { error: logErrorSummary(err) });
+      event.returnValue = { ok: false };
+    }
+  });
+
+  // Renderer reports throttled keyboard/pointer/wheel activity. Background
+  // boot work uses this only as an admission hint; no interaction payload is
+  // collected or persisted.
+  ipcMain.on('orkas.userActivity', () => noteBootUserActivity());
+
+  ipcMain.handle('orkas.diagnostics', async () => {
+    const sample = {
+      nowIso: storage.nowIso(),
+      uid: storage.genUserId(),
+      cid: storage.genConversationId(),
+      safeIdValid: storage.safeId('abc-123_XYZ'),
+      safeIdInvalid: storage.safeId('../etc/passwd'),
+    };
+    const tplNormal = prompts.load('chat_commander', {
+      contexts_dir: 'X',
+      builtin_agents_dir: 'X', custom_agents_dir: 'X',
+      builtin_skills_dir: 'X', custom_skills_dir: 'X',
+      agents_index: '', plan_state: '',
+      project_tasks_rules: '',
+      os: 'X', working_dir: 'X', shell_hint: '',
+      output_format_hint: 'X',
+      project_files_block: '',
+    });
+    const tplLen = tplNormal.length;
+    const skills = await skillsFeature.listSkills();
+    const agentsList = await agentsFeature.listAgents();
+    const contextEntries = await contextsFeature.getContextIndexEntries();
+    return {
+      ok: true,
+      env: {
+        appRoot: paths.APP_ROOT,
+        pcRoot: paths.PC_ROOT,
+        wsRoot: paths.WS_ROOT,
+        usersFile: paths.OPEN_USERS_FILE,
+      },
+      storage: sample,
+      prompts: {
+        chatNormalBytes: tplLen,
+        hasOrganize: prompts.exists('contexts_organize'),
+      },
+      skills: {
+        total: skills.length,
+        marketplace: skills.filter((s) => s.source === 'marketplace').length,
+        custom: skills.filter((s) => s.source === 'custom').length,
+        ids: skills.map((s) => `${s.source}:${s.id}`),
+      },
+      agents: {
+        total: agentsList.length,
+        ids: agentsList.map((a) => a.agent_id),
+      },
+      contexts: {
+        total: contextEntries.length,
+        entries: contextEntries.slice(0, 20),
+      },
+    };
+  });
+}
+
+async function runBootSelfCheck(): Promise<void> {
+  const diag = {
+    appVersion: app.getVersion(),
+    fileToolsBuild: fileToolBuildRef(paths.APP_ROOT),
+    packaged: app.isPackaged,
+    appRoot: paths.APP_ROOT,
+    wsRoot: paths.WS_ROOT,
+    promptChatNormal: prompts.exists('chat_commander'),
+    promptOrganize: prompts.exists('contexts_organize'),
+  };
+  log.info('boot self-check', diag);
+
+  // Stage 1: activate the primary user — mkdirs `<uid>/{cloud,local}/*` and
+  // pins `CORE_AGENT_AUTH_DIR` to `<uid>/local/config/`. Must run before any
+  // feature touches user-scoped paths (every feature goes through
+  // `getActiveUserId()`).
+  try {
+    const rec = users.initActiveUser({ openSource: true });
+    log.info('active user', { user_id: rec.user_id });
+  } catch (err) {
+    log.error('failed to activate user', { error: (err as Error).message });
+    throw err;
+  }
+
+  // Stage 1b: resolve UI language from `<uid>/cloud/config/preferences.json`,
+  // falling back to `app.getLocale()` on first boot.
+  try {
+    const lang = appConfig.initLanguageFromApp();
+    log.info('i18n language resolved', { lang });
+  } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
+
+  // Stage 2: clear stale processing=true conversations from a previous crash.
+  try {
+    const { swept } = await chatsFeature.sweepStaleProcessing(users.getActiveUserId());
+    // Emit once per boot, including zero, so dashboards can measure both the
+    // recovered task volume and the share of boots affected by interruption.
+    if (swept > 0) log.info('recovered stale conversations', { swept });
+  }
+  catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
+
+}
+
+async function sweepOfficeResidents(reason: 'startup' | 'quit'): Promise<void> {
+  // Test profiles may coexist with a real application using the same bundled
+  // binary. Only the regular single-instance application owns its residents.
+  if (E2E_USER_DATA_DIR || IS_PACKAGED_LAUNCH_SMOKE) return;
+  try {
+    const office = await import('./features/office/office_engine');
+    office.closeAllOfficeResidents();
+  } catch (err) {
+    createLogger('office-engine').warn(`resident sweep on ${reason} failed`, { error: (err as Error).message });
+  }
+}
+
+async function runBootMaintenanceSweeps(): Promise<void> {
+  await sweepOfficeResidents('startup');
+  // Full cross-user/unindexed recovery stays out of the pre-window self-check.
+  try {
+    const { swept } = await chatsFeature.sweepStaleProcessing();
+    // This full scan is a fallback for inactive/unindexed state. Zero adds no
+    // information beyond the active-user boot event, so keep it silent.
+    if (swept > 0) log.info('recovered stale conversations during maintenance', { swept });
+  }
+  catch (err) { log.warn('full chats sweep failed', { error: (err as Error).message }); }
+
+  // file_cache orphan sweep — stat-based maintenance, not needed before the
+  // first BrowserWindow exists.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const mod = await import('./features/file_indexer');
+      const { deleted } = await mod.pruneOrphans(uid);
+      if (deleted) log.info('file_cache pruned', { deleted });
+    }
+  } catch (err) { log.warn('file_cache sweep failed', { error: (err as Error).message }); }
+
+  // Expert-signal daily files were never pruned; consumers read ≤48h windows.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const signals = await import('./features/expert_signals/storage');
+      const removed = signals.pruneSignalFiles(uid);
+      if (removed) log.info('expert signal files pruned', { removed });
+    }
+  } catch (err) { log.warn('expert signal sweep failed', { error: logErrorSummary(err) }); }
+
+  // Workspace empty-subdir sweep — clean up legacy per-conv slug dirs that
+  // were materialised by bash's defensive mkdir on a turn that produced
+  // nothing. Deferred boot is still safe: no in-flight bash process exists
+  // this early in the app lifetime. Top-level scan only.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const userWs = await import('./features/user_workspace');
+      userWs.sweepEmptyConvDirs(uid);
+    }
+  } catch (err) { log.warn('workspace empty-dir sweep failed', { error: (err as Error).message }); }
+}
+
+let marketplaceReconcileStatusSubscribed = false;
+let marketplaceReconcileInFlight: Promise<void> | null = null;
+let marketplaceReconcileInFlightKey = '';
+const marketplaceDefaultsRetryTasks = new Map<string, ReturnType<typeof scheduleBootBackground>>();
+const marketplaceDefaultsRetryAttempts = new Map<string, number>();
+
+function subscribeMarketplaceReconcileStatus(m: typeof import('./features/marketplace_reconcile')): void {
+  if (marketplaceReconcileStatusSubscribed) return;
+  marketplaceReconcileStatusSubscribed = true;
+  m.subscribeReconcileStatus((status) => {
+    ipc.broadcastToRenderer('marketplace:reconcile-status', status);
+  });
+}
+
+function broadcastBuiltinMarketplaceSeedChanged(result: BuiltinMarketplaceSeedResult): void {
+  const pulledAgents = Math.max(0, Number(result.seeded_agents || 0) + Number(result.manifest_agents || 0));
+  const pulledSkills = Math.max(0, Number(result.seeded_skills || 0) + Number(result.manifest_skills || 0));
+  const pulled = pulledAgents + pulledSkills;
+  if (!pulled) return;
+  const base = {
+    phase: 'default_seed' as const,
+    total: pulled,
+    total_agents: pulledAgents,
+    total_skills: pulledSkills,
+    pulled_agents: pulledAgents,
+    pulled_skills: pulledSkills,
+    failed: [] as string[],
+  };
+  ipc.broadcastToRenderer('marketplace:reconcile-status', {
+    ...base,
+    state: 'running',
+    pulled: 0,
+    updated_at: Date.now(),
+  });
+  ipc.broadcastToRenderer('marketplace:reconcile-status', {
+    ...base,
+    state: 'done',
+    pulled,
+    updated_at: Date.now(),
+  });
+  ipc.broadcastToRenderer('marketplace:content-changed', {});
+}
+
+async function seedBuiltinMarketplaceForCurrentUser(
+  reason: string,
+  shouldContinue?: () => boolean,
+): Promise<void> {
+  await builtinMarketplaceStartup.seedBuiltinMarketplaceForActiveUser({
+    reason,
+    shouldContinue,
+    onChanged: broadcastBuiltinMarketplaceSeedChanged,
+  });
+}
+
+function marketplaceBootContextStillActive(uid: string): boolean {
+  if (!uid || users.isAnonymousLocalId(uid)) return false;
+  try { return users.getActiveUserId() === uid; }
+  catch { return false; }
+}
+
+function clearMarketplaceDefaultsRetry(runKey: string): void {
+  marketplaceDefaultsRetryTasks.get(runKey)?.cancel();
+  marketplaceDefaultsRetryTasks.delete(runKey);
+  marketplaceDefaultsRetryAttempts.delete(runKey);
+}
+
+function scheduleMarketplaceDefaultsRetry(runKey: string, uid: string, error: string): void {
+  if (marketplaceDefaultsRetryTasks.has(runKey)) return;
+  const attempt = marketplaceDefaultsRetryAttempts.get(runKey) || 0;
+  const delayMs = MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS[attempt];
+  if (delayMs === undefined) {
+    marketplaceBootLog.warn('marketplace default installs retry exhausted', { error });
+    marketplaceDefaultsRetryAttempts.delete(runKey);
+    return;
+  }
+  marketplaceDefaultsRetryAttempts.set(runKey, attempt + 1);
+  const task = scheduleBootBackground(`marketplace-defaults-retry:${runKey}`, async (signal) => {
+    marketplaceDefaultsRetryTasks.delete(runKey);
+    // A retry can become eligible while the earlier network phases drain.
+    // Start a fresh pass afterward instead of joining and losing this retry.
+    if (marketplaceReconcileInFlightKey === runKey) {
+      await marketplaceReconcileInFlight?.catch(() => undefined);
+    }
+    if (signal?.aborted || !marketplaceBootContextStillActive(uid)) {
+      marketplaceDefaultsRetryAttempts.delete(runKey);
+      return;
+    }
+    await runMarketplaceInstallReconcile('marketplace-defaults-retry', signal).catch((err) => {
+      marketplaceBootLog.warn('marketplace default installs retry failed', { error: (err as Error).message });
+    });
+  }, delayMs, { preferIdle: true, maxUserDeferralMs: 30_000, maxSliceMs: 60_000 });
+  marketplaceDefaultsRetryTasks.set(runKey, task);
+  marketplaceBootLog.info('scheduled marketplace default installs retry', {
+    attempt: attempt + 1, delay_ms: delayMs, error,
+  });
+}
+
+async function runMarketplaceInstallReconcile(reason: string, signal?: AbortSignal): Promise<void> {
+  const uid = users.getActiveUserId();
+  if (signal?.aborted || !marketplaceBootContextStillActive(uid)) {
+    marketplaceBootLog.info('skip marketplace reconcile: local user unavailable', { reason });
+    return;
+  }
+  const runKey = uid;
+  if (marketplaceReconcileInFlight && marketplaceReconcileInFlightKey === runKey) {
+    await marketplaceReconcileInFlight;
+    return;
+  }
+  const shouldContinue = (): boolean => !signal?.aborted && marketplaceBootContextStillActive(uid);
+  // Network waits must not reserve the disk queue. Cancellation stops queued
+  // phases; active work drains before returning, guarding publication itself.
+  const runStep = async (name: string, resourceClass: BootResourceClass, fn: () => Promise<void>): Promise<void> => {
+    if (!shouldContinue()) return;
+    let operation: Promise<void> | undefined;
+    const scheduled = scheduleBootBackground(`marketplace:${name}`, () => {
+      if (shouldContinue()) return operation = fn();
+    }, 0, { resourceClass, preferIdle: true, maxUserDeferralMs: 30_000 });
+    const cancel = (): void => scheduled.cancel();
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) cancel();
+    try {
+      await scheduled.promise;
+      await operation;
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+    }
+  };
+  marketplaceReconcileInFlightKey = runKey;
+  marketplaceReconcileInFlight = (async () => {
+    let defaultSeedStatusActive = false;
+    let marketplaceReconcileModule: typeof import('./features/marketplace_reconcile') | null = null;
+    let marketplaceModule: typeof import('./features/marketplace') | null = null;
+    const clearDefaultSeedStatus = (): void => {
+      if (marketplaceReconcileModule && defaultSeedStatusActive) {
+        marketplaceReconcileModule.setDefaultInstallSeedStatus(false);
+        defaultSeedStatusActive = false;
+      }
+    };
+    try {
+      await runStep('local-content', 'disk', async () => {
+        await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
+        if (!shouldContinue()) return;
+        const [mp, m] = await Promise.all([
+          import('./features/marketplace'), import('./features/marketplace_reconcile'),
+        ]);
+        if (!shouldContinue()) return;
+        marketplaceModule = mp;
+        marketplaceReconcileModule = m;
+        subscribeMarketplaceReconcileStatus(m);
+        if (await mp.hasKnownDefaultInstallWork(uid)) {
+          if (!shouldContinue()) return;
+          m.setDefaultInstallSeedStatus(true);
+          defaultSeedStatusActive = true;
+        }
+      });
+      await runStep('network', 'network', async () => {
+        const catalogReader = createMarketplaceCatalogReader(shouldContinue);
+        const builtinMarketplace = await import('./features/builtin_marketplace');
+        if (!shouldContinue()) return;
+        await builtinMarketplace.resolveBuiltinMarketplaceInstalls(uid, { shouldContinue, catalogReader }).catch((err) => {
+          marketplaceBootLog.warn('builtin marketplace resolve failed', { error: logErrorSummary(err) });
+        });
+        if (!shouldContinue()) return;
+        try {
+          const mp = marketplaceModule || await import('./features/marketplace');
+          const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
+          const seeded = await mp.ensureDefaultInstalls(uid, {
+            shouldContinue,
+            minIntervalMs: forceMarketplaceNetwork ? 0 : MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS,
+            force: forceMarketplaceNetwork,
+          });
+          if (!shouldContinue()) return;
+          if (seeded.failed) {
+            clearDefaultSeedStatus();
+            scheduleMarketplaceDefaultsRetry(runKey, uid, seeded.error || 'unknown error');
+          } else {
+            clearMarketplaceDefaultsRetry(runKey);
+          }
+          if ((seeded.seeded_agents || seeded.seeded_skills) && marketplaceReconcileModule && !defaultSeedStatusActive) {
+            marketplaceReconcileModule.setDefaultInstallSeedStatus(true);
+            defaultSeedStatusActive = true;
+          }
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('default installs seed failed', { error: (err as Error).message });
+          if (shouldContinue()) scheduleMarketplaceDefaultsRetry(runKey, uid, (err as Error).message);
+        }
+        if (!shouldContinue()) return;
+        try {
+          const m = marketplaceReconcileModule || await import('./features/marketplace_reconcile');
+          await m.checkServerUpdatesForInstalls(uid, {
+            shouldContinue, minIntervalMs: MARKETPLACE_SERVER_CHECK_INTERVAL_MS, catalogReader,
+          });
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('marketplace update check failed', { reason, error: logErrorSummary(err) });
+        }
+      });
+      await runStep('reconcile', 'network', async () => {
+        try {
+          const m = marketplaceReconcileModule || await import('./features/marketplace_reconcile');
+          const result = await m.reconcileInstalls(uid, { shouldContinue });
+          if (!shouldContinue()) return;
+          if (
+            result.pulled_agents || result.pulled_skills
+            || result.pruned_agents || result.pruned_skills
+            || result.restored_agents || result.restored_skills
+            || result.patched_agents || result.patched_skills
+          ) {
+            ipc.broadcastToRenderer('marketplace:content-changed', {});
+            marketplaceBootLog.info('marketplace install reconcile completed', { reason, ...result });
+          }
+        } catch (err) {
+          clearDefaultSeedStatus();
+          marketplaceBootLog.warn('marketplace reconcile failed', { reason, error: (err as Error).message });
+        }
+      });
+      await runStep('local-repair', 'disk', async () => {
+        try {
+          const skills = await import('./features/skills');
+          if (shouldContinue()) await skills.repairLegacySkillEnabledIdsForActiveUser();
+        } catch (err) {
+          marketplaceBootLog.warn('legacy skill enabled-state repair failed', { error: logErrorSummary(err) });
+        }
+      });
+    } catch (err) {
+      marketplaceBootLog.warn('marketplace install reconcile failed', { reason, error: (err as Error).message });
+    } finally {
+      clearDefaultSeedStatus();
+    }
+  })().finally(() => {
+    if (marketplaceReconcileInFlightKey === runKey) {
+      marketplaceReconcileInFlight = null;
+      marketplaceReconcileInFlightKey = '';
+    }
+  });
+  await marketplaceReconcileInFlight;
+}
+
+// `kb-file://<relpath>` — maps a KB-relative path to the active user's
+// `<uid>/cloud/contexts/<relpath>` on disk and returns the bytes with an
+// explicit Content-Type. Used by the renderer's PDF viewer iframe.
+//
+// Path extraction is string-based rather than via `new URL()`: Node's
+// WHATWG URL parser and Chromium's request normalizer treat non-built-in
+// schemes differently, and the resulting `pathname` values can diverge in
+// subtle ways (leading slashes, host vs path split). Slicing after the
+// scheme and stripping a variable number of slashes is the robust form.
+const _KB_FILE_MIME: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.json': 'application/json',
+};
+
+type MediaProtocolSource = 'kb' | 'chat_attachment' | 'chat_local' | 'chat_app_saved' | 'chat_app_artifact';
+
+let pdfProtocolRequestSeq = 0;
+let htmlProtocolRequestSeq = 0;
+
+function _mediaKindForContentType(contentType: string): string {
+  const mime = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'text/html') return 'html';
+  if (mime.startsWith('text/')) return 'text';
+  return 'binary';
+}
+
+function _mediaStreamErrorCode(err: Error): string {
+  const code = String((err as NodeJS.ErrnoException).code || '').toUpperCase();
+  if (err.name === 'AbortError' || code === 'ABORT_ERR' || code === 'ERR_STREAM_PREMATURE_CLOSE'
+      || code === 'ECONNRESET') return 'client_aborted';
+  if (code === 'ENOENT') return 'source_not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'permission_denied';
+  return 'read_failed';
+}
+
+function _protocolServeFailureCode(err: unknown): string {
+  const code = String((err as NodeJS.ErrnoException | undefined)?.code || '').toUpperCase();
+  if (code === 'ENOENT') return 'source_not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'permission_denied';
+  if (err instanceof URIError) return 'invalid_url_encoding';
+  return 'serve_failed';
+}
+
+// Thin wrapper over `util/http-range.serveFileRange` that emits bounded,
+// privacy-safe protocol diagnostics. The Range/cache/ETag/304 logic + its
+// fixtures live in the util module so they're unit-testable without Electron.
+function serveFileRange(
+  request: Request,
+  absPath: string,
+  contentType: string,
+  totalSize: number,
+  mtimeMs?: number,
+  source: MediaProtocolSource = 'chat_local',
+): Response {
+  const mediaKind = _mediaKindForContentType(contentType);
+  const pdfRequestId = mediaKind === 'pdf' ? ++pdfProtocolRequestSeq : null;
+  const htmlRequestId = mediaKind === 'html' ? ++htmlProtocolRequestSeq : null;
+  const responsePrepared = mediaKind === 'pdf'
+    ? (diagnostic: import('./util/http-range').FileRangeResponseDiagnostic) => {
+      log.info('pdf preview response prepared', {
+        request_id: pdfRequestId,
+        source,
+        method: diagnostic.requestMethod,
+        range_header: diagnostic.rangeHeaderKind,
+        status: diagnostic.status,
+        total_bytes: diagnostic.totalBytes,
+        response_bytes: diagnostic.responseBytes,
+        ...(diagnostic.rangeStart !== undefined ? { range_start: diagnostic.rangeStart } : {}),
+        ...(diagnostic.rangeEnd !== undefined ? { range_end: diagnostic.rangeEnd } : {}),
+        cache_revalidated: diagnostic.cacheRevalidated,
+        prepare_duration_ms: diagnostic.prepareDurationMs,
+      });
+    }
+    : mediaKind === 'html'
+      ? (diagnostic: import('./util/http-range').FileRangeResponseDiagnostic) => {
+        log.info('html preview response prepared', {
+          request_id: htmlRequestId,
+          source,
+          delivery_mode: 'streamed',
+          method: diagnostic.requestMethod,
+          range_header: diagnostic.rangeHeaderKind,
+          status: diagnostic.status,
+          total_bytes: diagnostic.totalBytes,
+          response_bytes: diagnostic.responseBytes,
+          cache_revalidated: diagnostic.cacheRevalidated,
+          prepare_duration_ms: diagnostic.prepareDurationMs,
+        });
+      }
+      : undefined;
+  const streamFinished = mediaKind === 'pdf'
+    ? (diagnostic: import('./util/http-range').FileRangeStreamDiagnostic) => {
+      log.info('pdf preview stream finished', {
+        request_id: pdfRequestId,
+        source,
+        outcome: diagnostic.outcome,
+        bytes_read: diagnostic.bytesRead,
+        stream_duration_ms: diagnostic.durationMs,
+      });
+    }
+    : mediaKind === 'html'
+      ? (diagnostic: import('./util/http-range').FileRangeStreamDiagnostic) => {
+        log.info('html preview stream finished', {
+          request_id: htmlRequestId,
+          source,
+          delivery_mode: 'streamed',
+          outcome: diagnostic.outcome,
+          bytes_read: diagnostic.bytesRead,
+          stream_duration_ms: diagnostic.durationMs,
+        });
+      }
+      : undefined;
+  return serveFileRangeCore(
+    request,
+    absPath,
+    contentType,
+    totalSize,
+    mtimeMs,
+    (err, streamDiagnostic) => {
+      const errorCode = _mediaStreamErrorCode(err);
+      const details = {
+        source,
+        media_kind: mediaKind,
+        error_code: errorCode,
+        total_bytes: totalSize,
+        bytes_read: streamDiagnostic.bytesRead,
+        stream_duration_ms: streamDiagnostic.durationMs,
+        ...(pdfRequestId !== null || htmlRequestId !== null
+          ? { request_id: pdfRequestId ?? htmlRequestId }
+          : {}),
+      };
+      if (errorCode === 'client_aborted') log.info('media stream ended', details);
+      else log.warn('media stream error', details);
+    },
+    responsePrepared,
+    streamFinished,
+  );
+}
+
+function registerKbFileProtocol(): void {
+  protocol.handle('kb-file', async (request) => {
+    const reqUrl = request.url;
+    try {
+      // URL shape on the wire: `kb-file://kb/<relpath>` — `kb` is a fixed
+      // fake host (see renderer `_encodeKbFileUrl`). Tolerate older /
+      // unusual normalisations (`kb-file://<seg>/...`, `kb-file:///…`) by
+      // extracting the pathname via `new URL`; standard-scheme URLs parse
+      // cleanly once a host is present.
+      const uid = users.getActiveUserId();
+      const root = path.resolve(paths.userContextsDir(uid));
+      const resolved = resolveContainedProtocolFile(reqUrl, 'kb-file', root);
+      if (resolved.ok === false) {
+        log.warn('kb-file: rejected', { error_code: resolved.error });
+        return new Response(resolved.error.replace('_', ' '), { status: resolved.status });
+      }
+      const { absPath: abs, stat: st } = resolved;
+      const ext = path.extname(abs).toLowerCase();
+      const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
+      log.info('kb-file: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+      return serveFileRange(request, abs, contentType, st.size, st.mtimeMs, 'kb');
+    } catch (err) {
+      log.warn('kb-file serve failed', { error_code: _protocolServeFailureCode(err) });
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
+// `chat-media://cid/<encCid>/<encName>` — streams a single attachment file for
+// the renderer's `<img>` / `<video>` tags. Sent attachments resolve under
+// cloud/chat_attachments/; composer-only draft cids resolve under local drafts.
+// The two-segment path (fixed host +
+// cid + name) sidesteps URL-parser divergence the way `kb-file` does.
+//
+// All the safety work (name + cid validation, path-traversal guard, file
+// existence + regular-file check, extension whitelist) lives inside
+// `chat_attachments.resolveAttachmentAbsPath` so the same guard rails get
+// unit-tested without spinning up Electron.
+// Turn a URL pathname (always leading-slash, URL-encoded) into a real abs
+// path on the running OS. On Windows pathnames like `/C:/Users/x/a.png`
+// must have the leading `/` stripped to get the real drive-letter path.
+// On Unix the pathname IS the abs path.
+function _pathnameToAbsPath(pathname: string): string {
+  const decoded = decodeURIComponent(pathname || '');
+  if (process.platform === 'win32') {
+    // Match `/X:/...` or `/X:\...` — strip the synthetic leading slash.
+    if (/^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+  }
+  return decoded;
+}
+
+// Map resolveLocalMediaPath / resolveAttachmentAbsPath error codes → HTTP.
+function _statusFor(code: string | undefined): number {
+  if (code === 'bad_input') return 400;
+  if (code === 'forbidden') return 403;
+  if (code === 'too_large') return 413;
+  return 404;
+}
+
+function registerChatMediaProtocol(): void {
+  protocol.handle('chat-media', async (request) => {
+    const reqUrl = request.url;
+    try {
+      // Two route shapes, dispatched by URL host:
+      //   chat-media://cid/<encCid>/<encName>      — per-conversation attachment
+      //   chat-media://local/<abs-path-no-leading-slash>  — any local media file,
+      //     plus same-folder assets of an HTML page the file viewer granted
+      let u: URL;
+      try { u = new URL(reqUrl); }
+      catch {
+        log.warn('chat-media: unparseable URL', { error_code: 'invalid_url' });
+        return new Response('bad request', { status: 400 });
+      }
+      const host = u.host.toLowerCase();
+
+      if (host === 'cid') {
+        const segs = decodeURIComponent(u.pathname || '')
+          .replace(/^\/+/, '')
+          .split('/');
+        const cid = segs[0] || '';
+        const name = segs.slice(1).join('/');
+        if (!cid || !name) {
+          log.warn('chat-media/cid: bad URL', { error_code: 'invalid_route' });
+          return new Response('bad request', { status: 400 });
+        }
+        const uid = users.getActiveUserId();
+        const resolved = chatAttachments.resolveAttachmentAbsPath(uid, cid, name);
+        if (!resolved.ok) {
+          const { code, diagnosticCode } = resolved as { code?: string; diagnosticCode?: string };
+          log.warn('chat-media/cid: reject', { error_code: diagnosticCode || code || 'rejected' });
+          return new Response(String((resolved as { error?: string }).error || code || 'error'), { status: _statusFor(code) });
+        }
+        const st = fs.statSync(resolved.absPath);
+        const contentType = chatAttachments.mediaMimeFor(name);
+        log.info('chat-media/cid: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+        return serveFileRange(request, resolved.absPath, contentType, st.size, st.mtimeMs, 'chat_attachment');
+      }
+
+      if (host === 'local') {
+        // pathname starts with `/`; on Windows the drive-letter prefix needs
+        // that leading slash stripped. `_pathnameToAbsPath` handles both.
+        // Try media (image/video) first; fall through to preview (pdf/html)
+        // on bad-ext only — every other failure (not_found / too_large) is
+        // terminal, so we don't mask a real error by re-checking under a
+        // different bucket.
+        let abs: string;
+        try {
+          abs = _pathnameToAbsPath(u.pathname || '');
+        } catch {
+          // A link whose path encoding is broken names no file: the request is at fault.
+          log.warn('chat-media/local: reject', { error_code: 'bad_input' });
+          return new Response('bad request', { status: 400 });
+        }
+        let resolved: ReturnType<typeof chatAttachments.resolveLocalMediaPath>
+          | ReturnType<typeof chatAttachments.resolveLocalPreviewPath>
+          = chatAttachments.resolveLocalMediaPath(abs);
+        if (!resolved.ok && (resolved as { code?: string }).code === 'bad_input') {
+          // Only retry under preview when the media resolver rejected on extension;
+          // path validation errors ('path must be absolute' / 'path required') re-raise.
+          const previewTry = chatAttachments.resolveLocalPreviewPath(abs);
+          if (previewTry.ok) resolved = previewTry;
+          else if ((previewTry as { code?: string }).code === 'bad_input') {
+            // Stylesheets, scripts, data and fonts next to a page the file
+            // viewer granted; other extensions keep the media rejection below.
+            const asset = chatAttachments.resolveLocalHtmlPreviewAssetPath(abs);
+            if (asset.ok) {
+              const st = fs.statSync(asset.absPath);
+              const contentType = chatAttachments.localPreviewAssetMimeFor(asset.absPath);
+              log.info('chat-media/local: serving preview asset', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+              return withHtmlPreviewAssetPolicy(
+                serveFileRange(request, asset.absPath, contentType, st.size, st.mtimeMs, 'chat_local'),
+              );
+            }
+            const assetErr = asset as { code?: string; error?: string };
+            if (assetErr.code !== 'bad_input') {
+              log.warn('chat-media/local: reject preview asset', { error_code: assetErr.code || 'rejected' });
+              return new Response(String(assetErr.error || ''), { status: _statusFor(assetErr.code) });
+            }
+          }
+        }
+        if (!resolved.ok) {
+          // Same `(x as {field?: T}).field` access pattern as the cid branch above —
+          // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
+          // error-branch fields here, so go through the type-assertion escape hatch.
+          const err = resolved as { code?: string; error?: string; diagnosticCode?: string };
+          log.warn('chat-media/local: reject', { error_code: err.diagnosticCode || err.code || 'rejected' });
+          return new Response(String(err.error || ''), { status: _statusFor(err.code) });
+        }
+        const st = fs.statSync(resolved.absPath);
+        const contentType = chatAttachments.localMediaMimeFor(resolved.absPath);
+        log.info('chat-media/local: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+        if (path.extname(resolved.absPath).toLowerCase() === '.svg') {
+          const materialized = chatAttachments.materializeLocalDisplaySvg(resolved.absPath);
+          if (!materialized.ok) {
+            const err = materialized as { code?: string; error?: string; diagnosticCode?: string };
+            log.warn('chat-media/local: SVG materialize rejected', { error_code: err.diagnosticCode || err.code || 'rejected' });
+            return new Response(String(err.error || ''), { status: _statusFor(err.code) });
+          }
+          const bytes = Buffer.byteLength(materialized.body, 'utf8');
+          return new Response(materialized.body, {
+            headers: {
+              'Content-Type': chatAttachments.localMediaMimeFor(resolved.absPath),
+              'Content-Length': String(bytes),
+              'Cache-Control': 'no-cache',
+            },
+          });
+        }
+        const response = serveFileRange(
+          request,
+          resolved.absPath,
+          contentType,
+          st.size,
+          st.mtimeMs,
+          'chat_local',
+        );
+        return resolved.kind === 'html'
+          ? withHtmlPreviewPolicy(response)
+          : response;
+      }
+
+      log.warn('chat-media: unknown host', { error_code: 'invalid_route' });
+      return new Response('bad request', { status: 400 });
+    } catch (err) {
+      log.warn('chat-media serve failed', { error_code: _protocolServeFailureCode(err) });
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
+// `chat-app://cid/<encCid>/<encArtifactId>/<relpath...>` streams LLM-generated
+// chat artifacts; `chat-app://saved/<encAppId>/<relpath...>` streams saved
+// "My Apps" bundles. Both are read-only and every disk request is filtered
+// through a feature resolver (safe ids / safe relpath / traversal guard /
+// served-extension allowlist / regular-file check). The reserved virtual
+// relpath `__orkas/bridge.js` is served from the in-memory `BRIDGE_JS`
+// constant, not from disk. Fixed hosts sidestep URL-parser divergence the same
+// way `chat-media://cid/...` does. `Access-Control-Allow-Origin: *` is set
+// defensively — `chat-app://` URLs are only issuable from inside this app.
+function _withArtifactCors(resp: Response): Response {
+  // Re-wrap so we can add the header without mutating the shared
+  // `serveFileRange` helper (kb-file / chat-media must not change). The body
+  // stream is passed through untouched — Chromium consumes it once.
+  const headers = new Headers(resp.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+}
+
+function registerChatAppProtocol(): void {
+  protocol.handle('chat-app', async (request) => {
+    const reqUrl = request.url;
+    try {
+      let u: URL;
+      try { u = new URL(reqUrl); }
+      catch {
+        log.warn('chat-app: unparseable URL', { error_code: 'invalid_url' });
+        return new Response('bad request', { status: 400 });
+      }
+      const sdkResource = await appResource(request);
+      if (sdkResource) {
+        if (sdkResource.status !== 200) return new Response('Application resource unavailable', { status: sdkResource.status });
+        if ('body' in sdkResource) return new Response(sdkResource.body, {
+          headers: { ...sdkResource.headers, 'Content-Type': sdkResource.mime },
+        });
+        const stat = fs.statSync(sdkResource.file);
+        const response = serveFileRange(request, sdkResource.file, sdkResource.mime, stat.size, stat.mtimeMs, sdkResource.source);
+        const headers = new Headers(response.headers);
+        for (const [key, value] of Object.entries(sdkResource.headers)) headers.set(key, value);
+        return new Response(response.body, { status: response.status, headers });
+      }
+      const host = u.host.toLowerCase();
+      // pathname is `/<encCid>/<encArtifactId>/<relpath...>` (always leading
+      // slash, URL-encoded). Decode the whole thing then split — decoding
+      // first then splitting on `/` is wrong if a relpath segment contained
+      // an encoded slash, but artifact file paths never do (safeRelPath
+      // rejects `\0` / `\`, and an encoded `/` would just be a path
+      // separator anyway); decode per-segment to be precise.
+      const rawSegs = (u.pathname || '').replace(/^\/+/, '').split('/');
+      const cid = rawSegs[0] ? decodeURIComponent(rawSegs[0]) : '';
+      const artifactId = rawSegs[1] ? decodeURIComponent(rawSegs[1]) : '';
+      const relPath = rawSegs.slice(2).map((s) => (s ? decodeURIComponent(s) : '')).join('/');
+
+      if (host === 'saved') {
+        const appId = cid;
+        const savedRelPath = rawSegs.slice(1).map((s) => (s ? decodeURIComponent(s) : '')).join('/');
+        if (!appId) {
+          log.warn('chat-app/saved: bad URL (need appId)', { error_code: 'invalid_route' });
+          return new Response('bad request', { status: 400 });
+        }
+        const uid = users.getActiveUserId();
+        if (hasIsolatedBrowserStorage(uid, { appId })) return new Response('Application origin required', { status: 403 });
+        if (savedRelPath === chatArtifacts.BRIDGE_RELPATH) {
+          return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
+            headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'private, max-age=60' },
+          }));
+        }
+        const resolved = savedApps.resolveSavedAppFilePath(uid, appId, savedRelPath);
+        if (!resolved.ok) {
+          const code = (resolved as { code?: string }).code;
+          const errMsg = (resolved as { error?: string }).error;
+          log.warn('chat-app/saved: reject', { error_code: code || 'rejected' });
+          return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
+        }
+        const st = fs.statSync(resolved.absPath);
+        log.info('chat-app/saved: serving', { media_kind: _mediaKindForContentType(resolved.mime), bytes: st.size });
+        return _withArtifactCors(serveFileRange(
+          request, resolved.absPath, resolved.mime, st.size, st.mtimeMs, 'chat_app_saved',
+        ));
+      }
+
+      if (host !== 'cid') {
+        log.warn('chat-app: unknown host', { error_code: 'invalid_route' });
+        return new Response('bad request', { status: 400 });
+      }
+      if (!cid || !artifactId) {
+        log.warn('chat-app: bad URL (need cid + artifactId)', { error_code: 'invalid_route' });
+        return new Response('bad request', { status: 400 });
+      }
+
+      const uid = users.getActiveUserId();
+      if (hasIsolatedBrowserStorage(uid, { cid, artifactId })) return new Response('Application origin required', { status: 403 });
+      // Reserved virtual path: the runtime bridge script (not on disk).
+      if (relPath === chatArtifacts.BRIDGE_RELPATH) {
+        return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
+          headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'private, max-age=60' },
+        }));
+      }
+
+      const resolved = chatArtifacts.resolveArtifactFilePath(uid, cid, artifactId, relPath);
+      if (!resolved.ok) {
+        // Cast in the error branch — `strictNullChecks: false` keeps the
+        // whole union here (same workaround as the chat-media handler above).
+        const code = (resolved as { code?: string }).code;
+        const errMsg = (resolved as { error?: string }).error;
+        log.warn('chat-app: reject', { error_code: code || 'rejected' });
+        return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
+      }
+      const st = fs.statSync(resolved.absPath);
+      log.info('chat-app: serving', { media_kind: _mediaKindForContentType(resolved.mime), bytes: st.size });
+      return _withArtifactCors(serveFileRange(
+        request, resolved.absPath, resolved.mime, st.size, st.mtimeMs, 'chat_app_artifact',
+      ));
+    } catch (err) {
+      log.warn('chat-app serve failed', { error_code: _protocolServeFailureCode(err) });
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
+// Single-instance lock prevents double-launch from duplicating the backend.
+const gotLock = IS_PACKAGED_LAUNCH_SMOKE || app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+
+  const shutdown = createShutdownCoordinator({
+    captureProcesses: () => captureWindowsShutdownProcesses(),
+    quiesce: async () => {
+      (await import('./features/web_apps/task-host')).stopAppTaskMaintenance();
+      autoTasks.stopScheduler();
+      projectDriverRunner.stopDriverScheduler();
+      await Promise.all([
+        prepareForShutdown(),
+        import('./features/local_agents/runner.js').then(runner => runner.stopBackgroundRuns('the app is quitting')),
+        import('../core-agent/src/tools/process-session')
+          .then(sessions => sessions.stopAllProcessSessions())
+          .catch(() => createLogger('process-sessions').warn('stopping retained commands failed')),
+      ]);
+      const boot = await import('./util/boot_init');
+      boot.stopBootWork();
+      const library = await import('./features/library_corpus');
+      library.closeAllLibraryCorpora();
+    },
+    localTasks: [
+      { name: 'conversation-history', run: async () => {
+        const history = await import('./features/conversation-history-client');
+        await history.closeConversationHistoryWorker();
+      } },
+      { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
+      { name: 'connectors', run: () => connectorsFeature.shutdown() },
+      { name: 'search', run: () => searchFeature.flushAll() },
+      { name: 'kb_vector', run: async () => {
+        const kb = await import('./features/kb_vector');
+        kb.closeAllKb();
+      } },
+      { name: 'kb_embed', run: async () => {
+        // Kill the isolated embedder worker so it releases its model promptly.
+        const kbEmbed = await import('./features/kb_embed');
+        kbEmbed.closeEmbedder();
+      } },
+      { name: 'image-runtime', run: async () => {
+        const images = await import('./util/sharp-runtime');
+        images.closeImageRuntime();
+      } },
+      { name: 'office-engine', run: async () => {
+        const extraction = await import('./util/office-extract');
+        await extraction.closeOfficeExtraction();
+        const oe = await import('./features/office/office_engine');
+        oe.closeAllOfficeResidents();
+      } },
+      { name: 'web-assist-session', run: async () => {
+        const webAssistSessions = await import('./features/web_assist_session');
+        await webAssistSessions.flushWebAssistSessions();
+      } },
+      { name: 'web-app-data', run: async () => {
+        // Checkpoint local app databases before closing the application.
+        const apps = await import('./features/web_apps/host');
+        apps.runtime.closeUser(users.getActiveUserId());
+        await apps.runtime.drainData();
+      } },
+    ],
+    onFailure: name => createLogger(name).warn('shutdown preparation failed'),
+    onIncomplete: async () => {
+      await resumeAfterFailedShutdown();
+      const library = await import('./features/library_corpus');
+      await library.resumeLibraryAdmission();
+      const boot = await import('./util/boot_init');
+      boot.resumeBootAdmission();
+      (await import('./features/web_apps/task-host')).startAppTaskMaintenance();
+      autoTasks.startScheduler();
+      projectDriverRunner.startDriverScheduler();
+    },
+  });
+  const flushForShutdown = shutdown.prepare;
+  const desktopWindows = createDesktopWindowController({
+    isShutdownComplete: () => shutdown.complete,
+    canHide: () => process.platform === 'darwin' || !!appTray,
+    nativeClose: () => process.platform === 'linux',
+  });
+  setDesktopWindowController(desktopWindows);
+
+  // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
+  // this connector-only receiver outside the removed account protocol module.
+  registerConnectorProtocol();
+  app.whenReady().then(async () => {
+    await runBootSelfCheck();
+    await installSystemProxyDispatcher();
+    // Publish packaged, local-only content before the first window so the
+    // first task can see every shipped System Skill and Marketplace resource.
+    // The open build has no account bootstrap that can provide this boundary,
+    // so keep the shared publication step explicitly wired here.
+    const initialBundledContentUid = users.getActiveUserId();
+    const initialBundledContent = scheduleBootBackground(
+      'bundled-content:first-window',
+      (signal) => bundledContentStartup.syncBundledContentForUser(initialBundledContentUid, {
+        reason: 'first-window',
+        shouldContinue: () => (
+          !signal?.aborted && users.getActiveUserId() === initialBundledContentUid
+        ),
+        onMarketplaceChanged: broadcastBuiltinMarketplaceSeedChanged,
+      }),
+      0,
+      { resourceClass: 'disk', maxSliceMs: 5_000 },
+    );
+    await initialBundledContent.promise;
+    // Source-run macOS uses Electron.app's own Info.plist, so set the dock
+    // icon at runtime. Packaged builds still pick up the configured icns.
+    if (process.platform === 'darwin' && app.dock) {
+      const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png');
+      const img = nativeImage.createFromPath(iconPath);
+      if (!img.isEmpty()) app.dock.setIcon(img);
+    }
+    if (process.platform === 'win32') {
+      app.setAppUserModelId(APP_USER_MODEL_ID);
+    }
+    if (process.platform === 'darwin') {
+      Menu.setApplicationMenu(Menu.buildFromTemplate([
+        { role: 'appMenu' },
+        { role: 'editMenu' },
+      ]));
+    } else {
+      Menu.setApplicationMenu(null);
+    }
+    registerKbFileProtocol();
+    registerChatMediaProtocol();
+    registerChatAppProtocol();
+    // Only the trusted main frame can capture audio. Previews and embedded apps
+    // retain their independent, default-deny permission handlers.
+    session.defaultSession.setPermissionCheckHandler((wc, permission, _origin, details) => {
+      if (permission === 'media') {
+        const owner = wc ? BrowserWindow.fromWebContents(wc) : null;
+        return !!owner && mainWindows.has(owner) && details.isMainFrame === true && details.mediaType === 'audio';
+      }
+      return permission === 'clipboard-read' || permission === 'clipboard-sanitized-write';
+    });
+    session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+      const owner = wc ? BrowserWindow.fromWebContents(wc) : null;
+      if (!owner || !mainWindows.has(owner) || !details.isMainFrame) { callback(false); return; }
+      if (permission === 'media') {
+        const mediaTypes = (details as Electron.MediaAccessPermissionRequest).mediaTypes || [];
+        callback(mediaTypes.length > 0 && mediaTypes.every((type) => type === 'audio'));
+        return;
+      }
+      callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
+    });
+    registerIpc(flushForShutdown, () => shutdown.quiescent);
+    const stopTaskNotifications = taskNotifications.startTaskNotifications({
+      getActiveUserId: () => users.getActiveUserId(),
+      isEnabled: () => appConfig.getTaskNotificationsEnabled(),
+      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
+        !win.isDestroyed() && win.isFocused()
+      )),
+      isSupported: () => Notification.isSupported(),
+      resolveLanguageForUser: (userId) => appConfig.resolveLanguageForUser(userId),
+      setBadgeCount: setTaskNotificationBadgeCount,
+      onDidFocus: (listener) => {
+        const onFocus = () => listener();
+        app.on('browser-window-focus', onFocus);
+        return () => { app.off('browser-window-focus', onFocus); };
+      },
+      createNotification: (options) => {
+        const notification = new Notification(options);
+        notification.on('show', () => {
+          notificationPermissions.markSystemNotificationDelivered();
+          log.info('native task notification accepted by OS');
+        });
+        notification.on('failed', (_event, error) => {
+          notificationPermissions.markSystemNotificationFailed();
+          log.warn('native task notification rejected by OS', { error: error || 'unknown' });
+        });
+        void notificationPermissions.getSystemNotificationPermission().then((permission) => {
+          if (permission.state === 'denied' || permission.state === 'presentation_disabled') {
+            log.warn('native task notification presentation blocked by system settings', {
+              permission_state: permission.state,
+            });
+          }
+        }).catch((error) => {
+          log.warn('native task notification permission check failed', {
+            error: (error as Error)?.message || String(error),
+          });
+        });
+        return {
+          onClick: (listener) => { notification.on('click', listener); },
+          onClose: (listener) => {
+            notification.once('close', (details) => listener(details.reason));
+          },
+          onFailed: (listener) => { notification.once('failed', () => listener()); },
+          show: () => { notification.show(); },
+          close: () => { notification.close(); },
+        };
+      },
+      openConversation: openConversationFromTaskNotification,
+    });
+    app.once('will-quit', stopTaskNotifications);
+    const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
+    app.once('will-quit', stopTaskTerminalUi);
+    // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
+    const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
+    app.once('will-quit', idleSleepGuard.stop);
+    clientConfigFeature.clientConfig.subscribeAll((keys) => {
+      ipc.broadcastToRenderer('client-config:changed', { keys });
+      if (keys.includes('connectors.catalog') || keys.includes('connectors.dcr_catalog')) {
+        connectorsFeature.refreshStaleToolCaches(users.getActiveUserId(), 'client_config_changed').catch((err) => {
+          log.warn('connector stale tool-cache refresh after client config change failed', { error: logErrorSummary(err) });
+        });
+      }
+    });
+    const BOOT_BACKGROUND_DEFER_MS = 6_000;
+    const bootDevice = getBootDeviceProfile();
+    const BOOT_HEAVY_DISK_DELAY_MS = bootDevice.heavyDiskOffsetMs;
+    const BOOT_POST_STARTUP_DELAY_MS = bootDevice.postStartupOffsetMs;
+    const CLIENT_CONFIG_STARTUP_DELAY_MS = 8_000;
+    const CONNECTORS_BOOTSTRAP_DELAY_MS = bootDevice.connectorBootstrapDelayMs;
+    log.info('boot device profile', {
+      tier: bootDevice.tier,
+      logical_cpus: bootDevice.logicalCpus,
+      total_memory_gib: Math.round((bootDevice.totalMemoryBytes / (1024 ** 3)) * 10) / 10,
+      heavy_disk_delay_ms: BOOT_HEAVY_DISK_DELAY_MS,
+      post_startup_delay_ms: BOOT_POST_STARTUP_DELAY_MS,
+    });
+    clientConfigFeature.start({
+      startupDelayMs: CLIENT_CONFIG_STARTUP_DELAY_MS,
+      forceStartupRefresh: false,
+    });
+    scheduleBootBackground('connectors:bootstrap', async () => {
+      await connectorsFeature.bootstrap(users.getActiveUserId());
+    }, CONNECTORS_BOOTSTRAP_DELAY_MS, { resourceClass: 'process', preferIdle: true, maxSliceMs: 30_000 });
+    const startupAvailable = app.isPackaged && !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW;
+    setLoginStartup(createLoginStartup({
+      platform: process.platform, available: startupAvailable, executable: process.execPath,
+      get: options => app.getLoginItemSettings(options),
+      set: settings => app.setLoginItemSettings(settings),
+      getUser: () => users.getActiveUserId(),
+      hasEnabledAutomations: async uid => (await autoTasks.listTasks(uid)).some(task => task.enabled === true),
+    }));
+    let startupHidden = false;
+    if (startupAvailable) {
+      try {
+        startupHidden = shouldHideStartupWindow({
+          platform: process.platform, argv: process.argv,
+          wasOpenedAtLogin: process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin,
+        });
+      } catch { log.warn('startup presentation unavailable; showing the main window'); }
+    }
+    createWindow(startupHidden);
+    openLifecycleTracking = startOpenLifecycleTracking({
+      app,
+      getActiveUserId: () => users.getActiveUserId(),
+      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
+        !win.isDestroyed() && win.isFocused()
+      )),
+      // Test and packaged-smoke launches use synthetic workspaces and must not
+      // write lifecycle reports. Normal source and packaged runs behave alike.
+      enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
+    });
+    app.once('will-quit', () => {
+      openLifecycleTracking?.stop();
+      openLifecycleTracking = null;
+    });
+    await consumeColdLaunchConnectorCallback();
+    createAppTray();
+    // A silent launch must always retain an existing way to recover its window.
+    if (startupHidden && process.platform !== 'darwin' && !appTray) showMainWindow();
+    if (process.platform === 'darwin' && appTray) {
+      const stopTaskUnreadTray = taskUnreadTray.startTaskUnreadTray({
+        tray: appTray,
+        getActiveUserId: () => users.getActiveUserId(),
+        isEnabled: () => appConfig.getTaskNotificationsEnabled(),
+        isMainWindowFocused: () => {
+          const focused = BrowserWindow.getFocusedWindow();
+          return !!focused && mainWindows.has(focused);
+        },
+        warn: message => log.warn(message),
+      });
+      app.once('will-quit', stopTaskUnreadTray);
+    }
+    // A scheduled fire or driver advance can reach the task browser with every
+    // window closed, which is routine on macOS. Hand Web Assist the ability to
+    // make one so the run is not simply told the browser is unavailable; it
+    // opens minimised and is surfaced only when a step needs a human.
+    void import('./features/web_assist')
+      .then(webAssist => webAssist.setAppWindowFactory(() => createWindow()))
+      .catch(err => log.warn('task browser window factory unavailable', { error: (err as Error).message }));
+
+    // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
+    //
+    //   registerImmediate(name, fn[, 'serial'])  → runs now, parallel by default
+    //   registerDeferred(name, fn[, 'serial'])   → runs after BOOT_BACKGROUND_DEFER_MS
+    //
+    // The runner swallows per-task errors (logged at warn) so one bad
+    // module can't keep the rest of boot from progressing. Slow tasks
+    // (>1.5s) emit a warn so regressions show up in the boot log.
+    //
+    // Replaces the pre-existing `setImmediate(...)` / `setTimeout(...)` /
+    // `import().then()` / async-IIFE soup that had grown around here.
+
+    configureBootAdmission({
+      isRuntimeBusy: () => {
+        try {
+          // CJS require intentionally shares bus.ts's global Symbol-backed
+          // runtime map with the normal send path.
+          const bus = require('./features/group_chat/bus') as typeof import('./features/group_chat/bus');
+          return bus.hasActiveWork(users.getActiveUserId());
+        } catch {
+          return false;
+        }
+      },
+    });
+
+    const idleDisk = {
+      resourceClass: 'disk' as const,
+      preferIdle: true,
+      maxSliceMs: 15_000,
+    };
+    const idleProcess = {
+      resourceClass: 'process' as const,
+      preferIdle: true,
+      maxSliceMs: 30_000,
+    };
+    // Small schedulers/cache reads may share the first deferred cohort. Disk
+    // walkers below are serial barriers so low-end devices do not receive a
+    // simultaneous search + KB + marketplace I/O burst.
+    registerDeferred('marketplace:prime-cache', async () => {
+      // Primes the in-memory category cache from disk/fallback only; the lazy
+      // path in features/marketplace_biz.ts refreshes from Server when needed.
+      const m = await import('./features/marketplace_biz');
+      await m.primeCategoryCache({ localOnly: true });
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    // Parallel: the probe only warms a cache. A serial barrier here would hold
+    // the automation and project-driver schedulers behind idle admission (no
+    // deadline while a conversation has active work) plus one `--version`
+    // spawn per installed CLI; the `process` resource class already serialises
+    // it against the connector bootstrap.
+    registerDeferred('local-agents:warm-cli-registry', async (signal) => {
+      const { warmLocalClis } = await import('./features/local_agents/registry');
+      await warmLocalClis(signal);
+    }, 'parallel', 0, idleProcess);
+    registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
+    registerDeferred('app-tasks:finalize', async () => {
+      const tasks = await import('./features/web_apps/task-host');
+      await tasks.maintainAppTasks();
+      tasks.startAppTaskMaintenance();
+    });
+    // To-do driver loop — opt-in per global/project backlog (default off); the
+    // poll early-exits on scopes that have not enabled it.
+    // Surface each driver-created conversation to the renderer so it appears in
+    // the project's task list live, like a human-started run.
+    registerDeferred('project-driver:scheduler', () => {
+      projectDriverRunner.onAdvance((e) => ipc.broadcastToRenderer('projects:advance', {
+        projectId: e.pid,
+        conversation: e.conversation,
+      }));
+      projectDriverRunner.startDriverScheduler();
+    });
+    registerDeferred('marketplace:reconcile', (signal) => runMarketplaceInstallReconcile('startup', signal));
+
+    registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('browser:http-cache', async (signal) => {
+      const { sweepWebAssistCache } = await import('./features/web_assist_cache');
+      const result = await sweepWebAssistCache(users.getActiveUserId(), signal);
+      log.info('HTTP cache maintenance finished', result);
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('search:reconcile', (signal) => searchFeature.reconcileActive(signal), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('kb:reconcile', async (signal) => {
+      // Picks up files dropped into contexts/ via Finder while the app was
+      // off + any divergence from a just-synced vector.db. UI gets live
+      // updates through the `kb.events` stream as files transition status.
+      const { reconcile } = await import('./features/kb_indexer');
+      await reconcile(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('project-library:reconcile', async (signal) => {
+      // Project Libraries have the same out-of-band sources as the global one
+      // (Finder drops while the app was off, a just-synced project tree), and
+      // retrieval no longer reconciles, so boot is one of the three owners of
+      // index freshness. Reconcile is incremental and opens no store for a
+      // project without indexable sources.
+      const uid = users.getActiveUserId();
+      const { listProjectIds } = await import('./util/project-layout');
+      const { reconcile } = await import('./features/project_library_indexer');
+      for (const projectId of listProjectIds(uid)) {
+        if (signal?.aborted) return;
+        try { await reconcile(uid, projectId, signal); }
+        catch (err) { log.warn('project library boot reconcile failed', { error: logErrorSummary(err) }); }
+      }
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    // Maintenance that can scan hundreds of sessions or invoke model-backed
+    // reflection starts after the measured 30-second startup window. The two
+    // tasks share a serial cohort so their disk walks cannot overlap.
+    registerDeferred('chats:index-repair', async (signal) => {
+      await chatsFeature.repairConversationIndex(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
+    registerDeferred('sessions:gc', async (signal) => {
+      const mod = await import('./features/sessions_sweep');
+      await mod.sweepSessions(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
+    // Automatic memory maintenance is retired; remove its local leftovers.
+    registerDeferred('memory:retired-state-cleanup', async () => {
+      const memoryWrites = await import('./features/memory-writes');
+      await memoryWrites.removeRetiredMemoryMaintenanceState(users.getActiveUserId());
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
+    registerDeferred('reflection:loop', () => {
+      reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
+
+    // Drive the immediate batch + schedule the deferred one.
+    void runBootPhases(BOOT_BACKGROUND_DEFER_MS);
+
+    app.on('activate', () => {
+      showMainWindow();
+    });
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+
+  app.on('before-quit', async (e) => {
+    if (shutdown.complete) { isQuitting = true; return; }
+    e.preventDefault();
+    if (isQuitting) return;
+    isQuitting = true;
+    try {
+      await flushForShutdown();
+      app.quit();
+    } catch (error) {
+      isQuitting = false;
+      showMainWindow();
+      log.error('quit preparation failed', { error: logErrorSummary(error) });
+    }
+  });
+}

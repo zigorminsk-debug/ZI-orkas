@@ -1,0 +1,206 @@
+// Core Agent — simplified extraction of OpenClaw's core modules.
+// Provides: LLM Provider interaction (via @earendil-works/pi-ai), Agent Harness,
+// Sandbox execution, and CLI commands.
+
+// Config
+export { loadConfig, createConfig, CoreAgentConfigSchema } from "./config/index.js";
+export type { CoreAgentConfig, AgentConfig, ProviderConfig, ModelConfig, EvolutionConfig } from "./config/index.js";
+
+// Shared types & utilities
+export type {
+  Message,
+  MessageContent,
+  ProviderEmptyKind,
+  ServerModelFallbackReason,
+  ProviderTerminationCategory,
+  Usage,
+  StopReason,
+  StreamEvent,
+} from "./shared/types.js";
+export {
+  CoreAgentError,
+  AuthError,
+  RateLimitError,
+  ContextOverflowError,
+  ProviderCandidateChangedError,
+  OutputLimitError,
+  ProviderError,
+  StorageFullError,
+  SessionPersistenceError,
+  TimeoutError,
+  DEFAULT_RETRY_ERROR_POLICY,
+  configureRetryErrorPolicy,
+  getRetryErrorPolicy,
+  isRetryableError,
+  isTransientNetworkError,
+  classifyRetryableError,
+  classifyRetryableErrorWithPolicy,
+  classifyTransientNetworkError,
+  classifyTransientNetworkErrorWithPolicy,
+  isStorageFullError,
+} from "./shared/errors.js";
+export type { RetryableErrorKind, RetryErrorPolicyConfig } from "./shared/errors.js";
+export { createLogger } from "./shared/logger.js";
+export type { Logger, LogLevel } from "./shared/logger.js";
+
+export type { ProviderRequestFailure } from "./providers/request-diagnostics.js";
+
+// Providers (backed by @earendil-works/pi-ai)
+export type { LLMProvider, ProviderContextBudget, CompletionParams, CompletionResult, ToolDefinition } from "./providers/index.js";
+export { createAnthropicProvider, createOpenAIProvider, createPiProvider } from "./providers/index.js";
+export { listPiProviders, listPiModels, getPiModel } from "./providers/index.js";
+export { ProviderRegistry } from "./providers/index.js";
+
+// Agent Harness
+export { AgentRunner } from "./agent/index.js";
+export { estimateCompletionRequestInputTokens, CONTEXT_COMPACTION_TRIGGER_RATIO } from "./agent/runner.js";
+export type {
+  ReflectionModelCallEvent,
+  ReflectionFailure,
+} from "./agent/index.js";
+export { Session } from "./agent/index.js";
+export { PersistentSession } from "./agent/index.js";
+export { discoverRepositoryInstructions, repositoryInstructionsText } from "./agent/index.js";
+export type { ToolProtocolRepairReport } from "./agent/index.js";
+export type {
+  CompletedWorkEntry,
+  CompletedWorkInput,
+  CompletedWorkStatus,
+  ExecutionPlanAuditRecord,
+  ExecutionPlanState,
+  ExecutionPlanStep,
+  ExecutionPlanStepStatus,
+  ExecutionPlanUpdate,
+  HistoryResource,
+  HistoryResourceKind,
+  ToolSurfaceState,
+  RepositoryInstructionFile,
+  RepositoryInstructions,
+  WorkspaceDiffRequest,
+  WorkspaceCompactedState,
+  WorkspaceObservationEntry,
+  WorkspaceObservationState,
+} from "./agent/index.js";
+export type {
+  AgentRunParams,
+  AgentRunResult,
+  AgentRunMeta,
+  AgentRunTimings,
+  AgentRunConvergenceSignal,
+  AgentRunTermination,
+  AgentRunEvent,
+  AgentRunSteerInput,
+  AgentRunSteerMessage,
+} from "./agent/index.js";
+
+// Tools
+export type {
+  AgentTool,
+  ToolContext,
+  ToolResult,
+  ToolResultImage,
+  ToolObservations,
+  FileReadObservation,
+  FileChangeObservation,
+  CommandExecutionObservation,
+  CommandStreamObservation,
+  CreateRunProgramToolOptions,
+  ProgrammaticToolAuthorization,
+  ProgrammaticToolInvokeOutcome,
+  ProgrammaticToolPolicy,
+  ProgramSourceLoadOutcome,
+  ProgramSourceLoader,
+  RunProgramLimits,
+} from "./tools/index.js";
+export {
+  applyPatchTool,
+  createApplyPatchTool,
+  getProcessSessionTools,
+  processSessionTool,
+  processReadTool,
+  processStartTool,
+  processStopTool,
+  processWriteTool,
+  stopAllProcessSessions,
+  runningProcessSessions,
+  runningCommandSessions,
+  workspaceDiffTool,
+  WORKSPACE_DIFF_PROVIDER_STATE_KEY,
+  defineTool,
+  toToolDefinition,
+  getBuiltinTools,
+  configureWebFetchRenderer,
+  createExecutionPlanTool,
+  runBuiltinWebSearch,
+  WEB_SEARCH_DEFAULT_COUNT,
+  WEB_SEARCH_MAX_COUNT,
+  createRunProgramTool,
+  DEFAULT_RUN_PROGRAM_LIMITS,
+  isProgrammaticToolCallContext,
+  markProgrammaticToolCallState,
+  RUN_PROGRAM_TOOL_NAME,
+} from "./tools/index.js";
+export type {
+  WebFetchRenderedPage,
+  WebFetchRenderer,
+} from "./tools/index.js";
+export type {
+  ApplyPatchCommittedFile,
+  ApplyPatchContentCheck,
+  ApplyPatchOperation,
+  ApplyPatchPathCheck,
+  ApplyPatchPathRole,
+  ApplyPatchSnapshot,
+  ApplyPatchToolHooks,
+  ProcessSessionStatus,
+} from "./tools/index.js";
+
+// Sandbox
+export { SandboxExecutor } from "./sandbox/index.js";
+export {
+  ProcessOutputCapture,
+  discardStreamedToolOutput,
+  DEFAULT_PROCESS_OUTPUT_MEMORY_BYTES,
+  DEFAULT_PROCESS_OUTPUT_SPOOL_BYTES,
+} from "./sandbox/index.js";
+export type {
+  SandboxConfig,
+  SandboxResult,
+  CapturedProcessOutput,
+  StreamedToolOutput,
+} from "./sandbox/index.js";
+
+// Skills (SKILL.md directory scanner + system-prompt injection helper)
+export { SkillLoader, parseFrontmatter, pickDescription } from "./skills/index.js";
+export type { SkillSpec, SkillLoaderOptions, FrontmatterParseResult } from "./skills/index.js";
+
+// Auth (OAuth & credential management)
+export type { AuthCredential, ApiKeyCredential, OAuthCredential, AuthStore } from "./auth/index.js";
+export {
+  loadAuthStore,
+  saveAuthStore,
+  writeOAuthCredentials,
+  writeApiKeyCredential,
+  removeCredential,
+  resolveApiKeyFromStore,
+  isOAuthExpired,
+  getOAuthCredential,
+  listCredentials,
+  resolveAuthDir,
+  resolveAuthStorePath,
+  loginOAuthProvider,
+  refreshOAuthCredential,
+  resolveOAuthApiKey,
+} from "./auth/index.js";
+
+// Evolution (self-improvement)
+export { SkillStore, createSkillManageTool } from "./evolution/index.js";
+export type { Skill, SkillSummary, SkillFrontmatter } from "./evolution/index.js";
+export {
+  buildReviewPrompt,
+  REFLECTION_SYSTEM_PROMPT,
+} from "./evolution/index.js";
+export type { MetacognitionConfig } from "./evolution/index.js";
+
+// CLI
+export { CLI } from "./cli/index.js";

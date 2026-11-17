@@ -1,0 +1,514 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const asar = require('@electron/asar');
+const semver = require('semver');
+const minimatchModule = require('minimatch');
+const minimatch = minimatchModule.minimatch || minimatchModule;
+
+// Full package graphs consumed by ordinary bundled Node. Connector adapters
+// load selected SDK entrypoints; their smaller closure and executable smoke
+// remain owned by packaged-entrypoint-gate.cjs. Electron-only dependencies can
+// stay in app.asar. See docs/packaged-dependencies.md for the complete inventory.
+const NODE_RUNTIME_PACKAGE_ROOTS = Object.freeze(['sharp', 'tsx', 'ag-psd']);
+
+const TARGETS = new Set(['darwin-arm64', 'darwin-x64', 'win32-x64', 'linux-x64', 'linux-arm64']);
+const PACKAGE_ROOT_PATTERN = /^(?:node_modules\/(?:@[^/]+\/)?[^/]+)(?:\/node_modules\/(?:@[^/]+\/)?[^/]+)*$/;
+
+function fail(message) {
+  throw new Error(`[packaged-dependency-gate] ${message}`);
+}
+
+function targetKey(platform, arch) {
+  return `${platform}-${arch}`;
+}
+
+function readJson(label, file) {
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+    fail(`missing ${label}: ${file}`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    fail(`invalid ${label}: ${file}: ${err.message}`);
+  }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableJson(value[key])]));
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(stableJson(left)) === JSON.stringify(stableJson(right));
+}
+
+function packageRootFromManifestPath(manifestPath) {
+  const normalized = String(manifestPath).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (normalized === 'package.json') return '';
+  if (!normalized.endsWith('/package.json')) return null;
+  const packageRoot = normalized.slice(0, -'/package.json'.length);
+  return PACKAGE_ROOT_PATTERN.test(packageRoot) ? packageRoot : null;
+}
+
+function readAsarJson(appAsar, archivePath, manifestPath) {
+  try {
+    return JSON.parse(asar.extractFile(appAsar, archivePath).toString('utf8'));
+  } catch (err) {
+    fail(`invalid ${manifestPath} in ${appAsar}: ${err.message}`);
+  }
+}
+
+function readPackagedManifests(appAsar) {
+  if (!fs.existsSync(appAsar) || !fs.statSync(appAsar).isFile()) {
+    fail(`missing app.asar: ${appAsar}`);
+  }
+
+  let entries;
+  try {
+    entries = asar.listPackage(appAsar);
+  } catch (err) {
+    fail(`cannot read app.asar: ${appAsar}: ${err.message}`);
+  }
+
+  const manifests = new Map();
+  for (const entry of entries) {
+    const archivePath = String(entry).replace(/^[\\/]+/, '');
+    const manifestPath = archivePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const packageRoot = packageRootFromManifestPath(manifestPath);
+    if (packageRoot === null) continue;
+    if (manifests.has(packageRoot)) {
+      fail(`duplicate package manifest root in app.asar: ${packageRoot || '(app root)'}`);
+    }
+    const manifest = readAsarJson(appAsar, archivePath, manifestPath);
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      fail(`package manifest is not an object: ${manifestPath}`);
+    }
+    manifests.set(packageRoot, manifest);
+  }
+
+  if (!manifests.has('')) fail(`app.asar has no root package.json: ${appAsar}`);
+  return manifests;
+}
+
+function packageNameFromLockPath(lockPath) {
+  const marker = 'node_modules/';
+  const index = lockPath.lastIndexOf(marker);
+  return index >= 0 ? lockPath.slice(index + marker.length) : '';
+}
+
+function lockedVersionsByName(lock) {
+  const versions = new Map();
+  for (const [lockPath, entry] of Object.entries(lock.packages || {})) {
+    if (!lockPath || !entry || !entry.version) continue;
+    const packageName = String(entry.name || packageNameFromLockPath(lockPath));
+    if (!packageName) continue;
+    if (!versions.has(packageName)) versions.set(packageName, new Set());
+    versions.get(packageName).add(String(entry.version));
+  }
+  return versions;
+}
+
+function validateRootContract(packagedRoot, sourcePackage, lock) {
+  const lockRoot = lock.packages?.[''];
+  if (!lockRoot) fail('package-lock.json has no root packages entry');
+
+  for (const key of ['name', 'version', 'main', 'dependencies', 'optionalDependencies', 'overrides']) {
+    if (!sameJson(packagedRoot[key], sourcePackage[key])) {
+      fail(`app.asar root ${key} differs from source package.json`);
+    }
+  }
+  for (const key of ['name', 'version', 'dependencies', 'optionalDependencies']) {
+    if (!sameJson(lockRoot[key], sourcePackage[key])) {
+      fail(`package-lock.json root ${key} differs from source package.json`);
+    }
+  }
+
+  const overrides = sourcePackage.overrides || {};
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    fail('source package.json overrides must be an object');
+  }
+  for (const [packageName, spec] of Object.entries(overrides)) {
+    if (typeof spec !== 'string' || !spec.trim()) {
+      fail(`unsupported override for ${packageName}; dependency gate currently requires a non-empty string version/range`);
+    }
+  }
+}
+
+function listMatchesTarget(values, target) {
+  if (!Array.isArray(values) || values.length === 0) return true;
+  const normalized = values.map(String);
+  if (normalized.includes(`!${target}`)) return false;
+  const positive = normalized.filter((value) => !value.startsWith('!'));
+  return positive.length === 0 || positive.includes(target);
+}
+
+function isPlatformSpecific(manifest) {
+  return (Array.isArray(manifest.os) && manifest.os.length > 0)
+    || (Array.isArray(manifest.cpu) && manifest.cpu.length > 0);
+}
+
+function validateTargetCompatibility(record, platform, arch) {
+  if (!listMatchesTarget(record.manifest.os, platform)) {
+    fail(`${record.name}@${record.version} at ${record.root} is incompatible with target OS ${platform}`);
+  }
+  if (!listMatchesTarget(record.manifest.cpu, arch)) {
+    fail(`${record.name}@${record.version} at ${record.root} is incompatible with target CPU ${arch}`);
+  }
+}
+
+function packageRecords(manifests, lockedVersions, platform, arch) {
+  const records = new Map();
+  for (const [root, manifest] of manifests) {
+    if (root === '') continue;
+    const name = String(manifest.name || '');
+    const version = String(manifest.version || '');
+    if (!name || !semver.valid(version)) {
+      fail(`invalid packaged package identity at ${root}: ${name || '(missing)'}@${version || '(missing)'}`);
+    }
+    const allowed = lockedVersions.get(name);
+    if (!allowed || !allowed.has(version)) {
+      fail(`${name}@${version} at ${root} is not present in package-lock.json`);
+    }
+    const record = {
+      root,
+      name,
+      version,
+      manifest,
+      platformSpecific: isPlatformSpecific(manifest),
+    };
+    validateTargetCompatibility(record, platform, arch);
+    records.set(root, record);
+  }
+  return records;
+}
+
+function parentPackageRoot(packageRoot) {
+  const index = packageRoot.lastIndexOf('/node_modules/');
+  return index >= 0 ? packageRoot.slice(0, index) : '';
+}
+
+function resolveDependency(records, fromRoot, dependencyName) {
+  let current = fromRoot;
+  while (true) {
+    const candidate = current
+      ? `${current}/node_modules/${dependencyName}`
+      : `node_modules/${dependencyName}`;
+    if (records.has(candidate)) return records.get(candidate);
+    if (!current) return null;
+    current = parentPackageRoot(current);
+  }
+}
+
+function dependencySpecs(manifest) {
+  const specs = new Map();
+  for (const [name, spec] of Object.entries(manifest.dependencies || {})) {
+    specs.set(name, { name, spec: String(spec), required: true, kind: 'dependency' });
+  }
+  for (const [name, spec] of Object.entries(manifest.optionalDependencies || {})) {
+    specs.set(name, { name, spec: String(spec), required: false, kind: 'optional dependency' });
+  }
+  for (const [name, spec] of Object.entries(manifest.peerDependencies || {})) {
+    if (specs.has(name)) continue;
+    const optional = manifest.peerDependenciesMeta?.[name]?.optional === true;
+    specs.set(name, { name, spec: String(spec), required: !optional, kind: optional ? 'optional peer dependency' : 'peer dependency' });
+  }
+  return [...specs.values()];
+}
+
+function npmAlias(spec) {
+  if (!spec.startsWith('npm:')) return null;
+  const value = spec.slice('npm:'.length);
+  const split = value.lastIndexOf('@');
+  if (split <= 0 || split === value.length - 1) {
+    fail(`unsupported npm alias dependency spec: ${spec}`);
+  }
+  return { packageName: value.slice(0, split), range: value.slice(split + 1) };
+}
+
+function normalizedSemverRange(spec) {
+  if (spec.startsWith('workspace:')) {
+    const value = spec.slice('workspace:'.length);
+    if (value === '' || value === '*' || value === '^' || value === '~') return '*';
+    return value;
+  }
+  return spec;
+}
+
+function isExternallyResolvedSpec(spec) {
+  return /^(?:file:|link:|https?:|git(?:\+|:)|github:|gitlab:|bitbucket:)/.test(spec);
+}
+
+function validateResolvedVersion(edge, resolved, overrides) {
+  const override = Object.prototype.hasOwnProperty.call(overrides, edge.name)
+    ? String(overrides[edge.name])
+    : '';
+  const effectiveSpec = override || edge.spec;
+  const alias = npmAlias(effectiveSpec);
+  if (alias && resolved.name !== alias.packageName) {
+    fail(`${edge.kind} ${edge.name}@${effectiveSpec} resolved to unexpected package ${resolved.name}@${resolved.version} at ${resolved.root}`);
+  }
+  const rangeText = normalizedSemverRange(alias ? alias.range : effectiveSpec);
+  const range = semver.validRange(rangeText);
+  if (range) {
+    if (!semver.satisfies(resolved.version, range)) {
+      const overrideDetail = override ? ` (root override ${edge.name}@${override})` : '';
+      fail(`${edge.kind} ${edge.name}@${edge.spec}${overrideDetail} resolved to ${resolved.name}@${resolved.version} at ${resolved.root}`);
+    }
+  } else if (!isExternallyResolvedSpec(rangeText)) {
+    fail(`unsupported dependency range ${edge.name}@${effectiveSpec}; cannot verify packaged version`);
+  }
+  return override ? 1 : 0;
+}
+
+function verifyDirectDependencies(sourcePackage, lock, records) {
+  for (const [name, spec] of Object.entries(sourcePackage.dependencies || {})) {
+    const record = records.get(`node_modules/${name}`);
+    if (!record) fail(`missing direct production dependency ${name}@${spec} from app.asar`);
+    const expected = lock.packages?.[`node_modules/${name}`]?.version;
+    if (!expected) fail(`package-lock.json has no top-level entry for direct dependency ${name}`);
+    if (record.version !== String(expected)) {
+      fail(`direct dependency ${name} version mismatch: packaged=${record.version} lock=${expected}`);
+    }
+  }
+}
+
+function verifyResolvedGraph(sourcePackage, rootManifest, records, allowUnreachable = false) {
+  const overrides = sourcePackage.overrides || {};
+  const reachable = new Set();
+  const queue = [{ root: '', name: sourcePackage.name, version: sourcePackage.version, manifest: rootManifest }];
+  let edgeCount = 0;
+  let overrideEdgeCount = 0;
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const edge of dependencySpecs(current.manifest)) {
+      const resolved = resolveDependency(records, current.root, edge.name);
+      if (!resolved) {
+        if (!edge.required) continue;
+        fail(`${current.name}@${current.version} at ${current.root || '(app root)'} is missing ${edge.kind} ${edge.name}@${edge.spec}`);
+      }
+      overrideEdgeCount += validateResolvedVersion(edge, resolved, overrides);
+      edgeCount += 1;
+      if (!reachable.has(resolved.root)) {
+        reachable.add(resolved.root);
+        queue.push(resolved);
+      }
+    }
+  }
+
+  const unexpected = [...records.values()]
+    .filter((record) => !reachable.has(record.root))
+    .map((record) => `${record.root} (${record.name}@${record.version})`)
+    .sort();
+  if (!allowUnreachable && unexpected.length > 0) {
+    fail(`unreachable package(s) in app.asar: ${unexpected.join(', ')}`);
+  }
+  return { edgeCount, overrideEdgeCount, reachable: [...reachable] };
+}
+
+// Packaging-only source/cache checks reuse the final archive's resolution and
+// version rules. Unrelated dev and other-platform optional packages may exist
+// in the lock or build tree, but cannot satisfy a missing production edge.
+function verifySourceDependencyGraph(sourcePackage, lock, platform, arch) {
+  validateRootContract(sourcePackage, sourcePackage, lock);
+  if (!sameJson(lock.packages[''].devDependencies, sourcePackage.devDependencies)) {
+    fail('package-lock.json root devDependencies differs from source package.json');
+  }
+  const records = new Map();
+  for (const [root, manifest] of Object.entries(lock.packages)) {
+    if (!root || !listMatchesTarget(manifest.os, platform) || !listMatchesTarget(manifest.cpu, arch)) continue;
+    records.set(root, { root, name: manifest.name || packageNameFromLockPath(root), version: manifest.version, manifest });
+  }
+  verifyDirectDependencies(sourcePackage, lock, records);
+  return { ...verifyResolvedGraph(sourcePackage, sourcePackage, records, true), records };
+}
+
+function verifyInstalledProductionDependencies(pcRoot, platform, arch) {
+  const source = readJson('package.json', path.join(pcRoot, 'package.json'));
+  const lock = readJson('package-lock.json', path.join(pcRoot, 'package-lock.json'));
+  const locked = verifySourceDependencyGraph(source, lock, platform, arch);
+  const records = new Map();
+  // Follow the locked production closure, including nested packages. Never
+  // require() dependency code or load a target native binding on the build host.
+  for (const root of locked.reachable) {
+    const expected = locked.records.get(root);
+    const file = path.join(pcRoot, root, 'package.json');
+    // npm may legitimately omit optional packages. The resolved graph below
+    // still rejects every missing required edge, including nested fallbacks.
+    if (!fs.existsSync(file)) continue;
+    const manifest = readJson(`${root}/package.json`, file);
+    if (manifest.name !== expected.name || manifest.version !== expected.version) {
+      fail(`installed ${root} name/version does not match package-lock.json`);
+    }
+    for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'peerDependenciesMeta']) {
+      if (!sameJson(manifest[key] || {}, expected.manifest[key] || {})) fail(`installed ${root} ${key} differs from package-lock.json`);
+    }
+    records.set(root, { ...expected, manifest });
+  }
+  return verifyResolvedGraph(source, source, records, true);
+}
+
+function nodeRuntimeClosure(records, rootNames, includeOptional) {
+  const found = new Set();
+  const queue = rootNames.map((name) => {
+    const record = records.get(`node_modules/${name}`);
+    if (!record) fail(`stock Node runtime root missing: ${name}`);
+    return record;
+  });
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    if (found.has(current.root)) continue;
+    found.add(current.root);
+    for (const edge of dependencySpecs(current.manifest)) {
+      if (!includeOptional && !edge.required) continue;
+      const resolved = resolveDependency(records, current.root, edge.name);
+      if (!resolved && edge.required) fail(`stock Node ${current.root} is missing ${edge.name}`);
+      if (resolved) queue.push(resolved);
+    }
+  }
+  return [...found].sort();
+}
+
+function verifyNodeRuntimeBuildConfig(sourcePackage, lock) {
+  const records = new Map(Object.entries(lock.packages || {}).filter(([root]) => root).map(([root, manifest]) => (
+    [root, { root, manifest }]
+  )));
+  const inventory = nodeRuntimeClosure(records, NODE_RUNTIME_PACKAGE_ROOTS, false);
+  for (const root of inventory) {
+    for (const field of ['files', 'asarUnpack']) {
+      const patterns = sourcePackage.build?.[field] || [];
+      const file = `${root}/package.json`;
+      const included = patterns.some((pattern) => typeof pattern === 'string'
+        && !pattern.startsWith('!') && minimatch(file, pattern, { dot: true }));
+      const excluded = patterns.some((pattern) => typeof pattern === 'string'
+        && pattern.startsWith('!') && minimatch(file, pattern.slice(1), { dot: true }));
+      if (!included || excluded) fail(`stock Node ${root} must be included in build.${field}`);
+    }
+  }
+  return inventory;
+}
+
+function verifyUnpackedNodeRuntime(appAsar, sourcePackage, records) {
+  const roots = NODE_RUNTIME_PACKAGE_ROOTS.filter((name) => sourcePackage.dependencies?.[name]);
+  const inventory = nodeRuntimeClosure(records, roots, true);
+  // Visit each package's own archive entries once. Do not walk nested packages
+  // here; resolution above selects the actual dependency, including nesting.
+  function visit(relative, entry) {
+    if (entry.files) {
+      for (const [name, child] of Object.entries(entry.files)) {
+        if (name !== 'node_modules') visit(`${relative}/${name}`, child);
+      }
+      return;
+    }
+    if (!entry.unpacked) fail(`stock Node ${relative} is not unpacked from app.asar`);
+    const file = path.join(`${appAsar}.unpacked`, ...relative.split('/'));
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) fail(`stock Node ${relative} is missing`);
+    // Signing can change native binary sizes after the archive is written.
+    // Architecture/integrity and executable behavior have their own gates.
+  }
+  // ASAR traverses directories with the host separator; lock roots use POSIX paths.
+  for (const root of inventory) visit(root, asar.statFile(appAsar, path.join(...root.split('/'))));
+  return inventory;
+}
+
+function inventoryCounts(records, predicate) {
+  const counts = {};
+  for (const record of records.values()) {
+    if (!predicate(record)) continue;
+    const key = `${record.name}@${record.version}`;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function verifyPackagedDependencyGraphWithRawFs(options) {
+  const { appAsar, packageJsonFile, packageLockFile, platform, arch } = options || {};
+  const key = targetKey(platform, arch);
+  if (!TARGETS.has(key)) fail(`unsupported packaged dependency target: ${key}`);
+
+  const sourcePackage = readJson('source package.json', packageJsonFile);
+  const lock = readJson('source package-lock.json', packageLockFile);
+  const manifests = readPackagedManifests(appAsar);
+  const rootManifest = manifests.get('');
+  validateRootContract(rootManifest, sourcePackage, lock);
+
+  const records = packageRecords(manifests, lockedVersionsByName(lock), platform, arch);
+  verifyDirectDependencies(sourcePackage, lock, records);
+  const graph = verifyResolvedGraph(sourcePackage, rootManifest, records);
+  const nodeRuntimeInventory = verifyUnpackedNodeRuntime(appAsar, sourcePackage, records);
+  const packageCount = records.size;
+
+  return {
+    platform,
+    arch,
+    packageCount,
+    edgeCount: graph.edgeCount,
+    overrideEdgeCount: graph.overrideEdgeCount,
+    nodeRuntimeInventory,
+    neutralInventory: inventoryCounts(records, (record) => !record.platformSpecific),
+    platformInventory: inventoryCounts(records, (record) => record.platformSpecific),
+    // mac x64/arm64 packages that are OS-specific but support both CPUs must
+    // still match exactly. Only packages whose cpu contract excludes one of
+    // those architectures are allowed to differ across the two builds.
+    crossArchInventory: inventoryCounts(
+      records,
+      (record) => listMatchesTarget(record.manifest.cpu, 'x64')
+        && listMatchesTarget(record.manifest.cpu, 'arm64'),
+    ),
+    verificationEntry: `dependency:lock-graph:${key}:packages=${packageCount}:edges=${graph.edgeCount}:overrides=${graph.overrideEdgeCount}`,
+  };
+}
+
+function verifyPackagedDependencyGraph(options) {
+  // Electron patches fs so a physical *.asar file appears as a directory.
+  // afterPack and the release validator normally run in plain Node, but the
+  // same verifier is also exercised by Electron-hosted Vitest. Disable that
+  // virtual filesystem only while reading the physical archive, then restore
+  // the caller's state exactly.
+  const hadNoAsar = Object.prototype.hasOwnProperty.call(process, 'noAsar');
+  const previousNoAsar = process.noAsar;
+  process.noAsar = true;
+  try {
+    return verifyPackagedDependencyGraphWithRawFs(options);
+  } finally {
+    if (hadNoAsar) process.noAsar = previousNoAsar;
+    else delete process.noAsar;
+  }
+}
+
+function formatInventoryDifference(left, right) {
+  const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+  return keys
+    .filter((key) => (left[key] || 0) !== (right[key] || 0))
+    .map((key) => `${key} (${left[key] || 0} vs ${right[key] || 0})`);
+}
+
+function comparePackagedDependencyInventories(left, right) {
+  if (!left || !right) fail('two packaged dependency verification results are required');
+  if (left.platform !== right.platform) {
+    fail(`cannot compare dependency inventories across platforms: ${left.platform} vs ${right.platform}`);
+  }
+  const leftInventory = left.crossArchInventory || left.neutralInventory || {};
+  const rightInventory = right.crossArchInventory || right.neutralInventory || {};
+  const differences = formatInventoryDifference(leftInventory, rightInventory);
+  if (differences.length > 0) {
+    fail(`platform-neutral dependency inventory differs for ${left.platform}/${left.arch} and ${right.platform}/${right.arch}: ${differences.join(', ')}`);
+  }
+  return `dependency:cross-arch-inventory:${left.platform}:${left.arch}=${right.arch}:packages=${Object.values(leftInventory).reduce((sum, count) => sum + count, 0)}`;
+}
+
+module.exports = {
+  NODE_RUNTIME_PACKAGE_ROOTS,
+  TARGETS,
+  comparePackagedDependencyInventories,
+  packageRootFromManifestPath,
+  verifyPackagedDependencyGraph,
+  verifyNodeRuntimeBuildConfig,
+  verifySourceDependencyGraph,
+  verifyInstalledProductionDependencies,
+};

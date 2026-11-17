@@ -1,0 +1,21 @@
+{
+  "version": "1.0.8",
+  "updated_at": "2026-08-16T08:43:12.000Z",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "routing": {
+    "applicable_domain": [
+      "live GitHub issues, pull requests, CI runs, releases, branches, and repository settings",
+      "repository maintenance that requires GitHub API state"
+    ],
+    "negative_examples": [
+      "edit local repository source without requiring GitHub state",
+      "infer live issue, pull request, or CI status from stale local text",
+      "perform writes outside the exact current request or after a material scope expansion without approval"
+    ],
+    "prerequisites": [
+      "a GitHub repository or concrete GitHub object is in scope",
+      "the GitHub connector is available for live operations"
+    ]
+  }
+}

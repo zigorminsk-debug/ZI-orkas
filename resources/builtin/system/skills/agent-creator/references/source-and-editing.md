@@ -1,0 +1,34 @@
+# Source-backed creation and editing
+
+Read this file when source material or conversation history defines the Agent, or when editing an existing Agent from an unbound Commander session.
+
+## Source-preservation contract
+
+Source includes current-turn attachments or referenced files, pasted prompts, `agent.json`, YAML/JSON specs, README/workflow documents, examples, or Agent directories.
+
+1. Read the source first. A filename plus a short request is not enough; for an injected path, apply the root attachment-source gate.
+2. Preserve the core prompt: role/persona, objective, boundaries, step order, tool rules, examples, output format, evaluation checks, and safety/confirmation points.
+3. Adapt format rather than substance. Map content into Orkas display, workflow, guidance, capability dependency, input, interaction, and category fields.
+4. Treat an `agent_id` found in exported or supplied source as provenance, not mutation intent. For import-as-new, copy, or create-from-source requests, never copy or emit that source ID. Follow the mutation controls in `llm-agent-fields.md`; only an explicit unbound edit resolved from the current index and spec emits the canonical current id.
+5. Map a source capability only to a real built-in tool or available Skill; state any unmapped capability as a limitation. Preserve useful examples, data/report shapes, acceptance criteria, and behavior-affecting configuration; ignore only unrelated build/editor artifacts.
+6. Treat a matching domain folder such as `education`, `data`, `creation`, `office`, or `rnd` as strong category evidence.
+
+## Conversation crystallization
+
+For “turn the above conversation into an Agent”, identify the concrete target before the current request: the task, delivered output, artifact, decision, or repeatable workflow. Author from that target, not from the meta act of creating an Agent. If no concrete target is identifiable, ask one concise clarification and emit no container.
+
+## Unbound editing loop
+
+1. Resolve the injected index entry and check its `Source` before reading the spec or preparing edits. For `Source: builtin` or `Source: platform`, explain that the platform Agent definition cannot be edited through chat and nothing changed; emit no container and do not retry the edit.
+2. For `Source: custom`, read its current `agent.json` through the advertised path; never reconstruct it from the slim roster. If `runtime.kind === "cli"`, follow `cli-and-prose.md`: Commander sends the user to the detail panel, while a bound CLI editor may edit only its small supported surface.
+3. For a custom LLM-managed Agent, follow the mutation controls from `llm-agent-fields.md` and emit only the verified edit target and changed fields.
+
+If the target does not resolve to one existing Agent, emit no container. Say in ordinary language that nothing changed, and ask the user to select it or provide its current display name. Do not list ids or XML mechanics, change the operation, or create a replacement.
+
+## Source-aware quality check
+
+Before emitting the container, verify:
+
+- substantive behavior, examples, and output checks remain source-specific rather than generic;
+- mapped capabilities are real and have matching dependencies; and
+- the visible claim is limited to what this container changes.

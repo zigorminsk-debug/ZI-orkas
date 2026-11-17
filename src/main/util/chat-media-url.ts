@@ -1,0 +1,326 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { isPathAllowed, resolveSandboxRoot } from './path-sandbox';
+import { splitMarkdownProseCode } from './markdown-prose-code';
+
+function _strictEncodePathSegment(segment: string): string {
+  // encodeURIComponent deliberately leaves !'()* unescaped. They are legal in
+  // a URL but collide with Markdown link delimiters, so generated media URLs
+  // use the stricter RFC 3986 form.
+  return encodeURIComponent(segment).replace(/[!'()*]/g, (char) => (
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  ));
+}
+
+/** Build the durable per-conversation media route used for attachment-backed
+ * assistant output. Unlike `chatMediaLocalUrl`, this URL survives project
+ * relocation and cloud restore because the protocol resolves the active
+ * conversation's attachment pool instead of an absolute machine path. */
+export function chatMediaCidUrl(cid: string, name: string): string {
+  return `chat-media://cid/${_strictEncodePathSegment(String(cid || ''))}/${_strictEncodePathSegment(String(name || ''))}`;
+}
+
+/**
+ * Build a durable `chat-media://local/` URL for an absolute filesystem path.
+ *
+ * Encode path segments independently: `encodeURI` leaves `#` and `?` intact,
+ * which makes Chromium interpret the rest of a perfectly valid filename as a
+ * fragment/query and sends a truncated path to the protocol handler.
+ */
+export function chatMediaLocalUrl(absPath: string): string {
+  let normalized = String(absPath || '').replace(/\\/g, '/');
+  if (normalized.startsWith('/')) normalized = normalized.slice(1);
+  const encoded = normalized
+    .split('/')
+    .map((segment, index) => (
+      index === 0 && /^[A-Za-z]:$/.test(segment)
+        ? segment
+        : _strictEncodePathSegment(segment)
+    ))
+    .join('/');
+  return `chat-media://local/${encoded}`;
+}
+
+function _chatMediaLocalVersionToken(absPath: string, tokens?: Map<string, string>): string {
+  const key = tokens ? path.normalize(absPath) : absPath;
+  if (tokens?.has(key)) return tokens.get(key)!;
+  let token = '';
+  try {
+    const st = fs.statSync(absPath, { bigint: true });
+    // ctime catches same-path rewrites that deliberately preserve mtime;
+    // nanosecond timestamps avoid the millisecond collision window.
+    if (st.isFile()) token = `${st.mtimeNs}-${st.ctimeNs}-${st.size}`;
+  } catch { /* missing files have no version */ }
+  tokens?.set(key, token);
+  return token;
+}
+
+/**
+ * Use for generated media that may overwrite an existing path. Chromium only
+ * revalidates a stable chat-media URL when an element actually requests it;
+ * changing the query token makes a newly rendered message issue that request.
+ */
+export function versionedChatMediaLocalUrl(absPath: string): string {
+  const base = chatMediaLocalUrl(absPath);
+  const token = _chatMediaLocalVersionToken(absPath);
+  return token ? `${base}?v=${token}` : base;
+}
+
+/** Decode only the local route. The caller still owns filesystem validation. */
+export function chatMediaLocalPathFromUrl(raw: string, platform = process.platform): string {
+  let url: URL;
+  try { url = new URL(String(raw || '')); }
+  catch { return ''; }
+  if (url.protocol !== 'chat-media:' || url.hostname.toLowerCase() !== 'local') return '';
+  let decoded = '';
+  try { decoded = decodeURIComponent(url.pathname || ''); }
+  catch { return ''; }
+  if (platform === 'win32' && /^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+  return decoded;
+}
+
+// Generated local URLs percent-encode filename punctuation, so raw CJK
+// sentence delimiters are always prose boundaries rather than path bytes.
+const CHAT_MEDIA_LOCAL_URL_IN_TEXT = /chat-media:\/\/local\/[^\s<>"'`\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+/gi;
+const CHAT_MEDIA_TRAILING_DELIMITER = /[)\]},.;:!\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+$/;
+// Match the same simple Markdown destination family rendered by
+// renderer/modules/utils.js. Local aliases are normalized only inside a media
+// link/image destination: an absolute path mentioned as prose or code is not a
+// request to rewrite the assistant's text.
+// Consume even an incomplete link prefix unchanged, so a run of '[' cannot
+// make a failed destination match retry the same label at every character.
+const MARKDOWN_LOCAL_MEDIA_DESTINATION = /((?:!\[[^\]\r\n]*\]|\[[^\]\r\n]+\])\()(?:([^\s)]+)((?:\s+"[^"\r\n]*")?\)))?/g;
+const MARKDOWN_CODE_REGION = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\r\n]*`)/g;
+const RENDERABLE_LOCAL_MEDIA_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.mp4', '.webm', '.mov', '.m4v', '.ogv',
+  '.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac',
+  '.html', '.htm',
+]);
+
+function _localMediaAliasPath(raw: string, platform = process.platform): string {
+  const candidate = String(raw || '').trim();
+  if (!candidate || /^chat-media:/i.test(candidate)) return '';
+
+  if (/^file:/i.test(candidate)) {
+    let parsed: URL;
+    try { parsed = new URL(candidate); }
+    catch { return ''; }
+    let decoded = '';
+    try { decoded = decodeURIComponent(parsed.pathname || ''); }
+    catch { return ''; }
+    if (platform === 'win32' && /^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+    return decoded;
+  }
+
+  const bare = candidate.replace(/^sandbox:/i, '');
+  if (bare.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bare)) return bare;
+  return '';
+}
+
+function _isRenderableLocalMediaPath(absPath: string): boolean {
+  const normalized = String(absPath || '').replace(/\\/g, '/');
+  const basename = normalized.slice(normalized.lastIndexOf('/') + 1);
+  const dot = basename.lastIndexOf('.');
+  if (dot < 0) return false;
+  return RENDERABLE_LOCAL_MEDIA_EXTS.has(basename.slice(dot).toLowerCase());
+}
+
+/** A workspace-relative media destination resolved against the conversation's
+ * own working directory, or '' when it does not name a file there.
+ *
+ * An agent hands the user the path it was given, and for files it produced in
+ * its cwd that is a relative one — the same spelling it uses for every other
+ * deliverable. A non-media relative link renders as a link and is harmless, so
+ * the shape looks safe; a media one is upgraded to an `<img>`/`<video>` by the
+ * renderer, which has no base directory and so requested it against the app
+ * origin. On 2026-09-01 eight keyframes offered for approval all rendered as
+ * "image missing" while sitting on disk, and the contact sheet beside them —
+ * emitted by a tool as an absolute `chat-media://local/` URL — displayed fine.
+ * The main process is the layer that knows the cwd, so the destination is
+ * resolved here, before the renderer ever sees it.
+ *
+ * Deliberately narrow: the target must stay inside the conversation workspace
+ * and must exist. A relative destination that names nothing keeps its original
+ * text rather than becoming a broken embed, and `..` cannot walk the rewrite
+ * out of the workspace. */
+function _workspaceRelativeMediaPath(raw: string, baseDirAbs: string): string {
+  const candidate = String(raw || '').trim();
+  if (!candidate || !baseDirAbs) return '';
+  // Anything carrying a scheme, an authority, or a bare query/fragment is a
+  // URL the model meant as a URL, not a path in the workspace.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(candidate) || candidate.startsWith('//')) return '';
+  if (/^[#?]/.test(candidate)) return '';
+  if (candidate.startsWith('/') || /^[A-Za-z]:[\\/]/.test(candidate)) return '';
+  let decoded = candidate;
+  try { decoded = decodeURIComponent(candidate); }
+  catch { /* a destination that is not valid percent-encoding is used verbatim */ }
+  const base = path.resolve(baseDirAbs);
+  const resolved = path.resolve(base, decoded);
+  const rel = path.relative(base, resolved);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return '';
+  try { if (!fs.statSync(resolved).isFile()) return ''; }
+  catch { return ''; }
+  return resolved;
+}
+
+function _normalizeLocalMediaAliasesInMarkdown(text: string, baseDirAbs: string): string {
+  if (!text.includes('](')) return text;
+  const normalizeSegment = (segment: string): string => segment.split(/([\r\n])/).map((line) => !line.includes('](') ? line : line.replace(
+    MARKDOWN_LOCAL_MEDIA_DESTINATION,
+    (full, prefix: string, destination: string, suffix: string) => {
+      if (!destination) return full;
+      let absPath = _localMediaAliasPath(destination);
+      if (!absPath) {
+        // Reject non-media destinations before any filesystem lookup.
+        let decoded = destination;
+        try { decoded = decodeURIComponent(destination); }
+        catch { /* preserve literal malformed encoding */ }
+        if (!_isRenderableLocalMediaPath(decoded)) return full;
+        absPath = _workspaceRelativeMediaPath(destination, baseDirAbs);
+      }
+      if (!absPath || !_isRenderableLocalMediaPath(absPath)) return full;
+      // Use the canonical route even when the file is currently missing. An
+      // existing file gains its byte-derived version below; a missing target
+      // remains a stable canonical URL for normal renderer error handling.
+      return `${prefix}${chatMediaLocalUrl(absPath)}${suffix}`;
+    },
+  )).join('');
+
+  const source = String(text || '');
+  let normalized = '';
+  let cursor = 0;
+  for (const match of source.matchAll(MARKDOWN_CODE_REGION)) {
+    const index = match.index ?? cursor;
+    normalized += normalizeSegment(source.slice(cursor, index));
+    normalized += match[0];
+    cursor = index + match[0].length;
+  }
+  return normalized + normalizeSegment(source.slice(cursor));
+}
+
+function _versionLocalUrlCandidate(candidate: string, tokens: Map<string, string>): string {
+  const absPath = chatMediaLocalPathFromUrl(candidate);
+  if (!absPath) return '';
+  const token = _chatMediaLocalVersionToken(absPath, tokens);
+  if (!token) return '';
+  try {
+    const parsed = new URL(candidate);
+    parsed.searchParams.set('v', token);
+    return parsed.toString();
+  } catch {
+    return '';
+  }
+}
+
+/** Only explicit document links to existing files inside the author's workspace
+ * become preview references. Never search other roots or follow a symlink out.
+ * Keep unresolved Markdown for the renderer's plain-filename fallback. */
+function _normalizeWorkspaceDocumentLinks(text: string, baseDirAbs: string, tokens: Map<string, string>): string {
+  if (!text.includes('](') || !baseDirAbs || !path.isAbsolute(baseDirAbs)) return text;
+  const base = path.resolve(baseDirAbs);
+  const targets = new Map<string, string>();
+  let sandboxRoot: string | undefined;
+  return splitMarkdownProseCode(text).map((segment) => {
+    if (segment.kind !== 'prose') return segment.text;
+    return segment.text.split(/([\r\n])/).map((line) => !line.includes('](') ? line : line.replace(/(!?\[[^\]\r\n]+\]\()(?:(<[^<>\r\n]+>|[^)\s]+)((?:\s+"[^"\r\n]*")?\)))?/g,
+      (full, prefix: string, raw: string, suffix: string) => {
+        if (!raw || prefix.startsWith('!')) return full;
+        const destination = raw.startsWith('<') ? raw.slice(1, -1) : raw;
+        // Same source-location grammar as renderer/modules/utils.js. Parse
+        // before decoding so encoded punctuation remains literal path bytes.
+        const location = destination.match(/(?::[1-9]\d*(?::[1-9]\d*)?|#L[1-9]\d*(?:C[1-9]\d*)?(?:-L[1-9]\d*(?:C[1-9]\d*)?)?)$/)?.[0] || '';
+        const filePath = location ? destination.slice(0, -location.length) : destination;
+        if (!filePath || /^(?:[a-z][a-z0-9+.-]*:|[\\/#?])/i.test(filePath)) return full;
+        let decoded: string;
+        try { decoded = decodeURIComponent(filePath); }
+        catch { return full; }
+        if (/[\u0000-\u001f\u007f]/.test(decoded) || !path.extname(decoded)
+            || _isRenderableLocalMediaPath(decoded)) return full;
+        const resolved = path.resolve(base, decoded);
+        if (!targets.has(resolved)) {
+          const relative = path.relative(base, resolved);
+          let url = '';
+          // Outside references need no disk access. Missing references need
+          // only one stat, without walking their missing ancestors for realpath.
+          if (relative && relative !== '..' && !relative.startsWith(`..${path.sep}`)
+              && !path.isAbsolute(relative) && _chatMediaLocalVersionToken(resolved, tokens)) {
+            sandboxRoot ??= resolveSandboxRoot(base);
+            if (isPathAllowed(resolved, [sandboxRoot], { rootsResolved: true })) url = chatMediaLocalUrl(resolved);
+          }
+          targets.set(resolved, url);
+        }
+        const url = targets.get(resolved);
+        if (!url) return full;
+        const fragment = location.startsWith(':')
+          ? `#L${location.slice(1).replace(':', 'C')}` : location;
+        return `${prefix}${url}${fragment}${suffix}`;
+      })).join('');
+  }).join('');
+}
+
+/**
+ * Refresh every local media URL embedded in assistant-authored Markdown/HTML.
+ *
+ * Tool results already return versioned URLs, but model prose can retype the
+ * same path and drop (or retain an older) `?v=` query. Running this at the
+ * message persistence boundary makes the stored and live-rendered text point
+ * at the bytes that exist when the reply is committed.
+ *
+ * `baseDirAbs` is the author's working directory, when the caller knows it, so
+ * a media destination written relative to it resolves to the file it names.
+ * Explicit document links are also resolved when the file exists inside that
+ * directory; source locations remain URL fragments, separate from path bytes.
+ */
+export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): string {
+  // Invocation-local metadata only: repeated references share I/O, while the
+  // next render observes file creation, deletion, replacement, and new bytes.
+  const tokens = new Map<string, string>();
+  const normalized = _normalizeLocalMediaAliasesInMarkdown(
+    _normalizeWorkspaceDocumentLinks(String(text || ''), baseDirAbs, tokens), baseDirAbs,
+  );
+  const versionBareUrls = (segment: string): string => segment.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
+    let candidate = raw;
+    let suffix = '';
+
+    // Anything after a query/fragment is not a filesystem-path character, so
+    // trailing Markdown/sentence delimiters can be peeled immediately.
+    if (/[?#]/.test(candidate)) {
+      const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
+      if (trailing) {
+        candidate = candidate.slice(0, -trailing.length);
+        suffix = trailing;
+      }
+    }
+
+    let versioned = _versionLocalUrlCandidate(candidate, tokens);
+    // For an unversioned Markdown URL, first try the exact filename so real
+    // local names ending in punctuation remain valid. Peel delimiters only
+    // when the exact path does not exist.
+    while (!versioned) {
+      const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
+      if (!trailing) break;
+      const last = trailing.slice(-1);
+      candidate = candidate.slice(0, -1);
+      suffix = last + suffix;
+      versioned = _versionLocalUrlCandidate(candidate, tokens);
+    }
+    return versioned ? versioned + suffix : raw;
+  });
+
+  // Parse the existing Markdown destination contract before scanning bare URLs.
+  // Otherwise a query can absorb the closing parenthesis and emphasis (e.g.
+  // `?v=old)**`), which URLSearchParams.set then silently replaces with the token.
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const match of normalized.matchAll(MARKDOWN_LOCAL_MEDIA_DESTINATION)) {
+    const index = match.index!;
+    parts.push(versionBareUrls(normalized.slice(cursor, index)));
+    const [full, prefix, destination, suffix] = match;
+    const versioned = destination && _versionLocalUrlCandidate(destination, tokens);
+    parts.push(versioned ? `${prefix}${versioned}${suffix}` : versionBareUrls(full));
+    cursor = index + full.length;
+  }
+  parts.push(versionBareUrls(normalized.slice(cursor)));
+  return parts.join('');
+}

@@ -1,0 +1,257 @@
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+import { fileSystemForPath } from './user-file-fs';
+
+export interface LocalImportSource {
+  absPath: string;
+  bytes: number;
+  mtimeMs: number;
+  sha1: string;
+}
+
+const _importLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serialize the small check-name/copy/publish critical section for one Library.
+ * Hashing stays outside the lock, while duplicate checks and unique-name
+ * allocation cannot race with another renderer window or native picker.
+ */
+export async function withLocalImportLock<T>(key: string, worker: () => Promise<T>): Promise<T> {
+  const previous = _importLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => current);
+  _importLocks.set(key, tail);
+  await previous.catch(() => {});
+  try {
+    return await worker();
+  } finally {
+    release();
+    if (_importLocks.get(key) === tail) _importLocks.delete(key);
+  }
+}
+
+export async function inspectLocalImportSource(absPath: string, maxBytes: number): Promise<LocalImportSource> {
+  if (!path.isAbsolute(absPath)) throw Object.assign(new Error('source path must be absolute'), { code: 'E_IMPORT_SOURCE' });
+  const lst = await fsp.lstat(absPath);
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    throw Object.assign(new Error('source must be a regular file'), { code: 'E_IMPORT_SOURCE' });
+  }
+  if (lst.size > maxBytes) {
+    throw Object.assign(new Error(`file exceeds ${Math.round(maxBytes / 1024 / 1024)}MB limit`), {
+      code: 'E_FILE_TOO_LARGE',
+      bytes: lst.size,
+    });
+  }
+  const hash = crypto.createHash('sha1');
+  const stream = fs.createReadStream(absPath);
+  for await (const chunk of stream) hash.update(chunk as Buffer);
+  return { absPath, bytes: lst.size, mtimeMs: lst.mtimeMs, sha1: hash.digest('hex') };
+}
+
+/** Reject an existing symlink anywhere below an owned Library root. */
+export async function assertLocalImportTarget(root: string, target: string): Promise<void> {
+  const base = path.resolve(root);
+  const absolute = path.resolve(target);
+  const relative = path.relative(base, absolute);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw Object.assign(new Error('invalid import target'), { code: 'E_IMPORT_TARGET' });
+  }
+  let current = base;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    try {
+      const stat = await fsp.lstat(current);
+      if (stat.isSymbolicLink()) {
+        throw Object.assign(new Error('symbolic links are not supported for Library imports'), {
+          code: 'E_IMPORT_TARGET_SYMLINK',
+        });
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw err;
+    }
+  }
+}
+
+/** Copy without loading file bytes into the Electron main-process heap. */
+export async function copyLocalFileAtomic(
+  source: string,
+  target: string,
+  expected?: Pick<LocalImportSource, 'bytes' | 'mtimeMs'>,
+): Promise<void> {
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  const temp = path.join(
+    path.dirname(target),
+    `.orkas-import-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`,
+  );
+  try {
+    await fsp.copyFile(source, temp);
+    if (expected) {
+      const [sourceAfter, tempAfter] = await Promise.all([fsp.stat(source), fsp.stat(temp)]);
+      if (
+        !sourceAfter.isFile()
+        || tempAfter.size !== expected.bytes
+        || sourceAfter.size !== expected.bytes
+        || Math.abs(sourceAfter.mtimeMs - expected.mtimeMs) > 1
+      ) {
+        throw Object.assign(new Error('source file changed during import; retry the upload'), {
+          code: 'E_IMPORT_SOURCE_CHANGED',
+        });
+      }
+    }
+    try {
+      // Publish the completed inode without replacing a path that appeared
+      // after the caller allocated the name. `rename` overwrites silently on
+      // POSIX and the old Windows fallback explicitly deleted the winner.
+      await fsp.link(temp, target);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw Object.assign(new Error('import target already exists'), {
+          code: 'E_IMPORT_TARGET_EXISTS',
+        });
+      }
+      throw err;
+    }
+  } finally {
+    await fsp.rm(temp, { force: true }).catch(() => {});
+  }
+}
+
+
+/** Copy a validated entry into a create-only destination. Namespace and source
+ * validation belong to the feature caller. Only a directory root claimed by
+ * this operation may be rolled back; native exclusive file copies own theirs. */
+export function copyLocalEntryExclusiveSync(source: string, target: string, directory: boolean): void {
+  if (!directory) {
+    fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+    return;
+  }
+  const sourceMode = fs.statSync(source).mode;
+  fs.mkdirSync(target);
+  let owned: fs.BigIntStats | undefined;
+  try {
+    owned = fs.lstatSync(target, { bigint: true });
+    fs.cpSync(source, target, {
+      recursive: true, errorOnExist: true, force: false,
+      dereference: false, mode: fs.constants.COPYFILE_EXCL,
+    });
+    fs.chmodSync(target, sourceMode);
+  } catch (error) {
+    try {
+      const current = fs.lstatSync(target, { bigint: true });
+      if (owned && current.dev === owned.dev && current.ino === owned.ino && !current.isSymbolicLink()) {
+        fs.rmSync(target, { recursive: true, force: true });
+      }
+    } catch { /* best-effort rollback of an owned partial copy */ }
+    throw error;
+  }
+}
+
+export interface LocalEntryRevision {
+  root: string;
+  entries: Array<{ relative: string; stamp: string }>;
+}
+
+const MAX_REVISION_ENTRIES = 10_000;
+const MAX_REVISION_PATH_BYTES = 1024 * 1024;
+
+function revisionStamp(stat: fs.BigIntStats): string | undefined {
+  if (!stat.isFile() && !stat.isDirectory()) return undefined;
+  return [stat.isDirectory() ? 'dir' : 'file', stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+}
+
+/** Metadata only: native saves replace the inode or change its timestamps.
+ * Include every directory so additions/removals are detected too. Refuse an
+ * unavailable or oversized snapshot before a move can remove any source. */
+export async function captureLocalEntryRevision(root: string): Promise<LocalEntryRevision | undefined> {
+  const entries: LocalEntryRevision['entries'] = [];
+  const deadline = performance.now() + 5000;
+  let pathBytes = 0;
+  async function visit(absolute: string, relative: string, depth: number): Promise<void> {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = await fsp.lstat(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = await fsp.opendir(absolute);
+      for await (const child of directory) {
+        await visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+      }
+    }
+  }
+  try { await visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Capture the owned copy before indexing can yield to another edit. */
+export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision | undefined {
+  const entries: LocalEntryRevision['entries'] = [];
+  const deadline = performance.now() + 100;
+  let pathBytes = 0;
+  function visit(absolute: string, relative: string, depth: number): void {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = fs.lstatSync(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = fs.opendirSync(absolute);
+      try {
+        let child: fs.Dirent | null;
+        while ((child = directory.readSync())) {
+          visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+        }
+      } finally { directory.closeSync(); }
+    }
+  }
+  try { visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Called at the actual synchronous removal boundary, after async validation.
+ * Bound main-thread work; uncertain state must retain both recoverable copies. */
+export function localEntryRevisionMatches(
+  revision: LocalEntryRevision | undefined, deadline = performance.now() + 100,
+): boolean {
+  if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
+  try {
+    return revision.entries.every(({ relative, stamp }) => performance.now() <= deadline
+      && revisionStamp(fs.lstatSync(path.join(revision.root, relative), { bigint: true })) === stamp);
+  } catch { return false; }
+}
+
+export async function isUtf8File(absPath: string): Promise<boolean> {
+  const fs = fileSystemForPath(absPath);
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  const stream = fs.createReadStream(absPath);
+  try {
+    for await (const chunk of stream) {
+      decoder.decode(chunk as Buffer, { stream: true });
+    }
+    decoder.decode();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+      return false;
+    }
+    throw err;
+  } finally {
+    // An invalid chunk ends iteration before the asynchronous handle close.
+    // Callers must be able to remove or replace the rejected source at once.
+    if (!stream.closed) {
+      await new Promise<void>((resolve) => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
+  }
+}

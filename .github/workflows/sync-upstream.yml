@@ -1,0 +1,39 @@
+name: Check Upstream Orkas Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-upstream:
+    name: Compare with Orkas-AI/Orkas
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect latest upstream release & tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LOCAL_VER="$(node -p "require('./package.json').version")"
+          UPSTREAM_JSON="$(gh api repos/Orkas-AI/Orkas/releases/latest 2>/dev/null || echo '{}')"
+          UPSTREAM_TAG="$(echo "$UPSTREAM_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.tag_name || 'unknown');")"
+          UPSTREAM_URL="$(echo "$UPSTREAM_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.html_url || 'https://github.com/Orkas-AI/Orkas');")"
+          UPSTREAM_DATE="$(echo "$UPSTREAM_JSON" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.published_at || 'n/a');")"
+
+          {
+            echo "## Upstream Orkas Version Check"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Local ZI-Orkas version | \`v${LOCAL_VER}\` |"
+            echo "| Upstream latest release | [\`${UPSTREAM_TAG}\`](${UPSTREAM_URL}) |"
+            echo "| Upstream published at | \`${UPSTREAM_DATE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Local: v${LOCAL_VER} | Upstream: ${UPSTREAM_TAG} (${UPSTREAM_URL})"

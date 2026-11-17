@@ -1,0 +1,235 @@
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
+/**
+ * `web_search` override — last-write-wins replacement for core-agent's
+ * built-in keyless web_search.
+ *
+ * Resolution order on every call:
+ *   1. If the user configured ANY paid search API key (`searchProfiles`),
+ *      route the query through the first usable adapter (Tavily / Serper /
+ *      Brave / Baidu AI Search). On success → return; on failure → fall
+ *      through to step 2 with a noted error.
+ *   2. Otherwise, delegate to the keyless Brave/Bing HTML scraper exposed
+ *      by core-agent as `runBuiltinWebSearch` — same behavior as before
+ *      this override existed.
+ *
+ * Why override instead of letting core-agent run its tool? Two reasons:
+ *   - We want the paid API to take precedence (user paid for it; don't
+ *     burn brave-bing rate limits when they have a key).
+ *   - We want to cleanly disable native model-side `web_search` (see
+ *     `native-search-tools.ts`) when the user has a paid search profile,
+ *     so the LLM doesn't have two competing search surfaces.
+ *
+ * Tool name MUST stay exactly `web_search` so AgentRunner's tool map
+ * overwrites core-agent's builtin (last-write-wins).
+ */
+
+import { createHash } from 'node:crypto';
+import type { AgentTool, ToolResult } from '#core-agent';
+import type { SearchProfile } from '../../features/auth';
+import { getActiveUserId } from '../../features/users';
+import { listSearchProfiles } from '../../features/search_auth';
+import { runSearchAdapter, SEARCH_PROVIDER_LABEL, SearchAccountError } from './search-adapters';
+import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
+import { getSearchQueryMaxChars, validateSearchQuery } from '../../util/search-contract';
+import { createTavilySearchTurn, currentTavilySearchTurn, recordTavilySearchRequest,
+  type TavilySearchTurn } from '../../util/tavily-search-turn';
+
+// core-agent is ESM; main is CJS. Static import would yank pi-ai into the
+// CJS load graph and crash with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Same
+// dynamic-import + lazy-cache pattern used by runner.ts / external-providers.ts.
+type CA = typeof import('#core-agent');
+let _caPromise: Promise<CA> | null = null;
+function ca(): Promise<CA> {
+  if (!_caPromise) _caPromise = import('#core-agent') as Promise<CA>;
+  return _caPromise;
+}
+
+const log = createLogger('search-tools');
+
+const DEFAULT_COUNT = 8;
+const MAX_COUNT = 20;
+const PAID_SEARCH_COOLDOWN_MS = 10 * 60_000;
+const MAX_PAID_SEARCH_COOLDOWNS = 128;
+const paidSearchCooldowns = new Map<string, number>();
+
+function searchCooldownKey(userId: string, profile: SearchProfile): string {
+  return createHash('sha256').update(JSON.stringify([
+    userId,
+    profile.id,
+    profile.provider,
+    profile.apiKey,
+    Object.entries(profile.extras || {}).sort(([a], [b]) => a.localeCompare(b)),
+  ])).digest('hex');
+}
+
+function rememberAccountFailure(key: string): void {
+  const now = Date.now();
+  for (const [entry, until] of paidSearchCooldowns) {
+    if (until <= now) paidSearchCooldowns.delete(entry);
+  }
+  paidSearchCooldowns.delete(key);
+  while (paidSearchCooldowns.size >= MAX_PAID_SEARCH_COOLDOWNS) {
+    paidSearchCooldowns.delete(paidSearchCooldowns.keys().next().value!);
+  }
+  paidSearchCooldowns.set(key, now + PAID_SEARCH_COOLDOWN_MS);
+}
+
+export interface SearchExecutionContext {
+  conversationId?: string;
+  conversationTitle?: string;
+  conversationTitleUpdatedAt?: number;
+  turnId?: string;
+  agentId?: string;
+  agentName?: string;
+}
+
+function formatPaidResults(query: string, providerLabel: string, results: { title: string; url: string; snippet: string }[]): string {
+  if (!results.length) {
+    return `No search results for: "${query}" (via ${providerLabel})`;
+  }
+  const lines = [`Search results for: "${query}" (via ${providerLabel})\n`];
+  results.forEach((r, i) => {
+    lines.push(`${i + 1}. ${r.title}`);
+    lines.push(`   URL: ${r.url}`);
+    if (r.snippet) lines.push(`   ${r.snippet}`);
+    lines.push('');
+  });
+  lines.push('Use the web_fetch tool to read the full content of any result URL.');
+  return lines.join('\n');
+}
+
+export async function createWebSearchOverrideTool(context?: SearchExecutionContext): Promise<AgentTool> {
+  const cid = context?.conversationId || '';
+  const owningTurn = currentTavilySearchTurn(getActiveUserId(), cid);
+  const mod = await ca();
+  let fallbackTurn: TavilySearchTurn | undefined;
+  const firstProfile = listSearchProfiles()[0];
+  // Keyless search retains its existing unrestricted query contract.
+  const maxQueryChars = firstProfile ? getSearchQueryMaxChars(firstProfile.provider) : undefined;
+  const runKeylessFallback = async (
+    query: string,
+    count: number,
+    errors: string[],
+    accountErr: string | null,
+  ): Promise<ToolResult> => {
+    try {
+      const fallback = await mod.runBuiltinWebSearch(query, count);
+      if (fallback.isError) {
+        const head = accountErr
+          ? `Paid search unavailable (account: ${accountErr}); free search fallback also failed: ${fallback.content}`
+          : `Configured search providers failed:\n${errors.join('\n')}\nKeyless fallback also failed: ${fallback.content}`;
+        return {
+          content: head,
+          isError: true,
+          ...(fallback.displayName ? { displayName: fallback.displayName } : {}),
+        };
+      }
+      const note = accountErr
+        ? `(paid search unavailable — account quota/auth: ${accountErr}; automatically using free search)`
+        : `(configured search providers failed; falling back to keyless built-in)\n${errors.join('\n')}`;
+      return {
+        content: `${note}\n\n${fallback.content}`,
+        ...(fallback.displayName ? { displayName: fallback.displayName } : {}),
+      };
+    } catch (err) {
+      const tail = (err as Error).message || String(err);
+      const head = accountErr
+        ? `Paid search unavailable (account: ${accountErr}); free search fallback also crashed: ${tail}`
+        : `Configured search providers failed:\n${errors.join('\n')}\nKeyless fallback crashed: ${tail}`;
+      return { content: head, isError: true };
+    }
+  };
+  return mod.defineTool({
+    name: 'web_search',
+    executionMode: 'parallel',
+    description:
+      'Search the web for information. Returns a list of search results with titles, URLs, and snippets. ' +
+      'Use this when you need to find current information, news, documentation, or any web content. ' +
+      'After searching, use web_fetch to read the full content of relevant result URLs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', ...(maxQueryChars !== undefined ? { maxLength: maxQueryChars } : {}), description: 'The search query; length is measured in Unicode characters.' },
+        count: { type: 'number', description: `Number of results to return (default: ${DEFAULT_COUNT}, max: ${MAX_COUNT}).` },
+      },
+      required: ['query'],
+    },
+    async execute(input) {
+      const query = String((input as any)?.query || '').trim();
+      const requested = Number((input as any)?.count) || DEFAULT_COUNT;
+      const count = Math.min(Math.max(1, requested), MAX_COUNT);
+      if (!query) return parameterError('Error: query is required', ['query'], 'required');
+
+      const profiles = listSearchProfiles();
+      // A changed setting can tighten this run's advertised bound. A wider
+      // schema takes effect when the next runner constructs its tools.
+      const currentMax = profiles[0] ? getSearchQueryMaxChars(profiles[0].provider) : undefined;
+      const applicableMax = Math.min(maxQueryChars ?? Infinity, currentMax ?? Infinity);
+      try { if (Number.isFinite(applicableMax)) validateSearchQuery(query, applicableMax); } catch (error) {
+        return parameterError((error as Error).message, ['query'], 'invalid_value');
+      }
+      const userId = getActiveUserId();
+      let searchTurn = owningTurn?.userId === userId ? owningTurn : currentTavilySearchTurn(userId, cid);
+      if (!searchTurn) {
+        if (!fallbackTurn || fallbackTurn.userId !== userId || fallbackTurn.cid !== cid) {
+          fallbackTurn = createTavilySearchTurn(userId, cid);
+        }
+        searchTurn = fallbackTurn;
+      }
+      // Count one admitted tool invocation, independently of provider fallback
+      // or retry attempts. Reserve synchronously so parallel results retain
+      // their own threshold even when responses finish out of order.
+      const reminderCount = recordTavilySearchRequest(searchTurn);
+      const finish = (result: ToolResult): ToolResult => reminderCount === undefined ? result : {
+        ...result,
+        content: `${result.content}\n\nThis turn: ${reminderCount} web searches. Prioritize completing the task with existing evidence; search further if necessary.`,
+      };
+
+      if (profiles.length) {
+        const candidates = profiles.map(profile => ({ profile, key: searchCooldownKey(userId, profile) }));
+        const errors: string[] = [];
+        let accountErr: string | null = null;
+        for (const { profile, key } of candidates) {
+          const label = SEARCH_PROVIDER_LABEL[profile.provider] || profile.provider;
+          if (Date.now() < (paidSearchCooldowns.get(key) || 0)) {
+            accountErr = `${label}: temporarily unavailable (account quota/auth)`;
+            errors.push(accountErr);
+            continue;
+          }
+          paidSearchCooldowns.delete(key);
+          // Input incompatibility must not advance the fallback chain or dispatch a request.
+          try { validateSearchQuery(query, getSearchQueryMaxChars(profile.provider)); } catch (error) {
+            return finish({ content: (error as Error).message, isError: true });
+          }
+          log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
+          try {
+            const res = await runSearchAdapter(profile, query, count, context);
+            log.info('web_search paid API ok', { provider: profile.provider, results: res.results.length });
+            const text = formatPaidResults(query, label, res.results);
+            return finish(res.results.length
+              ? { content: text, displayName: label }
+              : { content: text, displayName: label, isError: true });
+          } catch (err) {
+            const msg = (err as Error).message || String(err);
+            errors.push(`${label}: ${msg}`);
+            const accountError = err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg);
+            if (accountError) {
+              accountErr = msg;
+              rememberAccountFailure(key);
+            }
+            log.warn('paid search failed; trying next provider', {
+              provider: profile.provider,
+              account_error: accountError,
+              error: logErrorSummary(err),
+            });
+          }
+        }
+        return finish(await runKeylessFallback(query, count, errors, accountErr));
+      }
+
+      log.info('web_search via builtin keyless (no paid profile configured)', { query_len: query.length, count });
+      return finish(await mod.runBuiltinWebSearch(query, count));
+    },
+  });
+}
