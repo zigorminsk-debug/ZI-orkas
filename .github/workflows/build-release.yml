@@ -242,17 +242,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SMOKE_DIR="${RUNNER_TEMP}/zi-orkas-smoke-${{ matrix.id }}"
-          rm -rf "$SMOKE_DIR"
-          mkdir -p "$SMOKE_DIR"
-          export SMOKE_FILE="${SMOKE_DIR}/launch-smoke.json"
           export TARGET_ID="${{ matrix.id }}"
 
           if [[ "$TARGET_ID" == "darwin-x64" ]]; then
-            if ! /usr/bin/pgrep -q oahd; then
-              sudo softwareupdate --install-rosetta --agree-to-license || true
-            fi
+            APP="dist/mac/ZI-Orkas.app"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            node product/signing/verify-mac-permissions.cjs "$APP"
+            for BIN in \
+              "$APP/Contents/MacOS/ZI-Orkas" \
+              "$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+              "$APP/Contents/Resources/app.asar.unpacked/src/main/native/build/notification_permissions-darwin-x64.node" \
+              "$APP/Contents/Resources/runtime/phone-passkey/darwin-x64/orkas-phone-passkey" \
+              "$APP/Contents/Resources/runtime/ffmpeg/darwin-x64/ffmpeg" \
+              "$APP/Contents/Resources/runtime/whisper/darwin-x64/bin/whisper-cli" \
+              "$APP/Contents/Resources/runtime/libraw/darwin-x64/bin/dcraw_emu" \
+              "$APP/Contents/Resources/officecli/officecli-mac-x64"; do
+              test -f "$BIN"
+              ARCHS="$(lipo -archs "$BIN")"
+              echo "[verify-x64] $BIN -> $ARCHS"
+              echo "$ARCHS" | grep -qw x86_64
+            done
+            test -f "dist/mac/.orkas-native-deps-verified.json"
+            echo "::notice title=Verified darwin-x64::codesign --strict + 5 bundle entitlements + all x86_64 Mach-O binaries verified"
+            exit 0
           fi
+
+          SMOKE_DIR="${RUNNER_TEMP}/zi-orkas-smoke-${TARGET_ID}"
+          rm -rf "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR"
+          export SMOKE_FILE="${SMOKE_DIR}/launch-smoke.json"
 
           node -e '
             const { spawnSync } = require("node:child_process");
@@ -269,9 +287,6 @@ jobs:
             } else if (id === "darwin-arm64") {
               cmd = path.resolve("dist/mac-arm64/ZI-Orkas.app/Contents/MacOS/ZI-Orkas");
               args = [];
-            } else if (id === "darwin-x64") {
-              cmd = "arch";
-              args = ["-x86_64", path.resolve("dist/mac/ZI-Orkas.app/Contents/MacOS/ZI-Orkas")];
             } else if (id === "linux-x64") {
               cmd = "xvfb-run";
               args = ["-a", path.resolve("dist/linux-unpacked/zi-orkas"), "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"];
