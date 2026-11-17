@@ -223,14 +223,20 @@ function pruneTokenizersPackages(nodeModules, targetPlatform, targetArch) {
 
 function pruneBetterSqlite3BuildArtifacts(nodeModules) {
   // @electron/rebuild compiles better-sqlite3's optional test extension next
-  // to the production binding. It is not loaded by Orkas and must not become
-  // an undeclared native payload merely because npmRebuild ran during pack.
+  // to the production binding (and copies a duplicate cache under bin/<triple>/
+  // on cross-arch builds). Neither is loaded by Orkas and must not become an
+  // undeclared native payload alongside build/Release/better_sqlite3.node.
   removeIfExists(path.join(
     nodeModules,
     'better-sqlite3',
     'build',
     'Release',
     'test_extension.node',
+  ));
+  removeIfExists(path.join(
+    nodeModules,
+    'better-sqlite3',
+    'bin',
   ));
 }
 
