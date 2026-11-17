@@ -751,7 +751,7 @@ async function afterPack(context) {
   }
 
   console.log(`[codesign-adhoc] signing ${appPath}`);
-  const signingDir = path.join(PC_DIR, 'product', 'signing');
+  const signingDir = path.join(__dirname, '..', 'product', 'signing');
   const mainEntitlements = path.join(signingDir, 'entitlements.mac.plist');
   const inheritEntitlements = path.join(signingDir, 'entitlements.mac.inherit.plist');
   execSync(`codesign --force --deep --sign - "${appPath}"`, { stdio: 'inherit' });

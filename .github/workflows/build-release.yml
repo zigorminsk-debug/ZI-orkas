@@ -152,7 +152,13 @@ jobs:
 
       - name: Install npm dependencies
         shell: bash
-        run: npm ci
+        run: |
+          if [[ "${{ matrix.id }}" == "darwin-x64" ]]; then
+            npm ci --cpu=x64 --ignore-scripts
+            node node_modules/electron/install.js
+          else
+            npm ci
+          fi
 
       - name: Prepare target native dependencies (${{ matrix.id }})
         shell: bash
@@ -176,7 +182,7 @@ jobs:
               node ./node_modules/@electron/rebuild/lib/cli.js \
                 --version "$ELECTRON_VER" \
                 --module-dir . \
-                --which-module better-sqlite3 \
+                --only better-sqlite3 \
                 --arch x64 \
                 --force \
                 --build-from-source
@@ -221,9 +227,14 @@ jobs:
             --publish never \
             -c.npmRebuild=false \
             -c.mac.forceCodeSigning=false 2>&1 | tee "$LOG"; then
-            TAIL_MSG="$(tail -n 12 "$LOG" | tr '\n' ' ' | cut -c1-800)"
-            echo "::error title=Package ${{ matrix.id }}::${TAIL_MSG}"
+            ERR_MSG="$(grep -E 'Error:|failed|native-deps-gate|native-package-gate|codesign' "$LOG" | tail -n 8 | tr '\n' ' ' | cut -c1-900)"
+            echo "::error title=Package ${{ matrix.id }}::${ERR_MSG:-$(tail -n 10 "$LOG" | tr '\n' ' ' | cut -c1-900)}"
             exit 1
+          fi
+          if [[ "${{ matrix.id }}" == "darwin-arm64" ]]; then
+            node product/signing/verify-mac-permissions.cjs "dist/mac-arm64/ZI-Orkas.app"
+          elif [[ "${{ matrix.id }}" == "darwin-x64" ]]; then
+            node product/signing/verify-mac-permissions.cjs "dist/mac/ZI-Orkas.app"
           fi
           ls -lh dist/
 
