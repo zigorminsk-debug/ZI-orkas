@@ -57,12 +57,11 @@ function npmPack(cwd, spec) {
 }
 
 function ensureLockedPlatformPackage(packageName, relativeBinaries, targetArch) {
-  const lockEntry = readLockPackage(LOCK_FILE, `node_modules/${packageName}`);
-  const expectedVersion = lockEntry.version;
+  const expectedVersion = readLockPackage(LOCK_FILE, packageName);
   const targetDir = packagePath(PC_DIR, packageName);
   const files = relativeBinaries.map((rel) => path.join(targetDir, ...rel.split('/')));
 
-  const alreadyValid = packageVersion(targetDir) === expectedVersion
+  const alreadyValid = packageVersion(PC_DIR, packageName) === expectedVersion
     && files.every((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   if (!alreadyValid) {
     console.log(`[prepare-linux-native-deps] unpacking ${packageName}@${expectedVersion}`);
@@ -91,10 +90,12 @@ function rebuildBetterSqlite3(targetArch) {
   console.log(`[prepare-linux-native-deps] rebuilding better-sqlite3 for Electron ${electronVersion} linux-${targetArch}`);
   run(PC_DIR, process.execPath, [
     rebuildCli,
-    '-f',
-    '-w', 'better-sqlite3',
-    '-v', electronVersion,
-    '-a', targetArch,
+    '--version', electronVersion,
+    '--module-dir', PC_DIR,
+    '--which-module', 'better-sqlite3',
+    '--arch', targetArch,
+    '--force',
+    '--build-from-source',
   ]);
   const testExt = path.join(PC_DIR, 'node_modules', 'better-sqlite3', 'build', 'Release', 'test_extension.node');
   fs.rmSync(testExt, { recursive: true, force: true });
@@ -127,8 +128,8 @@ function main() {
   // Remove fsevents if present (macOS-only).
   fs.rmSync(path.join(PC_DIR, 'node_modules', 'fsevents'), { recursive: true, force: true });
 
-  const sharpLock = readLockPackage(LOCK_FILE, `node_modules/@img/sharp-linux-${targetArch}`);
-  const sharpFiles = sharpPreparationFiles('linux', targetArch, sharpLock.version);
+  const sharpVersion = readLockPackage(LOCK_FILE, `@img/sharp-linux-${targetArch}`);
+  const sharpFiles = sharpPreparationFiles('linux', targetArch, sharpVersion);
   const stripPkg = (pkg, rel) => rel.slice(pkg.length + 1);
 
   ensureLockedPlatformPackage(`@esbuild/linux-${targetArch}`, ['bin/esbuild'], targetArch);
@@ -138,8 +139,29 @@ function main() {
   ensureLockedPlatformPackage(`@img/sharp-linux-${targetArch}`, [stripPkg(`@img/sharp-linux-${targetArch}`, sharpFiles.binding)], targetArch);
   ensureLockedPlatformPackage(`@img/sharp-libvips-linux-${targetArch}`, [stripPkg(`@img/sharp-libvips-linux-${targetArch}`, sharpFiles.cpp)], targetArch);
 
+  const pruneDir = (parent, shouldRemove) => {
+    if (!fs.existsSync(parent)) return;
+    for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+      if (entry.isDirectory() && shouldRemove(entry.name)) {
+        fs.rmSync(path.join(parent, entry.name), { recursive: true, force: true });
+      }
+    }
+  };
+  pruneDir(path.join(PC_DIR, 'node_modules', '@esbuild'), (n) => n !== `linux-${targetArch}`);
+  pruneDir(path.join(PC_DIR, 'node_modules'), (n) => /^sqlite-vec-(darwin|linux|windows)-/i.test(n) && n !== `sqlite-vec-linux-${targetArch}`);
+  pruneDir(path.join(PC_DIR, 'node_modules', '@napi-rs'), (n) => /^canvas-/i.test(n) && n !== `canvas-linux-${targetArch}-gnu`);
+  pruneDir(path.join(PC_DIR, 'node_modules', '@anush008'), (n) => /^tokenizers-/i.test(n) && n !== `tokenizers-linux-${targetArch}-gnu`);
+  pruneDir(path.join(PC_DIR, 'node_modules', '@img'), (n) => (
+    (/^sharp-(darwin|linux|linuxmusl|win32|wasm32|freebsd|webcontainers)/i.test(n) && n !== `sharp-linux-${targetArch}`)
+    || (/^sharp-libvips-/i.test(n) && n !== `sharp-libvips-linux-${targetArch}`)
+  ));
+
   verifyOnnxRuntime(targetArch);
-  rebuildBetterSqlite3(targetArch);
+  if (process.argv.includes('--skip-sqlite-rebuild')) {
+    console.log('[prepare-linux-native-deps] skipped better-sqlite3 rebuild (--skip-sqlite-rebuild)');
+  } else {
+    rebuildBetterSqlite3(targetArch);
+  }
   console.log(`[prepare-linux-native-deps] all linux-${targetArch} native dependencies ready`);
 }
 

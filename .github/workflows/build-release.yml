@@ -164,11 +164,11 @@ jobs:
               node scripts/ensure-sqlite-electron-abi.mjs
               ;;
             darwin-arm64)
-              node scripts/prepare-mac-native-deps.cjs --arch arm64
+              node scripts/prepare-mac-native-deps.cjs arm64
               node scripts/ensure-sqlite-electron-abi.mjs
               ;;
             darwin-x64)
-              node scripts/prepare-mac-native-deps.cjs --arch x64
+              node scripts/prepare-mac-native-deps.cjs x64
               ELECTRON_VER="$(node -p "require('./node_modules/electron/package.json').version")"
               SDK_ROOT="$(xcrun --sdk macosx --show-sdk-path)"
               export SDKROOT="$SDK_ROOT"
@@ -184,7 +184,7 @@ jobs:
               lipo -archs node_modules/better-sqlite3/build/Release/better_sqlite3.node | grep -qw x86_64
               ;;
             linux-x64)
-              node scripts/prepare-linux-native-deps.cjs --arch x64
+              node scripts/prepare-linux-native-deps.cjs --arch x64 --skip-sqlite-rebuild
               node scripts/ensure-sqlite-electron-abi.mjs
               ;;
           esac
@@ -216,10 +216,15 @@ jobs:
           ORKAS_FORCE_ADHOC_CODESIGN: '1'
         run: |
           set -euo pipefail
-          node "$EB_CLI" ${{ matrix.eb_args }} \
+          LOG="${RUNNER_TEMP}/eb-${{ matrix.id }}.log"
+          if ! node "$EB_CLI" ${{ matrix.eb_args }} \
             --publish never \
             -c.npmRebuild=false \
-            -c.mac.forceCodeSigning=false
+            -c.mac.forceCodeSigning=false 2>&1 | tee "$LOG"; then
+            TAIL_MSG="$(tail -n 12 "$LOG" | tr '\n' ' ' | cut -c1-800)"
+            echo "::error title=Package ${{ matrix.id }}::${TAIL_MSG}"
+            exit 1
+          fi
           ls -lh dist/
 
       - name: Packaged application launch & KB vector smoke check
@@ -244,6 +249,8 @@ jobs:
             const path = require("node:path");
             const id = process.env.TARGET_ID;
             const smokeFile = path.resolve(process.env.SMOKE_FILE);
+            const workspaceDir = path.join(path.dirname(smokeFile), "workspace");
+            fs.mkdirSync(workspaceDir, { recursive: true });
             let cmd, args;
             if (id === "win32-x64") {
               cmd = path.resolve("dist/win-unpacked/ZI-Orkas.exe");
@@ -256,7 +263,7 @@ jobs:
               args = ["-x86_64", path.resolve("dist/mac/ZI-Orkas.app/Contents/MacOS/ZI-Orkas")];
             } else if (id === "linux-x64") {
               cmd = "xvfb-run";
-              args = ["-a", path.resolve("dist/linux-unpacked/zi-orkas"), "--no-sandbox", "--disable-gpu"];
+              args = ["-a", path.resolve("dist/linux-unpacked/zi-orkas"), "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"];
             } else {
               throw new Error("Unknown target: " + id);
             }
@@ -266,15 +273,19 @@ jobs:
               timeout: 240_000,
               env: {
                 ...process.env,
+                ORKAS_WORKSPACE_ROOT: workspaceDir,
                 ORKAS_PACKAGED_LAUNCH_SMOKE_FILE: smokeFile,
                 ORKAS_PACKAGED_LAUNCH_STARTED_AT_MS: String(Date.now()),
               },
             });
             console.log("[smoke] exit:", res.status, "signal:", res.signal || "none");
             if (!fs.existsSync(smokeFile)) {
-              throw new Error("[smoke] launch smoke file was not produced: " + smokeFile);
+              const msg = "[smoke] launch smoke file missing (" + id + ") exit=" + res.status + " signal=" + (res.signal || "none");
+              console.log("::error::" + msg);
+              throw new Error(msg);
             }
             const proof = JSON.parse(fs.readFileSync(smokeFile, "utf8"));
+            console.log("::notice title=Smoke " + id + "::readyElapsedMs=" + proof.readyElapsedMs + " dims=" + (proof.library && proof.library.embeddingDimensions));
             console.log("=== Packaged Launch Smoke Proof (" + id + ") ===");
             console.log(JSON.stringify(proof, null, 2));
           '
