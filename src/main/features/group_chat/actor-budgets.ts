@@ -8,8 +8,8 @@ import type { ActorKind } from './state';
  * Periodic checkpoints, the hard cap, repeat protection and idle watchdogs
  * bound long-running work. Ephemeral workers inherit the schema default.
  */
-export const COMMANDER_MAX_TOOL_LOOPS = 500;
-export const AGENT_MAX_TOOL_LOOPS = 500;
+export const COMMANDER_MAX_TOOL_LOOPS = 2_000;
+export const AGENT_MAX_TOOL_LOOPS = 2_000;
 
 /**
  * Per-turn tool-round budget for a dispatched actor, or `undefined` to let

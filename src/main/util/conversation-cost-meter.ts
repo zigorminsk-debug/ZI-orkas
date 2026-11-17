@@ -19,10 +19,10 @@
  * no task identity, per-agent allocation or persistence.
  */
 
-/** Default per-task ceiling (input+output tokens). Generous on purpose — far
- *  above any normal heavy task (deep research, video), so it only trips on a
- *  runaway. Override with ORKAS_MAX_TASK_TOKENS (0 or negative disables). */
-const DEFAULT_MAX_TASK_TOKENS = 25_000_000;
+/** Default per-task ceiling (input+output tokens). Disabled (`0`) in ZI-Orkas
+ *  so autonomous Commander runs without artificial task token limits. Set
+ *  ORKAS_MAX_TASK_TOKENS to a positive integer to opt into a ceiling. */
+const DEFAULT_MAX_TASK_TOKENS = 0;
 
 function resolveMaxTaskTokens(): number {
   const raw = process.env.ORKAS_MAX_TASK_TOKENS;

@@ -3,7 +3,7 @@ import { getOrkasApiKey } from '../auth';
 export class OrkasApiCredentialRequiredError extends Error {
   readonly code = 'orkas_api_key_required';
 
-  constructor(message = 'Configure an Orkas API Key before using this connector.') {
+  constructor(message = 'Hosted connectors are disabled in autonomous ZI-Orkas. Use direct or local MCP connectors.') {
     super(message);
     this.name = 'OrkasApiCredentialRequiredError';
   }

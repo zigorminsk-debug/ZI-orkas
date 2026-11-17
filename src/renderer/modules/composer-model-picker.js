@@ -111,7 +111,7 @@ function _composerModelEntryLabel(entry) {
 }
 
 function _composerModelEntryIsOfficial(entry) {
-  return !!entry && entry.official === true && entry.provider === 'orkas-api';
+  return !!entry && (entry.autonomous === true || entry.provider === 'zi-commander');
 }
 
 function _composerModelMenuGroups(entries) {

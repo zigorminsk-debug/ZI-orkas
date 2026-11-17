@@ -12,12 +12,12 @@ import { loadVideoProfiles, type VideoProfile } from './auth';
 import { isVideoProviderModelAllowed } from './video_auth';
 export { VIDEO_MODELS_BY_PROVIDER, isVideoProviderModelAllowed } from './video_auth';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_PROVIDER,
-  ORKAS_API_VIDEO_MODEL,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from './orkas_api';
+  autonomousGenerateVideo,
+  ZI_KEYLESS_SENTINEL,
+  ZI_VIDEO_MODEL,
+  ZI_VIDEO_PROVIDER,
+} from './autonomous_media';
+import type { OrkasApiUsageContext } from './orkas_api';
 import { prepareReferenceUrls, registerGeneratedMediaUrl, withReferencePreparation } from './generation_reference_assets';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
@@ -127,9 +127,22 @@ export interface PickedVideoGenProfile {
   entry: VideoProfile;
 }
 export function listVideoGenCandidates(): PickedVideoGenProfile[] {
-  return loadVideoProfiles()
+  const out = loadVideoProfiles()
     .filter((profile) => isVideoProviderModelAllowed(profile.provider, profile.model) && !isRetiredVideoModel(profile.provider, profile.model))
     .map((entry) => ({ entry }));
+  if (!out.some((c) => c.entry.provider === ZI_VIDEO_PROVIDER)) {
+    out.push({
+      entry: {
+        id: 'zi-video-builtin',
+        provider: ZI_VIDEO_PROVIDER,
+        model: ZI_VIDEO_MODEL,
+        apiKey: ZI_KEYLESS_SENTINEL,
+        label: 'ZI-Commander · Cinema HD',
+        createdAt: 0,
+      },
+    });
+  }
+  return out;
 }
 export function pickVideoGenProfile(): PickedVideoGenProfile | null {
   return listVideoGenCandidates()[0] || null;
@@ -309,18 +322,15 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
         },
         onRequestDisposition: disposition => { requestDisposition = disposition; },
         usageContext: input.usageContext,
-      }, candidate.entry.provider);
+      }, candidate.entry.provider, [
+        ...(input.firstFramePath ? [input.firstFramePath] : []),
+        ...(input.referenceImagePaths || []),
+        ...(input.lastFramePath ? [input.lastFramePath] : []),
+      ]);
     } catch (err) {
       lastProviderError = (err as Error).message || String(err);
-      if (candidate.entry.provider === ORKAS_API_PROVIDER) {
-        // Preserve the public API's existing terminal error and quota contract.
+      if (candidate.entry.provider === ZI_VIDEO_PROVIDER) {
         const message = sanitizeLogTextForUpload(lastProviderError);
-        if (err instanceof VideoDeliveryError) {
-          return { ok: false, errorCode: 'DELIVERY_ERROR', message, taskId: err.taskId, postDispatch: true };
-        }
-        if (err instanceof OrkasApiQuotaError) {
-          return { ok: false, errorCode: 'CREDITS_EXHAUSTED', message };
-        }
         return {
           ok: false,
           errorCode: input.signal?.aborted || /operation aborted/i.test(message) ? 'BAD_INPUT'
@@ -381,7 +391,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
     }
 
     const selectedModel = adapterRes.model || candidate.entry.model;
-    const finalPath = candidate.entry.provider === ORKAS_API_PROVIDER
+    const finalPath = candidate.entry.provider === ZI_VIDEO_PROVIDER
       ? ensurePublicApiMp4Extension(input.outputAbsPath)
       : ensureMp4Extension(input.outputAbsPath);
     let finished: {bytes:number;changed:boolean;duration?:number;resolution?:string;ratio?:string};
@@ -389,7 +399,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
       emitProgress(input.onProgress, 'save', 'Saving generated video', { provider: candidate.entry.provider });
       throwIfAborted(input.signal);
       await fs.mkdir(path.dirname(finalPath), { recursive: true });
-      if(candidate.entry.provider===ORKAS_API_PROVIDER){await fs.writeFile(finalPath,adapterRes.buffer);finished={bytes:adapterRes.buffer.length,changed:false};}
+      if(candidate.entry.provider===ZI_VIDEO_PROVIDER){await fs.writeFile(finalPath,adapterRes.buffer);finished={bytes:adapterRes.buffer.length,changed:false};}
       else { const {saveCompatibleVideo}=await import('./video_output_compatibility'); finished=await saveCompatibleVideo(adapterRes.buffer,finalPath,input,{...normalizeVideoInput(compatibleInput,candidate.entry),...(candidate.entry.provider==='google'?{duration:-1}:{}),...(typeof adapterRes.duration==='number'?{duration:adapterRes.duration}:{}),...(adapterRes.ratio?{ratio:adapterRes.ratio}:{}),...(adapterRes.resolution?{resolution:adapterRes.resolution}:{})},input.signal); }
     } catch (err) {
       const message = (err as Error).message || String(err);
@@ -477,14 +487,15 @@ async function resolveReferenceUrls(
     }))[0] : undefined);
     const firstFrameUrl = await frame(input.firstFrameUrl, input.firstFramePath);
     const lastFrameUrl = await frame(input.lastFrameUrl, input.lastFramePath);
-    if(profile?.provider === ORKAS_API_PROVIDER && [...referenceImageUrls,...referenceVideoUrls].some(url=>!/^https:\/\//i.test(url))) throw new Error('Orkas API video references must use public HTTPS URLs');
     return { referenceImageUrls, referenceVideoUrls, ...(firstFrameUrl ? { firstFrameUrl } : {}), ...(lastFrameUrl ? { lastFrameUrl } : {}) };
   });
 }
 
-async function dispatchVideo(req: AdapterVideoRequest, provider: string): Promise<AdapterVideoResult> {
+async function dispatchVideo(req: AdapterVideoRequest, provider: string, localRefPaths?: string[]): Promise<AdapterVideoResult> {
   req = { ...req, deadlineAt: req.deadlineAt ?? Date.now() + req.timeoutMs };
-  if(provider === ORKAS_API_PROVIDER) return callOrkasApiVideo({...req,quality:req.quality==='quality'?'quality':'balanced'});
+  if (provider === ZI_VIDEO_PROVIDER || provider === 'orkas-api') {
+    return callZiAutonomousVideo(req, localRefPaths);
+  }
   if (provider === 'doubao') req = normalizeDoubaoVideoRequest(req);
   emitProgress(
     req.onProgress,
@@ -511,97 +522,30 @@ async function dispatchVideo(req: AdapterVideoRequest, provider: string): Promis
   throw new Error(`Unknown video-gen provider: ${provider}`);
 }
 
-async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResult> {
+async function callZiAutonomousVideo(req: AdapterVideoRequest, localRefPaths?: string[]): Promise<OrkasVideoResult> {
   throwIfAborted(req.signal);
-  emitProgress(req.onProgress, 'create_task', 'Creating Orkas API video task');
-  const { body: createdData } = await fetchAndReadWithTimeout(
-    `${ORKAS_API_BASE_URL}/videos`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${req.apiKey}`,
-        'Content-Type': 'application/json',
-        ...orkasApiUsageHeaders(req.usageContext),
-      },
-      body: JSON.stringify({
-        prompt: req.prompt,
-        duration: req.duration,
-        resolution: req.resolution,
-        ratio: req.ratio,
-        quality: req.quality,
-        generate_audio: req.generateAudio,
-        reference_image_urls: req.referenceImageUrls,
-        reference_video_urls: req.referenceVideoUrls,
-        operation: req.operation,
-        ...(typeof req.seed === 'number' ? { seed: req.seed } : {}),
-      }),
-    },
-    CREATE_TIMEOUT_MS,
-    req.signal,
-    'Orkas API video create request timed out',
-    (response) => readOrkasVideoResponse(response, 'create'),
-  );
-  let data = createdData;
-  const taskId = String(data?.id || '').trim();
-  if (!taskId) throw new Error('Orkas API video create returned no task id');
-  emitProgress(req.onProgress, 'task_created', `Video task created: ${taskId}`, { taskId });
-
-  const started = Date.now();
-  let attempts = 0;
-  let consecutiveTimeouts = 0;
-  while (Date.now() - started < req.timeoutMs) {
-    throwIfAborted(req.signal);
-    const status = String(data?.status || 'processing').toLowerCase();
-    if (VIDEO_TASK_FAILED_STATUSES.includes(status)) {
-      throw new Error(`Orkas API video task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
-    }
-    const url = String(data?.url || '').trim();
-    if (url) {
-      emitProgress(req.onProgress, 'task_succeeded', `Video task completed: ${taskId}`, { taskId });
-      const buffer = await downloadVideo(url, taskId, req.signal, req.onProgress);
-      return {
-        buffer,
-        taskId,
-        videoUrl: url,
-        status: status || 'succeeded',
-        ...(typeof data?.ratio === 'string' ? { ratio: data.ratio } : {}),
-        ...(typeof data?.duration === 'number' ? { duration: data.duration } : {}),
-        ...(typeof data?.resolution === 'string' ? { resolution: data.resolution } : {}),
-      };
-    }
-
-    attempts += 1;
-    emitProgress(req.onProgress, 'poll_wait', 'Waiting before checking video status', { taskId, attempt: attempts });
-    await sleep(req.pollIntervalMs, req.signal);
-    try {
-      const { body: statusData } = await fetchAndReadWithTimeout(
-        `${ORKAS_API_BASE_URL}/videos/${encodeURIComponent(taskId)}`,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${req.apiKey}`,
-            ...orkasApiUsageHeaders(req.usageContext),
-          },
-        },
-        POLL_TIMEOUT_MS,
-        req.signal,
-        'Orkas API video status request timed out',
-        (response) => readOrkasVideoResponse(response, 'status'),
-      );
-      data = statusData;
-      consecutiveTimeouts = 0;
-      emitProgress(req.onProgress, 'poll_result', `Video task status: ${data?.status || 'processing'}`, {
-        taskId,
-        attempt: attempts,
-        status: String(data?.status || 'processing'),
-      });
-    } catch (err) {
-      if (req.signal?.aborted || !/timed out|timeout/i.test((err as Error).message)) throw err;
-      consecutiveTimeouts += 1;
-      if (consecutiveTimeouts >= MAX_CONSECUTIVE_POLL_TIMEOUTS) throw err;
-    }
-  }
-  throw new Error(`Orkas API video task ${taskId} timed out after ${Math.round(req.timeoutMs / 1000)} seconds`);
+  const taskId = `zi-vid-${Date.now().toString(36)}`;
+  emitProgress(req.onProgress, 'task_created', `Generating video locally: ${taskId}`, { taskId });
+  const res = await autonomousGenerateVideo({
+    prompt: req.prompt,
+    ratio: req.ratio,
+    resolution: req.resolution,
+    durationSec: req.duration > 0 ? req.duration : 6,
+    seed: req.seed,
+    referenceImagePaths: localRefPaths,
+    signal: req.signal,
+    onProgress: (phase, message) => emitProgress(req.onProgress, phase as any, message, { taskId }),
+  });
+  emitProgress(req.onProgress, 'task_succeeded', `Autonomous video completed: ${taskId}`, { taskId });
+  return {
+    buffer: res.buffer,
+    taskId,
+    videoUrl: '',
+    status: 'succeeded',
+    ratio: req.ratio,
+    duration: req.duration > 0 ? req.duration : 6,
+    resolution: req.resolution,
+  };
 }
 
 async function readOrkasVideoResponse(resp: Response, phase: string): Promise<any> {
@@ -776,7 +720,9 @@ interface AdapterVideoResult {
 }
 
 function normalizeVideoInput(input: GenerateVideoInput, profile?: VideoProfile): NormalizedVideoInput {
-  if(!profile || profile.provider === ORKAS_API_PROVIDER) return normalizeLegacyVideoInput(input);
+  if (!profile || profile.provider === ZI_VIDEO_PROVIDER || profile.provider === 'orkas-api') {
+    return normalizeLegacyVideoInput(input);
+  }
   input = fitVideoParameters(input, profile.provider, profile.model);
   const known = profile && videoParameterModel(profile.provider, profile.model);
   const spec = known?.spec;
@@ -1525,10 +1471,7 @@ function videoFrameInputError(input: GenerateVideoInput, profile: VideoProfile, 
 }
 
 export function videoGenerationInputError(input: GenerateVideoInput, profile: VideoProfile): string | null {
-  if (profile.provider === ORKAS_API_PROVIDER) {
-    if (hasFirstFrame(input) || input.lastFrameUrl || input.lastFramePath) return 'The public Orkas API does not support explicit first_frame or last_frame. Use reference images instead.';
-    if ((input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0) > 9) return 'The public Orkas API accepts at most 9 reference images.';
-    if ((input.referenceVideoUrls?.length || 0) + (input.referenceVideoPaths?.length || 0) > 3) return 'The public Orkas API accepts at most 3 reference videos.';
+  if (profile.provider === ZI_VIDEO_PROVIDER || profile.provider === 'orkas-api') {
     return null;
   }
   const spec = videoModelSpec(profile.provider,profile.model);

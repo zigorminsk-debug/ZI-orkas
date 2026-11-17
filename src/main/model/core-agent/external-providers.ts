@@ -48,11 +48,13 @@ import {
 import { repairOpenAIToolMessageOrder } from './openai-payload';
 import { createCustomOutputLimitCompatibility } from './custom-output-limit';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_PROVIDER,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from '../../features/orkas_api';
+  buildZiCommanderModel,
+  createZiCommanderProvider,
+  ZI_COMMANDER_PROVIDER,
+} from '../autonomous-commander';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
+
+export { buildZiCommanderModel, createZiCommanderProvider, ZI_COMMANDER_PROVIDER };
 
 // core-agent is an ESM package and the Orkas main process is CJS, so
 // **static import is not allowed**. Reuse the dynamic-import + lazy cache
@@ -150,49 +152,20 @@ export function omitReservedOutputLimitForProvider(
   };
 }
 
-// ── Orkas public API ───────────────────────────────────────────────────
+// ── ZI-Commander autonomous adapter (legacy orkas-api callers redirect here) ──
 
 export function buildOrkasApiModel(modelId: string): Model<'openai-completions'> {
-  const curated = curatedModelsFor(ORKAS_API_PROVIDER).find((model) => model.id === modelId);
-  return {
-    id: modelId,
-    name: curated?.name || modelId,
-    api: 'openai-completions',
-    provider: ORKAS_API_PROVIDER as any,
-    baseUrl: ORKAS_API_BASE_URL,
-    reasoning: true,
-    compat: {
-      supportsDeveloperRole: false,
-      supportsStore: false,
-      thinkingFormat: 'deepseek',
-      requiresReasoningContentOnAssistantMessages: true,
-    },
-    input: ['text', 'image'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: configuredPositiveInteger(curated?.contextWindow, 1_048_576),
-    maxTokens: configuredPositiveInteger(curated?.maxTokens, 32_000),
-  };
+  return buildZiCommanderModel(modelId) as Model<'openai-completions'>;
 }
 
 export async function createOrkasApiProvider(config: {
-  apiKey: string;
+  apiKey?: string;
   modelId: string;
   userCacheKey?: string;
   usageContext?: OrkasApiUsageContext;
 }): Promise<LLMProvider> {
-  if (!config.apiKey) throw new Error('orkas-api: apiKey required');
-  if (!isBearerTokenHeaderSafe(config.apiKey)) throw new Error('orkas-api: invalid API key');
-  if (!config.modelId) throw new Error('orkas-api: modelId required');
-  const mod = await ca();
-  return mod.createPiProvider({
-    provider: ORKAS_API_PROVIDER,
-    apiKey: config.apiKey,
-    userCacheKey: config.userCacheKey,
-    customModel: buildOrkasApiModel(config.modelId),
-    defaultReasoning: 'low',
-    headers: orkasApiUsageHeaders(config.usageContext),
-    onPayload: repairOpenAICompatiblePayload,
-  });
+  void curatedModelsFor;
+  return createZiCommanderProvider({ modelId: config.modelId });
 }
 
 // ── Moonshot open-platform (https://api.moonshot.cn/v1) ─────────────────
@@ -584,11 +557,13 @@ export function buildCustomAnthropicModel(
   };
 }
 
+export const KEYLESS_CUSTOM_API_KEY = 'local-no-key';
+
 export async function createCustomOpenAICompatibleProvider(
   config: CreateCustomOpenAICompatibleProviderConfig,
 ): Promise<LLMProvider> {
-  if (!config.apiKey) throw new Error('custom: apiKey required');
-  if (!isBearerTokenHeaderSafe(config.apiKey)) {
+  const effectiveKey = String(config.apiKey || '').trim() || KEYLESS_CUSTOM_API_KEY;
+  if (!isBearerTokenHeaderSafe(effectiveKey)) {
     throw Object.assign(
       new Error(
         'Custom model has an invalid API key for HTTP Authorization headers. Re-enter it in Settings.',
@@ -602,9 +577,23 @@ export async function createCustomOpenAICompatibleProvider(
   const isAnthropic = config.protocol === 'anthropic';
   const isResponses = config.protocol === 'responses';
   const compatibility = isAnthropic || isResponses ? null : createCustomOutputLimitCompatibility(config);
+  const isKeyless = effectiveKey === KEYLESS_CUSTOM_API_KEY;
+  const stripAuthFetch = (baseFetch: typeof fetch): typeof fetch => async (input, init) => {
+    if (!init?.headers) return baseFetch(input, init);
+    const h = new Headers(init.headers as HeadersInit);
+    h.delete('authorization');
+    h.delete('x-api-key');
+    return baseFetch(input, { ...init, headers: h });
+  };
+  const wrapFetch = isKeyless
+    ? (inner: typeof fetch) => {
+        const stripped = stripAuthFetch(inner);
+        return compatibility ? compatibility.wrapFetch(stripped) : stripped;
+      }
+    : compatibility?.wrapFetch;
   return mod.createPiProvider({
     provider: 'custom',
-    apiKey: config.apiKey,
+    apiKey: effectiveKey,
     userCacheKey: config.userCacheKey,
     customModel: isAnthropic
       ? buildCustomAnthropicModel(config.modelId, config)
@@ -613,8 +602,8 @@ export async function createCustomOpenAICompatibleProvider(
     normalizeLiteralLeadingThinkText: !isAnthropic && !isResponses,
     ...(compatibility ? {
       onPayload: (payload: unknown) => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
-      wrapFetch: compatibility.wrapFetch,
     } : {}),
+    ...(wrapFetch ? { wrapFetch } : {}),
     ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });
 }

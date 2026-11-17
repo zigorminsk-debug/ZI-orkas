@@ -524,7 +524,11 @@ function catalogIndex(): Map<string, CatalogEntry> {
 }
 
 export function connectorCatalog(): CatalogEntry[] {
-  return structuredClone(Array.from(catalogIndex().values()));
+  return structuredClone(
+    Array.from(catalogIndex().values()).filter(
+      (entry) => entry.auth_mode !== 'composio' && entry.requires_credits !== true,
+    ),
+  );
 }
 
 /** Membership checks must not clone catalog transport, policy or icon data. */

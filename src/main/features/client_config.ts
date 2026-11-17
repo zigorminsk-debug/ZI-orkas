@@ -68,7 +68,7 @@ function configFailureDiagnostic(error: unknown): Record<string, unknown> {
 }
 const CLIENT_CONFIG_REFRESH_TIMEOUT_MS = 60_000;
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
-const PROD_DEFAULT = 'https://orkas.ai/api';
+const PROD_DEFAULT = '';
 
 let started = false;
 let inFlight: Promise<ConfigRefreshResult> | null = null;
@@ -478,6 +478,11 @@ export async function refresh(
   reason: ConfigRefreshReason = 'manual',
   options: { force?: boolean } = {},
 ): Promise<ConfigRefreshResult> {
+  // Personal autonomous ZI-Orkas build: never poll orkas.ai for remote config
+  // overrides or provider kill-switches (allow explicit E2E test override only).
+  if (!String(process.env.ORKAS_CLIENT_CONFIG_API_BASE || '').trim()) {
+    return { updated: false, skipped: true };
+  }
   if (!options.force && !clientConfig.shouldRefresh(REFRESH_INTERVAL_MS)) {
     return { updated: false, skipped: true };
   }

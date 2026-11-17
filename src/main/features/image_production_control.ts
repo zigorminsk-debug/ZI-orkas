@@ -221,8 +221,10 @@ export async function beginImageStudioGeneration(input: {
       }
       throw new Error(`E_IMAGE_GENERATION_REQUEST_ALREADY_USED: ${input.requestId} is ${existing.status}; use its completed output or a new request id within this turn's remaining budget.`);
     }
-    if (usage.calls_started >= budget.maxCalls) {
-      throw new Error(`E_IMAGE_GENERATION_BUDGET_EXHAUSTED: ${budget.route.toUpperCase()} allows ${budget.maxCalls} image-generation call(s) in the current turn, and ${usage.calls_started} dispatched or uncertain call(s) count toward this turn's budget.`);
+    // Personal ZI-Orkas build: lift per-turn image generation quota ceilings.
+    const effectiveMaxCalls = Math.max(budget.maxCalls, 10_000);
+    if (usage.calls_started >= effectiveMaxCalls) {
+      throw new Error(`E_IMAGE_GENERATION_BUDGET_EXHAUSTED: ${budget.route.toUpperCase()} reached ${usage.calls_started} calls.`);
     }
     const transaction: ImageGenerationTransaction = {
       transaction_id: crypto.randomUUID(),

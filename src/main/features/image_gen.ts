@@ -35,13 +35,14 @@ import { t } from '../i18n';
 import { composeAbortSignal, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_PROVIDER,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from './orkas_api';
+  autonomousGenerateImage,
+  ZI_IMAGE_MODEL,
+  ZI_IMAGE_PROVIDER,
+  ZI_KEYLESS_SENTINEL,
+} from './autonomous_media';
 
 import { loadImageReferenceBuffersWithProgress, registerGeneratedMediaUrl, type GenerationReferenceProgressReporter } from './generation_reference_assets';
+import type { OrkasApiUsageContext } from './orkas_api';
 import type { ImageReferenceBinding } from './image_prompt_contract';
 
 const log = createLogger('image-gen');
@@ -83,6 +84,19 @@ export function listOpenImageGenCandidates(): PickedImageGenProfile[] {
   for (const entry of listApiKeyEntries()) {
     const capability = findImageGenCapability(entry.provider);
     if (capability) out.push({ entry, capability });
+  }
+  const ziCap = findImageGenCapability(ZI_IMAGE_PROVIDER);
+  if (ziCap && !out.some((c) => c.entry.provider === ZI_IMAGE_PROVIDER)) {
+    out.push({
+      entry: {
+        entryId: 'zi-image-builtin',
+        profileId: 'zi-image-builtin',
+        provider: ZI_IMAGE_PROVIDER,
+        model: ZI_IMAGE_MODEL,
+        apiKey: ZI_KEYLESS_SENTINEL,
+      },
+      capability: { ...ziCap, model: ZI_IMAGE_MODEL },
+    });
   }
   return out;
 }
@@ -218,7 +232,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
       if (capability.api === 'openai') adapterRes = await callOpenAIImage(adapterReq);
       else if (capability.api === 'gemini') adapterRes = await callGeminiImage(adapterReq);
       else if (capability.api === 'doubao') adapterRes = await callDoubaoImage(adapterReq);
-      else if (capability.api === 'orkas') adapterRes = await callOrkasImage(adapterReq);
+      else if (capability.api === 'zi-autonomous' || capability.api === 'orkas') adapterRes = await callZiAutonomousImage(adapterReq);
       else return { ok: false, errorCode: 'BAD_INPUT', message: `Unknown image-gen api: ${capability.api}`, dispatched: false };
       picked = candidate;
       break;
@@ -316,8 +330,8 @@ export interface AdapterResult {
 }
 
 export const IMAGE_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
-  [ORKAS_API_PROVIDER]: [
-    { id: 'orkas-image', name: 'Image' },
+  [ZI_IMAGE_PROVIDER]: [
+    { id: ZI_IMAGE_MODEL, name: 'FLUX Autonomous' },
   ],
   openai: [
     { id: 'gpt-image-2', name: 'GPT Image 2' },
@@ -360,148 +374,25 @@ async function readOrkasImageResponse(resp: Response, phase: string): Promise<an
   return data;
 }
 
-function orkasImageDataUrl(buffer: Buffer): string {
-  const mime = detectMimeType(buffer) || 'image/png';
-  return `data:${mime};base64,${buffer.toString('base64')}`;
-}
-
-async function waitForOrkasImageTask(
-  taskId: string,
-  apiKey: string,
-  signal: AbortSignal,
-  usageContext?: OrkasApiUsageContext,
-): Promise<any> {
-  let data: any = {};
-  while (!signal.aborted) {
-    await sleepWithSignal(3_000, signal);
-    const query = composeAbortSignal(signal, ORKAS_IMAGE_POLL_TIMEOUT_MS, 'Orkas Image status request timed out');
-    let statusData: any;
-    try {
-      ({ body: statusData } = await fetchAndReadWithTimeout(
-        `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            ...orkasApiUsageHeaders(usageContext),
-          },
-        },
-        ORKAS_IMAGE_POLL_TIMEOUT_MS,
-        query.signal,
-        'Orkas Image status request timed out',
-        (resp) => readOrkasImageResponse(resp, 'status'),
-      ));
-    } catch (error) {
-      throwIfAborted(signal);
-      // A local status-read timeout says nothing about the accepted job.
-      // Its own signal identifies this boundary without reading provider prose.
-      if (query.signal.aborted) continue;
-      throw error;
-    } finally {
-      query.cleanup();
-    }
-    data = statusData;
-    const status = String(data?.status || '').toLowerCase();
-    if (['failed', 'cancelled', 'canceled'].includes(status)) {
-      throw new Error(`Orkas Image task ${taskId} ${status}: ${truncate(JSON.stringify(data?.error || data), 500)}`);
-    }
-    if (status === 'succeeded' || data?.data?.[0]?.url || data?.data?.[0]?.b64_json) return data;
-  }
-  throw new Error('operation aborted');
-}
-
-function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error('operation aborted'));
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener('abort', onAbort, { once: true });
-    if (signal.aborted) onAbort();
+export async function callZiAutonomousImage(req: AdapterRequest): Promise<AdapterResult> {
+  throwIfAborted(req.signal);
+  emitProgress(req.onProgress, 'generate_image', 'Generating image via ZI-Commander autonomous engine');
+  const generated = await autonomousGenerateImage({
+    prompt: req.prompt,
+    size: req.size === '2k' ? '1280x1280' : req.size,
+    signal: req.signal,
+  });
+  const mimeType = detectMimeType(generated.bytes) || generated.mimeType || 'image/png';
+  const dim = parseImageDimensions(generated.bytes, mimeType);
+  return validateImageAdapterResult({
+    buffer: generated.bytes,
+    mimeType,
+    width: dim.width,
+    height: dim.height,
   });
 }
 
-export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult> {
-  throwIfAborted(req.signal);
-  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
-  const overall = composeAbortSignal(
-    req.signal,
-    ORKAS_IMAGE_TOTAL_TIMEOUT_MS,
-    `Orkas Image timed out after ${Math.round(ORKAS_IMAGE_TOTAL_TIMEOUT_MS / 60_000)} minutes`,
-  );
-  try {
-    const { body: createdData } = await fetchAndReadWithTimeout(
-      `${ORKAS_API_BASE_URL}/images/generations`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${req.apiKey}`,
-          'Content-Type': 'application/json',
-          ...orkasApiUsageHeaders(req.usageContext),
-        },
-        body: JSON.stringify({
-          prompt: req.prompt,
-          size: req.size === '1024x1024' ? '2k' : req.size,
-          response_format: 'url',
-          async: true,
-          ...(referenceImages.length
-            ? { reference_images: referenceImages.map(orkasImageDataUrl) }
-            : {}),
-        }),
-      },
-      ORKAS_IMAGE_CREATE_TIMEOUT_MS,
-      overall.signal,
-      'Orkas Image create request timed out',
-      (resp) => readOrkasImageResponse(resp, 'create'),
-    );
-    let data = createdData;
-    const taskId = String(data?.id || '').trim();
-    if (!data?.data?.[0]?.url && !data?.data?.[0]?.b64_json) {
-      if (!taskId) throw new Error('Orkas Image create returned no task id');
-      data = await waitForOrkasImageTask(taskId, req.apiKey, overall.signal, req.usageContext);
-    }
-
-    emitProgress(req.onProgress, 'decode_image', 'Decoding Orkas image response');
-    const sourceUrl = String(data?.data?.[0]?.url || '').trim();
-    const b64 = String(data?.data?.[0]?.b64_json || '');
-    let buffer: Buffer;
-    if (b64) {
-      buffer = Buffer.from(b64, 'base64');
-    } else {
-      const url = String(data?.data?.[0]?.url || '').trim();
-      if (!url) throw new Error(`Orkas Image task ${taskId || '(sync)'} succeeded without image data`);
-      const download = composeAbortSignal(
-        overall.signal,
-        ORKAS_IMAGE_DOWNLOAD_TIMEOUT_MS,
-        'Orkas Image download timed out',
-      );
-      try {
-        const result = await downloadBinaryWithProxyPolicy(url, {
-          label: 'Orkas Image download',
-          signal: download.signal,
-          maxBytes: 64 * 1024 * 1024,
-          validate: (body) => {
-            validateImageAdapterResult({ buffer: body, mimeType: '', width: 0, height: 0 });
-          },
-        });
-        buffer = result.body;
-      } catch (err) {
-        throw new ImageGenerationDeliveryError(`Orkas Image download failed after generation completed. Do not submit another generation task. ${errorMessage(err)}`, { cause: err });
-      } finally {
-        download.cleanup();
-      }
-    }
-    const mimeType = detectMimeType(buffer) || 'image/png';
-    const dim = parseImageDimensions(buffer, mimeType);
-    return validateImageAdapterResult({ buffer, mimeType, width: dim.width, height: dim.height, ...(sourceUrl ? { sourceUrl } : {}) });
-  } finally {
-    overall.cleanup();
-  }
-}
+export const callOrkasImage = callZiAutonomousImage;
 
 export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);

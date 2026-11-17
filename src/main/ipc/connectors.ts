@@ -175,7 +175,7 @@ export const invokeHandlers = {
         return {
           ok: false,
           code: String((err as { code?: unknown }).code || 'orkas_api_key_required'),
-          error: String((err as Error).message || 'Configure an Orkas API Key first.'),
+          error: String((err as Error).message || 'Hosted connector disabled in autonomous build.'),
           requires_api_key: true,
           settings_tab: 'credentials',
         };

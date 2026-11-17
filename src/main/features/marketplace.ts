@@ -107,7 +107,9 @@ function _assertSafeMarketplaceId(id: unknown): asserts id is string {
 // ── server URL ────────────────────────────────────────────────────────────
 // The open-source build has exactly one server environment: global prod. Use the apex host
 // directly so marketplace POST calls do not first hit a www -> apex 301 redirect.
-const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
+// Autonomous ZI-Orkas build: never contact Orkas servers unless the user
+// explicitly configures their own ORKAS_MARKETPLACE_API_BASE.
+const GLOBAL_PROD_API_BASE = '';
 
 export function apiBase(): string {
   const e2eBase = String(process.env.ORKAS_E2E_MARKETPLACE_API_BASE || '').trim();

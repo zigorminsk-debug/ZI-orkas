@@ -57,38 +57,15 @@ export function openLifecycleRequestBody(
   return { uid, event: record.event, trigger: record.trigger };
 }
 
-export async function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): Promise<void> {
-  if (!safeId(uid) || uid.length > 50) {
-    warnTransport('lifecycle event skipped because the active uid is invalid', { reason: 'invalid_uid' });
-    return;
-  }
-  try {
-    const response = await fetchWithRetry(
-      'open-lifecycle',
-      `${apiBase()}/analytics/open-app-lifecycle`,
-      {
-        method: 'POST',
-        headers: withCommonHeaders({
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        }),
-        body: JSON.stringify(openLifecycleRequestBody(uid, record)),
-      },
-      {
-        retries: 0,
-        timeoutMs: REQUEST_TIMEOUT_MS,
-        timeoutMessage: 'open lifecycle request timed out',
-      },
-    );
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      warnTransport('lifecycle event rejected', { status_code: response.status });
-      return;
-    }
-    await response.body?.cancel().catch(() => {});
-  } catch (error) {
-    warnTransport('lifecycle event delivery failed', { error: logErrorRef(error) });
-  }
+export async function reportOpenLifecycle(_uid: string, _record: OpenLifecycleRecord): Promise<void> {
+  // Telemetry disabled in personal ZI-Orkas build — never contacts orkas.ai.
+  void warnTransport;
+  void fetchWithRetry;
+  void withCommonHeaders;
+  void apiBase;
+  void logErrorRef;
+  void REQUEST_TIMEOUT_MS;
+  void safeId;
 }
 
 export class OpenLifecycleState {

@@ -110,6 +110,24 @@ import {
   ORKAS_API_TTS_MODEL,
   ORKAS_API_VIDEO_MODEL,
 } from './orkas_api';
+import {
+  discoverLocalModels,
+  isZiCommanderProvider,
+  ZI_COMMANDER_DEFAULT_MODEL,
+  ZI_COMMANDER_MODELS,
+  ZI_COMMANDER_PROVIDER,
+} from '../model/autonomous-commander';
+import {
+  ZI_IMAGE_MODEL,
+  ZI_IMAGE_PROVIDER,
+  ZI_KEYLESS_SENTINEL,
+  ZI_SEARCH_PROVIDER,
+  ZI_TTS_DEFAULT_VOICE,
+  ZI_TTS_MODEL,
+  ZI_TTS_PROVIDER,
+  ZI_VIDEO_MODEL,
+  ZI_VIDEO_PROVIDER,
+} from './autonomous_media';
 
 const log = createLogger('auth');
 
@@ -169,6 +187,7 @@ export const FEATURED_PROVIDERS: readonly string[] =
 export function maskKey(key: unknown): string {
   if (!key || typeof key !== 'string') return '';
   const k = key.trim();
+  if (!k || k === ZI_KEYLESS_SENTINEL || k === 'local-no-key') return '';
   if (k.length <= 8) return '*'.repeat(k.length);
   return `${k.slice(0, 4)}…${k.slice(-4)}`;
 }
@@ -422,33 +441,7 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string 
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
       const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
       const ttsProfiles = parseTtsProfilesArray((data as any).ttsProfiles);
-      let orkasApiCredential = parseOrkasApiCredential((data as any).orkasApiCredential);
-      if (!orkasApiCredential) {
-        const legacyKeys = new Set<string>();
-        for (const profile of Object.values(profiles)) {
-          if (profile.provider === ORKAS_API_PROVIDER && profile.type === 'api_key' && profile.key) {
-            legacyKeys.add(profile.key);
-          }
-        }
-        for (const profile of [...searchProfiles, ...imageProfiles, ...videoProfiles, ...ttsProfiles]) {
-          if (profile.provider === ORKAS_API_PROVIDER && profile.apiKey) legacyKeys.add(profile.apiKey);
-        }
-        if (legacyKeys.size === 1) {
-          const [key] = legacyKeys;
-          orkasApiCredential = {
-            key,
-            keyId: '',
-            name: '',
-            prefix: maskKey(key),
-            scopes: [],
-            expiresAt: 0,
-            ownerRef: '',
-            updatedAt: Date.now(),
-          };
-          shouldRewrite = true;
-        }
-      }
-      const store = {
+      const store: ProfilesFile = {
         version: PROFILES_FILE_VERSION,
         profiles,
         entries,
@@ -456,8 +449,10 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string 
         imageProfiles,
         videoProfiles,
         ttsProfiles,
-        ...(orkasApiCredential ? { orkasApiCredential } : {}),
       };
+      if (sanitizeAndSeedAutonomousDefaults(store)) {
+        shouldRewrite = true;
+      }
       if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) {
         try { saveProfiles(store, uid); }
         catch (err) {
@@ -474,7 +469,22 @@ function loadProfiles(opts: { throwOnInvalidExisting?: boolean; userId?: string 
       if (opts.throwOnInvalidExisting) throw err;
     }
   }
-  return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [] };
+  const freshStore: ProfilesFile = {
+    version: PROFILES_FILE_VERSION,
+    profiles: {},
+    entries: [],
+    searchProfiles: [],
+    imageProfiles: [],
+    videoProfiles: [],
+    ttsProfiles: [],
+  };
+  if (sanitizeAndSeedAutonomousDefaults(freshStore)) {
+    try {
+      const uid = opts.userId ?? (hasActiveUser() ? getActiveUserId() : '');
+      if (uid) saveProfiles(freshStore, uid);
+    } catch { /* in-memory defaults remain active */ }
+  }
+  return freshStore;
 }
 
 function parseOrkasApiCredential(raw: unknown): OrkasApiCredential | undefined {
@@ -767,6 +777,189 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
   clearCooldown(chatProfileId);
   invalidateCoreAgentRunner();
   return { configured: true };
+}
+
+function sanitizeAndSeedAutonomousDefaults(store: ProfilesFile): boolean {
+  let changed = false;
+
+  // 1. Purge every trace of legacy hosted `orkas-api` credentials & rows.
+  if (store.orkasApiCredential) {
+    delete store.orkasApiCredential;
+    changed = true;
+  }
+  const removedProfileIds = new Set<string>();
+  for (const [pid, profile] of Object.entries(store.profiles)) {
+    if (profile.provider === ORKAS_API_PROVIDER) {
+      removedProfileIds.add(pid);
+      delete store.profiles[pid];
+      changed = true;
+    }
+  }
+  const prevEntriesLen = store.entries.length;
+  store.entries = store.entries.filter(
+    (e) => e.provider !== ORKAS_API_PROVIDER && !removedProfileIds.has(e.profileId),
+  );
+  if (store.entries.length !== prevEntriesLen) changed = true;
+
+  for (const key of ['searchProfiles', 'imageProfiles', 'videoProfiles', 'ttsProfiles'] as const) {
+    const arr = store[key];
+    if (Array.isArray(arr)) {
+      const filtered = arr.filter((p) => p.provider !== ORKAS_API_PROVIDER);
+      if (filtered.length !== arr.length) {
+        (store as any)[key] = filtered;
+        changed = true;
+      }
+    }
+  }
+
+  // 2. Auto-provision zero-token autonomous Commander & media capabilities out of the box.
+  if (process.env.ORKAS_DISABLE_AUTONOMOUS_DEFAULTS === '1') return changed;
+
+  const autoProfileId = makeProfileId(ZI_COMMANDER_PROVIDER, 'autonomous');
+  const now = Date.now();
+  if (!store.profiles[autoProfileId]) {
+    store.profiles[autoProfileId] = {
+      type: 'api_key',
+      provider: ZI_COMMANDER_PROVIDER,
+      label: 'autonomous',
+      key: ZI_KEYLESS_SENTINEL,
+      createdAt: now,
+      lastUsed: 0,
+    };
+    changed = true;
+  }
+
+  if (store.entries.length === 0) {
+    for (const m of ZI_COMMANDER_MODELS) {
+      store.entries.push({
+        entryId: `zi-entry-${m.id}`,
+        provider: ZI_COMMANDER_PROVIDER,
+        model: m.id,
+        profileId: autoProfileId,
+        createdAt: now,
+        lastUsed: 0,
+      });
+    }
+    changed = true;
+  }
+
+  if (!store.searchProfiles || store.searchProfiles.length === 0) {
+    store.searchProfiles = [{
+      id: 'zi-search-builtin',
+      provider: ZI_SEARCH_PROVIDER,
+      apiKey: ZI_KEYLESS_SENTINEL,
+      label: 'Autonomous Search',
+      createdAt: now,
+    }];
+    changed = true;
+  }
+
+  if (!store.imageProfiles || store.imageProfiles.length === 0) {
+    store.imageProfiles = [{
+      id: 'zi-image-builtin',
+      provider: ZI_IMAGE_PROVIDER,
+      model: ZI_IMAGE_MODEL,
+      apiKey: ZI_KEYLESS_SENTINEL,
+      label: 'Autonomous FLUX',
+      createdAt: now,
+    }];
+    changed = true;
+  }
+
+  if (!store.videoProfiles || store.videoProfiles.length === 0) {
+    store.videoProfiles = [{
+      id: 'zi-video-builtin',
+      provider: ZI_VIDEO_PROVIDER,
+      model: ZI_VIDEO_MODEL,
+      apiKey: ZI_KEYLESS_SENTINEL,
+      label: 'Autonomous Cinema HD',
+      createdAt: now,
+    }];
+    changed = true;
+  }
+
+  if (!store.ttsProfiles || store.ttsProfiles.length === 0) {
+    store.ttsProfiles = [{
+      id: 'zi-tts-builtin',
+      provider: ZI_TTS_PROVIDER,
+      baseUrl: 'https://local.zi-orkas/tts',
+      model: ZI_TTS_MODEL,
+      apiKey: ZI_KEYLESS_SENTINEL,
+      voice: ZI_TTS_DEFAULT_VOICE,
+      format: 'mp3',
+      label: 'Autonomous Neural TTS',
+      createdAt: now,
+    }];
+    changed = true;
+  }
+
+  return changed;
+}
+
+export function restoreAutonomousDefaults(): { configured: true } {
+  const store = loadProfiles();
+  const autoProfileId = makeProfileId(ZI_COMMANDER_PROVIDER, 'autonomous');
+  const now = Date.now();
+  store.profiles[autoProfileId] = {
+    type: 'api_key',
+    provider: ZI_COMMANDER_PROVIDER,
+    label: 'autonomous',
+    key: ZI_KEYLESS_SENTINEL,
+    createdAt: store.profiles[autoProfileId]?.createdAt ?? now,
+    lastUsed: 0,
+  };
+  for (const m of ZI_COMMANDER_MODELS) {
+    if (!store.entries.some((e) => e.provider === ZI_COMMANDER_PROVIDER && e.model === m.id)) {
+      store.entries.push({
+        entryId: `zi-entry-${m.id}`,
+        provider: ZI_COMMANDER_PROVIDER,
+        model: m.id,
+        profileId: autoProfileId,
+        createdAt: now,
+        lastUsed: 0,
+      });
+    }
+  }
+  sanitizeAndSeedAutonomousDefaults(store);
+  saveProfiles(store);
+  return { configured: true };
+}
+
+export async function importDiscoveredLocalModels(): Promise<{
+  ok: true;
+  discovered: number;
+  added: number;
+  models: Array<{ runtime: string; model: string; baseUrl: string }>;
+}> {
+  const locals = await discoverLocalModels({ force: true, timeoutMs: 1_500 });
+  let added = 0;
+  for (const item of locals) {
+    const store = loadProfiles();
+    const already = store.entries.some((e) => {
+      if (e.provider !== CUSTOM_MODEL_PROVIDER || e.model !== item.model) return false;
+      const p = store.profiles[e.profileId];
+      return p?.type === 'api_key' && p.baseUrl === item.baseUrl;
+    });
+    if (already) continue;
+    await addCustomModelEntry({
+      label: `${item.runtime}-${item.model}`.slice(0, 48),
+      protocol: 'openai',
+      baseUrl: item.baseUrl,
+      model: item.model,
+      apiKey: 'local-no-key',
+      contextWindow: 131_072,
+      maxTokens: 16_384,
+      supportsReasoning: item.supportsReasoning,
+      supportsVision: item.supportsVision,
+    });
+    added += 1;
+  }
+  return {
+    ok: true,
+    discovered: locals.length,
+    added,
+    models: locals.map((m) => ({ runtime: m.runtime, model: m.model, baseUrl: m.baseUrl })),
+  };
 }
 
 function orkasApiCredentialError(code: string, message: string): Error & { code: string } {
@@ -1100,10 +1293,8 @@ export interface AuthConfig { provider: string; model: string }
  * pending setup" and redirect the user to the settings page.
  */
 export function hasConfiguredModel(): { configured: boolean } {
-  const store = loadProfiles();
-  if (store.entries.some((e) => isEntryAllowed(store, e))) return { configured: true };
-  if (process.env.ANTHROPIC_API_KEY) return { configured: true };
-  return { configured: false };
+  // Autonomous ZI-Commander is always built in and active without any keys.
+  return { configured: true };
 }
 
 export function getConfiguredModelCooldown(): {
@@ -1359,7 +1550,8 @@ export async function addApiKey(
   label?: string,
 ): Promise<{ profileId: string }> {
   const id = String(providerId || '').trim();
-  const key = String(apiKey || '').trim();
+  const rawKey = String(apiKey || '').trim();
+  const key = rawKey || (isZiCommanderProvider(id) ? ZI_KEYLESS_SENTINEL : '');
   if (!id) throw new Error('provider required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id);
@@ -1401,7 +1593,8 @@ export async function addApiKeyEntry(
   const userId = getActiveUserId();
   const id = String(providerId || '').trim();
   const model = resolveModelUpgrade(id, String(modelId || '').trim()).modelId;
-  const key = String(apiKey || '').trim();
+  const rawKey = String(apiKey || '').trim();
+  const key = rawKey || (isZiCommanderProvider(id) ? ZI_KEYLESS_SENTINEL : '');
   if (!id) throw new Error('provider required');
   if (!model) throw new Error('model required');
   if (!key) throw new Error('api key required');
@@ -1469,9 +1662,9 @@ export async function addCustomModelEntry(
   const rawLabel = String(input?.label || '').trim();
   const model = String(input?.model || '').trim();
   const protocol = input?.protocol === 'anthropic' ? 'anthropic' : input?.protocol === 'responses' ? 'responses' : 'openai';
-  const key = String(input?.apiKey || '').trim();
+  // Allow keyless local/self-hosted servers (Ollama, LM Studio, llama.cpp, vLLM) without any API key.
+  const key = String(input?.apiKey || '').trim() || 'local-no-key';
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
-  if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
   if (!isBearerTokenHeaderSafe(key)) {
     throw customConfigError(
       'CUSTOM_API_KEY_INVALID',
@@ -1609,6 +1802,7 @@ export interface EntryView {
   availability?: 'available' | 'catalog_removed' | 'credential_missing' | 'context_too_small' | 'service_disabled';
   availabilityReason?: string;
   official?: boolean;
+  autonomous?: boolean;
   recommended?: boolean;
   profileId: string;
   profileAvailable: boolean;
@@ -1643,21 +1837,26 @@ function entryToView(
     providerLabelKey: providerLabelKey(e.provider),
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
-    modelEditable: e.provider !== ORKAS_API_PROVIDER && !providerUsesCustomOpenAIConfig(e.provider),
+    modelEditable: !isZiCommanderProvider(e.provider) && !providerUsesCustomOpenAIConfig(e.provider),
     modelAvailable: isSelectableModel(e.provider, e.model) && runtimeResolvable,
     includedModels: catalogModel?.includedModels ? [...catalogModel.includedModels] : [],
-    ...(e.provider === ORKAS_API_PROVIDER && catalogModel ? { official: true } : {}),
-    ...(catalogModel?.recommended ? { recommended: true } : {}),
+    ...(isZiCommanderProvider(e.provider) ? { autonomous: true } : {}),
+    ...(catalogModel?.recommended || e.model === ZI_COMMANDER_DEFAULT_MODEL ? { recommended: true } : {}),
     profileId: e.profileId,
-    profileAvailable: !!prof,
-    profileLabel: e.provider === ORKAS_API_PROVIDER
-      ? 'Orkas'
+    profileAvailable: !!prof || isZiCommanderProvider(e.provider),
+    profileLabel: isZiCommanderProvider(e.provider)
+      ? 'ZI-Commander'
       : (prof?.label || e.profileId.split(':').slice(1).join(':') || '(missing)'),
     profileType: (prof?.type as 'api_key' | 'oauth') || 'api_key',
     createdAt: e.createdAt,
     lastUsed: e.lastUsed,
   };
-  if (prof?.type === 'api_key') return { ...base, profileMasked: maskKey(prof.key) };
+  if (prof?.type === 'api_key') {
+    const isKeyless = isZiCommanderProvider(e.provider)
+      || prof.key === ZI_KEYLESS_SENTINEL
+      || prof.key === 'local-no-key';
+    return isKeyless ? base : { ...base, profileMasked: maskKey(prof.key) };
+  }
   if (prof?.type === 'oauth')  return { ...base, oauthExpired: Date.now() >= prof.expires };
   return base;
 }
@@ -1688,7 +1887,9 @@ export async function getChatPreloadApi(): Promise<string | null> {
   if (isExternalApiProvider(entry.provider)) {
     const models = await import('../model/core-agent/external-providers');
     if (!isActiveAuthOwner(uid)) return null;
-    if (entry.provider === ORKAS_API_PROVIDER) return models.buildOrkasApiModel(entry.model).api;
+    if (isZiCommanderProvider(entry.provider) || entry.provider === ORKAS_API_PROVIDER) {
+      return models.buildZiCommanderModel(entry.model).api;
+    }
     if (entry.provider === 'moonshot') return models.buildMoonshotModel(entry.model).api;
     if (entry.provider === 'deepseek') return models.buildDeepSeekModel(entry.model).api;
     if (entry.provider === 'doubao') return models.buildDoubaoModel(entry.model).api;
@@ -2344,7 +2545,15 @@ export function bumpEntryLastUsed(entryId: string): void {
 export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
   const userId = getActiveUserId();
   const store = loadProfiles({ userId });
-  if (store.entries.length === 0) return [];
+  if (store.entries.length === 0) {
+    return [{
+      entryId: `zi-entry-${ZI_COMMANDER_DEFAULT_MODEL}`,
+      profileId: makeProfileId(ZI_COMMANDER_PROVIDER, 'autonomous'),
+      provider: ZI_COMMANDER_PROVIDER,
+      model: ZI_COMMANDER_DEFAULT_MODEL,
+      apiKey: ZI_KEYLESS_SENTINEL,
+    }];
+  }
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
   if (!isActiveAuthOwner(userId)) return [];
 
@@ -2386,6 +2595,16 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
         refreshApiKey: (rejectedApiKey: string) => refreshOAuthProfileAfterAuthFailure(entry.profileId, rejectedApiKey, userId),
       } : {}),
       ...(customConfig ? { customConfig } : {}),
+    });
+  }
+  // Always keep autonomous ZI-Commander available as an indestructible zero-token fallback.
+  if (!choices.some((c) => isZiCommanderProvider(c.provider))) {
+    choices.push({
+      entryId: `zi-entry-${ZI_COMMANDER_DEFAULT_MODEL}`,
+      profileId: makeProfileId(ZI_COMMANDER_PROVIDER, 'autonomous'),
+      provider: ZI_COMMANDER_PROVIDER,
+      model: ZI_COMMANDER_DEFAULT_MODEL,
+      apiKey: ZI_KEYLESS_SENTINEL,
     });
   }
   return choices;
@@ -2679,8 +2898,8 @@ export async function testConnection(
       let probeModel = modelForTest;
       if (pid === 'moonshot') {
         provider = await ext.createMoonshotProvider({ apiKey, modelId: probeModel });
-      } else if (pid === ORKAS_API_PROVIDER) {
-        provider = await ext.createOrkasApiProvider({ apiKey, modelId: probeModel });
+      } else if (isZiCommanderProvider(pid) || pid === ORKAS_API_PROVIDER) {
+        provider = ext.createZiCommanderProvider({ modelId: probeModel });
       } else if (pid === 'deepseek') {
         provider = await ext.createDeepSeekProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'doubao') {

@@ -12,20 +12,11 @@
 
 const _settingsLog = createLogger('settings');
 const _OPENROUTER_CUSTOM_MODEL_VALUE = '__openrouter_custom_model__';
-const _ORKAS_API_PROVIDER_ID = 'orkas-api';
-const _ORKAS_API_KEYS_URL = 'https://orkas.ai/views/account/account.html#api-keys';
+const _ORKAS_API_PROVIDER_ID = 'zi-commander';
+const _ZI_KEYLESS_PROVIDERS = new Set(['zi-commander', 'zi-search', 'zi-image', 'zi-video', 'zi-tts']);
 
 function _settingsLocalizedOrkasWebUrl(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ''));
-    if (url.origin !== 'https://orkas.ai') return String(rawUrl || '');
-    const current = String(typeof getLang === 'function' ? getLang() : 'en').trim().toLowerCase();
-    const lang = ['zh', 'en', 'ja', 'pt'].includes(current) ? current : 'en';
-    url.searchParams.set('lang', lang);
-    return url.toString();
-  } catch (_) {
-    return String(rawUrl || '');
-  }
+  return String(rawUrl || '');
 }
 
 function _settingsIsOpenRouterCustomModel(providerId, modelId) {
@@ -1159,24 +1150,29 @@ async function _settingsRefreshEntries() {
 }
 
 function _settingsRenderOrkasApiCard() {
-  const credential = _settingsState.orkasApiCredential;
-  const configured = !!(credential && credential.configured);
-  const saved = document.getElementById('settings-orkas-api-saved');
-  const editor = document.getElementById('settings-orkas-api-editor');
-  const masked = document.getElementById('settings-orkas-api-key-masked');
-  const cancel = document.getElementById('settings-orkas-api-cancel');
-  if (saved) saved.hidden = !configured;
-  if (editor) editor.hidden = configured && !_settingsState.orkasApiEditing;
-  if (cancel) cancel.hidden = !configured || !_settingsState.orkasApiEditing;
-  if (masked) masked.textContent = configured ? String(credential.keyMasked || '') : '';
-  const status = document.getElementById('settings-orkas-api-status');
-  const key = status && status.getAttribute('data-i18n');
-  if (status && key) status.textContent = t(key);
+  const info = _settingsState.orkasApiCredential;
+  const statusEl = document.getElementById('settings-zi-commander-status');
+  if (!statusEl || !info || statusEl.dataset.manualStatus === '1') return;
+  const locals = Array.isArray(info.localModels) ? info.localModels : [];
+  if (locals.length > 0) {
+    statusEl.className = 'settings-status settings-orkas-api-status ok';
+    statusEl.textContent = t('settings.zi_commander.local_detected', {
+      count: locals.length,
+      models: locals.slice(0, 4).map((m) => `${m.runtime}: ${m.model}`).join(', '),
+    });
+  } else if (info.activeNodeLabel) {
+    statusEl.className = 'settings-status settings-orkas-api-status ok';
+    statusEl.textContent = t('settings.zi_commander.active_node', { node: info.activeNodeLabel });
+  }
 }
 
 async function _settingsRefreshOrkasApiCredential() {
-  const res = await window.orkas.invoke('orkasApi.getStatus');
-  _settingsState.orkasApiCredential = res && res.ok ? res : null;
+  try {
+    const res = await window.orkas.invoke('ziCommander.status', {});
+    _settingsState.orkasApiCredential = res && res.ok ? res : null;
+  } catch (_) {
+    _settingsState.orkasApiCredential = null;
+  }
   _settingsRenderOrkasApiCard();
 }
 
@@ -1201,101 +1197,67 @@ async function _settingsRefreshAllCredentialSections() {
 
 function _settingsBindOrkasApiOnce() {
   if (_settingsState.orkasApiBound) return;
-  const createBtn = document.getElementById('settings-orkas-api-create-key');
-  const configureBtn = document.getElementById('settings-orkas-api-configure');
-  const editBtn = document.getElementById('settings-orkas-api-edit');
-  const deleteBtn = document.getElementById('settings-orkas-api-delete');
-  const cancelBtn = document.getElementById('settings-orkas-api-cancel');
-  const keyInput = document.getElementById('settings-orkas-api-key-input');
-  if (!createBtn || !configureBtn || !editBtn || !deleteBtn || !cancelBtn || !keyInput) return;
+  const scanBtn = document.getElementById('settings-zi-commander-scan');
+  const testBtn = document.getElementById('settings-zi-commander-test');
+  const statusEl = document.getElementById('settings-zi-commander-status');
+  if (!scanBtn || !testBtn) return;
   _settingsState.orkasApiBound = true;
 
-  createBtn.addEventListener('click', async () => {
-    const url = _settingsLocalizedOrkasWebUrl(_ORKAS_API_KEYS_URL);
-    const res = await window.orkas.invoke('auth.openExternal', { url });
-    if (!res || !res.ok) {
-      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.open_failed');
-    }
-  });
-
-  editBtn.addEventListener('click', () => {
-    _settingsState.orkasApiEditing = true;
-    keyInput.value = '';
-    _settingsRenderOrkasApiCard();
-    keyInput.focus();
-  });
-
-  cancelBtn.addEventListener('click', () => {
-    _settingsState.orkasApiEditing = false;
-    keyInput.value = '';
-    _settingsRenderOrkasApiCard();
-  });
-
-  deleteBtn.addEventListener('click', async () => {
-    if (!(await uiConfirm(t('settings.orkas_api.delete_confirm')))) return;
-    deleteBtn.disabled = true;
+  scanBtn.addEventListener('click', async () => {
+    scanBtn.disabled = true;
+    if (statusEl) statusEl.dataset.manualStatus = '1';
+    _settingsSetStatus('settings-zi-commander-status', 'busy', t('settings.zi_commander.scanning'));
     try {
-      const res = await window.orkas.invoke('orkasApi.remove');
-      if (!res || !res.ok) throw new Error((res && res.error) || t('settings.orkas_api.delete_failed'));
-      _settingsState.orkasApiCredential = null;
-      _settingsState.orkasApiEditing = false;
+      const res = await window.orkas.invoke('ziCommander.importLocal');
       await _settingsRefreshAllCredentialSections();
       if (typeof refreshModelGuard === 'function') {
         await Promise.resolve(refreshModelGuard()).catch(() => {});
       }
-      _settingsSetStatus('settings-orkas-api-status', '', '');
-    } catch (err) {
-      _settingsSetStatus(
-        'settings-orkas-api-status',
-        'error',
-        (err && err.message) || t('settings.orkas_api.delete_failed'),
-      );
-    } finally {
-      deleteBtn.disabled = false;
-    }
-  });
-
-  const configure = async () => {
-    const apiKey = String(keyInput.value || '').trim();
-    if (!apiKey) {
-      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.key_required');
-      return;
-    }
-    configureBtn.disabled = true;
-    _settingsSetI18nStatus('settings-orkas-api-status', 'busy', 'settings.orkas_api.configuring');
-    try {
-      const res = await window.orkas.invoke('orkasApi.save', { apiKey });
-      if (!res || !res.ok) {
-        if (res && res.error) {
-          _settingsSetStatus('settings-orkas-api-status', 'error', res.error);
-        } else {
-          _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
-        }
-        return;
-      }
-      keyInput.value = '';
-      _settingsState.orkasApiCredential = res;
-      _settingsState.orkasApiEditing = false;
-      await _settingsRefreshAllCredentialSections();
-      if (typeof refreshModelGuard === 'function') {
-        await Promise.resolve(refreshModelGuard()).catch(() => {});
-      }
-      _settingsSetStatus('settings-orkas-api-status', '', '');
-    } catch (err) {
-      if (err && err.message) {
-        _settingsSetStatus('settings-orkas-api-status', 'error', err.message);
+      if (res && res.discovered > 0) {
+        _settingsSetStatus(
+          'settings-zi-commander-status',
+          'ok',
+          t('settings.zi_commander.scan_found', { count: res.discovered, added: res.added }),
+        );
       } else {
-        _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
+        _settingsSetStatus('settings-zi-commander-status', '', t('settings.zi_commander.scan_none'));
       }
+    } catch (err) {
+      _settingsSetStatus('settings-zi-commander-status', 'error', (err && err.message) || String(err));
     } finally {
-      configureBtn.disabled = false;
+      scanBtn.disabled = false;
     }
-  };
-  configureBtn.addEventListener('click', configure);
-  keyInput.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.isComposing) return;
-    event.preventDefault();
-    void configure();
+  });
+
+  testBtn.addEventListener('click', async () => {
+    testBtn.disabled = true;
+    if (statusEl) statusEl.dataset.manualStatus = '1';
+    _settingsSetStatus('settings-zi-commander-status', 'busy', t('settings.zi_commander.testing'));
+    try {
+      await window.orkas.invoke('ziCommander.restoreDefaults');
+      const res = await window.orkas.invoke('ziCommander.test', {});
+      await _settingsRefreshAllCredentialSections();
+      if (res && res.ok) {
+        _settingsSetStatus(
+          'settings-zi-commander-status',
+          'ok',
+          t('settings.zi_commander.test_ok', {
+            ms: res.latencyMs || 0,
+            node: res.activeNodeLabel || 'ZI-Commander',
+          }),
+        );
+      } else {
+        _settingsSetStatus(
+          'settings-zi-commander-status',
+          'error',
+          (res && res.error) || t('settings.zi_commander.test_failed'),
+        );
+      }
+    } catch (err) {
+      _settingsSetStatus('settings-zi-commander-status', 'error', (err && err.message) || String(err));
+    } finally {
+      testBtn.disabled = false;
+    }
   });
 }
 
@@ -1556,7 +1518,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
       modelInput?.focus();
       return;
     }
-    if (!apiKey) {
+    if (!apiKey && !_ZI_KEYLESS_PROVIDERS.has(provider.id)) {
       msg.textContent = t('settings.paste_key_first');
       msg.className = 'form-msg error';
       return;
@@ -1753,7 +1715,8 @@ function _settingsShowCustomModelForm(provider) {
     const { label, baseUrl, model, apiKey } = payload;
     let errorCode = _settingsValidateCustomBaseUrl(baseUrl);
     if (!errorCode && !model) errorCode = 'CUSTOM_MODEL_REQUIRED';
-    if (!errorCode && !apiKey) errorCode = 'CUSTOM_API_KEY_REQUIRED';
+    // API key is optional in ZI-Orkas for local Ollama / LM Studio / llama.cpp / self-hosted servers.
+    void apiKey;
     if (errorCode) {
       msg.textContent = _settingsCustomModelError(errorCode);
       msg.className = 'form-msg error';
@@ -2195,9 +2158,7 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
   const isOrkasApi = entry.provider === _ORKAS_API_PROVIDER_ID;
   const recommendedModelTag = isOrkasApi && entry.recommended === true
-    ? `<span class="entry-model-recommended">${escapeHtml(t(entry.model === 'orkas-llm-1.5'
-      ? 'new_chat.model_picker.recommended_with_savings'
-      : 'settings.orkas_api.recommended'))}</span>`
+    ? `<span class="entry-model-recommended">${escapeHtml(t('settings.zi_commander.no_key_badge'))}</span>`
     : '';
   const modelControl = entry.modelEditable === false
     ? `<span class="entry-model-static"><span class="entry-model-static-name">${escapeHtml(entry.modelName || entry.model)}</span>${recommendedModelTag}</span>`
@@ -2246,6 +2207,9 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   } else if (entry.profileType === 'oauth') {
     badge.className = 'account-type-badge oauth' + (entry.oauthExpired ? ' expired' : '');
     badge.textContent = entry.oauthExpired ? t('settings.entries.oauth_expired') : t('settings.entries.oauth_badge');
+  } else if (isOrkasApi || entry.autonomous || !entry.profileMasked) {
+    badge.className = 'account-type-badge';
+    badge.textContent = t('settings.zi_commander.no_key_badge');
   } else {
     badge.className = 'account-type-badge';
     badge.textContent = 'API Key';
@@ -2255,9 +2219,7 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
   if (isOrkasApi && Array.isArray(entry.includedModels) && entry.includedModels.length) {
     const included = document.createElement('span');
     included.className = 'entry-included-models';
-    included.textContent = t('settings.orkas_api.includes', {
-      models: entry.includedModels.join(' · '),
-    });
+    included.textContent = entry.includedModels.join(' · ');
     meta.appendChild(included);
   }
 
@@ -2535,11 +2497,11 @@ function _settingsSortApiProfiles(profiles) {
 }
 
 function _settingsOrkasServiceLabel(service) {
-  return `Orkas · ${service}`;
+  return `ZI-Commander · ${service}`;
 }
 
 const _SEARCH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api',          label: _settingsOrkasServiceLabel('Search'), docs: _ORKAS_API_KEYS_URL },
+  { id: 'zi-search',          label: 'ZI-Commander · Search', docs: '' },
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'deepseek',          label: 'DeepSeek', docs: 'https://api-docs.deepseek.com/guides/search/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
@@ -2594,7 +2556,7 @@ async function _settingsClickAddSearchKey() {
   const input = document.getElementById('settings-search-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_provider_needed')); return; }
-  if (!apiKey)   { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_key_needed')); return; }
+  if (!apiKey && !_ZI_KEYLESS_PROVIDERS.has(provider)) { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_key_needed')); return; }
   _settingsSetStatus('settings-search-status', 'busy', t('settings.search.adding'));
   try {
     const res = await window.orkas.invoke('searchAuth.add', { provider, apiKey, label: 'default' });
@@ -2687,7 +2649,7 @@ function _settingsRenderSearchEntries() {
 // still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', provider: 'orkas-api', model: 'orkas-image', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
+  { id: 'zi-image', provider: 'zi-image', model: 'zi-flux', label: 'ZI-Commander · Image (FLUX)', docs: '' },
   {"id": "openai:gpt-image-2", "label": "OpenAI · GPT Image 2", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2"},
   {"id": "openai:gpt-image-2.5-flare", "label": "OpenAI · GPT Image 2.5 Flare", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2.5-flare"},
   {"id": "openai:gpt-image-2.5-sunburst", "label": "OpenAI · GPT Image 2.5 Sunburst", "docs": "https://platform.openai.com/api-keys", "provider": "openai", "model": "gpt-image-2.5-sunburst"},
@@ -2747,7 +2709,7 @@ async function _settingsClickAddImageKey() {
   const input = document.getElementById('settings-image-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_provider_needed')); return; }
-  if (!apiKey)   { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
+  if (!apiKey && !_ZI_KEYLESS_PROVIDERS.has(provider)) { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
   _settingsSetStatus('settings-image-status', 'busy', t('settings.image.adding'));
   try {
     const res = await window.orkas.invoke('imageAuth.add', { provider, model, apiKey, label: 'default' });
@@ -2845,7 +2807,7 @@ function _settingsRenderImageEntries() {
 // User-owned provider keys only; account-managed providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  {id:'orkas-api',provider:'orkas-api',model:'orkas-video',label:_settingsOrkasServiceLabel('Video'),docs:_ORKAS_API_KEYS_URL},
+  { id: 'zi-video', provider: 'zi-video', model: 'zi-cinema-hd', label: 'ZI-Commander · Cinema HD', docs: '' },
   { id: 'doubao:doubao-seedance-2-5-260628', provider: 'doubao', model: 'doubao-seedance-2-5-260628', label: 'Doubao Seedance 2.5' },
   { id: 'doubao:doubao-seedance-2-5-flash', provider: 'doubao', model: 'doubao-seedance-2-5-flash', label: 'Doubao Seedance 2.5 Flash' },
   { id: 'doubao:doubao-seedance-2-0-260128', provider: 'doubao', model: 'doubao-seedance-2-0-260128', label: 'Doubao Seedance 2.0' },
@@ -2959,8 +2921,8 @@ async function _settingsClickAddVideoKey() {
   const input = document.getElementById('settings-video-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_provider_needed')); return; }
-  if (!model && provider !== _ORKAS_API_PROVIDER_ID) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_model_needed')); return; }
-  if (!apiKey) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
+  if (!model && !_ZI_KEYLESS_PROVIDERS.has(provider)) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_model_needed')); return; }
+  if (!apiKey && !_ZI_KEYLESS_PROVIDERS.has(provider)) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
   _settingsSetStatus('settings-video-status', 'busy', t('settings.video.adding'));
   try {
     const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default', ...(provider === 'aliyun' ? { workspaceId: document.getElementById('settings-video-workspace-input')?.value?.trim() || '', region: _settingsState.videoRegionSel?.getValue() || 'cn-beijing' } : {}) });
@@ -3175,7 +3137,7 @@ async function _settingsClickAddTts() {
   const preset = _settingsTtsPreset(provider);
   const apiKey = (document.getElementById('settings-tts-key-input')?.value || '').trim();
   const voice = (document.getElementById('settings-tts-voice-input')?.value || '').trim();
-  if (!apiKey) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_key_needed')); return; }
+  if (!apiKey && !_ZI_KEYLESS_PROVIDERS.has(provider) && provider !== 'custom') { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_key_needed')); return; }
 
   let payload;
   if (provider === 'doubao') {

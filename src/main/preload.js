@@ -216,6 +216,7 @@ contextBridge.exposeInMainWorld('orkas', {
   voiceInput: {
     status: () => invoke('voiceInput.status'),
     createSession: () => invoke('voiceInput.createSession'),
+    transcribePcm: (payload) => invoke('voiceInput.transcribePcm', payload),
     ensureMicrophoneAccess: () => invoke('voiceInput.ensureMicrophoneAccess'),
   },
   recycleBin,

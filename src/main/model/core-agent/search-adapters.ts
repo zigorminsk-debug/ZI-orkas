@@ -18,12 +18,10 @@ import { createLogger } from '../../logger';
 import { composeAbortSignal, fetchAndReadWithTimeout } from '../../util/abort';
 import { getSearchQueryMaxChars, validateSearchQuery } from '../../util/search-contract';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_KEYS_URL,
-  ORKAS_API_PROVIDER,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from '../../features/orkas_api';
+  autonomousWebSearch,
+  ZI_SEARCH_PROVIDER,
+} from '../../features/autonomous_media';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
 
 const log = createLogger('search-adapters');
 
@@ -122,38 +120,7 @@ export class SearchAccountError extends Error {
   }
 }
 
-// ── Orkas public search API ─────────────────────────────────────────────
-
-async function orkasApiSearch(
-  profile: SearchProfile,
-  query: string,
-  count: number,
-  context?: OrkasApiUsageContext,
-): Promise<SearchAdapterResult> {
-  const { response: resp, text } = await fetchTextWithTimeout(`${ORKAS_API_BASE_URL}/search`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${profile.apiKey}`,
-      'Content-Type': 'application/json',
-      ...orkasApiUsageHeaders(context),
-    },
-    body: JSON.stringify({ query, max_results: clamp(count, 1, 20) }),
-  });
-  if (!resp.ok) {
-    throw new Error(`Orkas Search ${resp.status}: ${text.slice(0, 300)}`);
-  }
-  const data = parseJson(text) as {
-    results?: Array<{ title?: string; url?: string; snippet?: string }>;
-  };
-  return {
-    provider: ORKAS_API_PROVIDER,
-    results: (data.results || []).map((result) => ({
-      title: String(result.title || ''),
-      url: String(result.url || ''),
-      snippet: String(result.snippet || ''),
-    })).filter((result) => result.url),
-  };
-}
+// Hosted orkas-api search removed in autonomous ZI-Orkas build.
 
 // ── Tavily ──────────────────────────────────────────────────────────────
 
@@ -413,8 +380,20 @@ export type SearchAdapter = (
   context?: OrkasApiUsageContext,
 ) => Promise<SearchAdapterResult>;
 
+async function ziAutonomousSearch(
+  _profile: SearchProfile,
+  query: string,
+  count: number,
+): Promise<SearchAdapterResult> {
+  const hits = await autonomousWebSearch(query, count);
+  return {
+    provider: ZI_SEARCH_PROVIDER,
+    results: hits.map((h) => ({ title: h.title, url: h.url, snippet: h.snippet })),
+  };
+}
+
 export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
-  [ORKAS_API_PROVIDER]: orkasApiSearch,
+  [ZI_SEARCH_PROVIDER]: ziAutonomousSearch,
   tavily:            tavilySearch,
   deepseek:          deepseekSearch,
   serper:            serperSearch,
@@ -426,7 +405,7 @@ export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
 /** Display labels for provider ids — used by both the settings UI and the
  *  formatted tool result so the LLM knows which API answered. */
 export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
-  [ORKAS_API_PROVIDER]: 'Orkas · Search',
+  [ZI_SEARCH_PROVIDER]: 'ZI-Commander · Search',
   tavily:            'Tavily',
   deepseek:          'DeepSeek',
   serper:            'Serper',
@@ -437,7 +416,7 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
 
 /** Documentation URL shown next to the API-key input in the settings UI. */
 export const SEARCH_PROVIDER_DOCS: Record<string, string> = {
-  [ORKAS_API_PROVIDER]: ORKAS_API_KEYS_URL,
+  [ZI_SEARCH_PROVIDER]: '',
   tavily:            'https://tavily.com/',
   deepseek:          'https://api-docs.deepseek.com/guides/search/',
   serper:            'https://serper.dev/',

@@ -30,7 +30,7 @@ import {
 } from './image_gen';
 import { createLogger } from '../logger';
 import { logErrorSummary } from '../util/log-redact';
-import { ORKAS_API_KEYS_URL } from './orkas_api';
+import { ZI_IMAGE_MODEL, ZI_IMAGE_PROVIDER, ZI_KEYLESS_SENTINEL } from './autonomous_media';
 
 const log = createLogger('image-auth');
 
@@ -59,9 +59,11 @@ export function addImageProfile(input: AddImageProfileInput): { ok: true; id: st
   const provider = String(input.provider || '').trim();
   const capability = findImageGenCapability(provider);
   const model = String(input.model || capability?.model || '').trim();
-  const apiKey = String(input.apiKey || '').trim();
+  const rawKey = String(input.apiKey || '').trim();
+  const apiKey = rawKey || (provider === ZI_IMAGE_PROVIDER ? ZI_KEYLESS_SENTINEL : '');
   if (!provider) return { ok: false, error: 'provider required' };
   if (!apiKey) return { ok: false, error: 'apiKey required' };
+  void ZI_IMAGE_MODEL;
   if (!capability) {
     return { ok: false, error: `provider "${provider}" has no image-gen capability` };
   }
@@ -145,9 +147,9 @@ export interface ImageProviderPickerOption {
   docs?: string;
 }
 
-export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
+export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string; keyless?: boolean }> {
   return [
-    { id: 'orkas-api', label: 'Orkas · Image', docs: ORKAS_API_KEYS_URL },
+    { id: ZI_IMAGE_PROVIDER, label: 'ZI-Commander · Image (FLUX)', keyless: true },
     { id: 'openai', label: 'OpenAI', docs: 'https://platform.openai.com/api-keys' },
     { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
     {

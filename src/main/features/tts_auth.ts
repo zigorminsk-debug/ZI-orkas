@@ -9,12 +9,11 @@
 import { loadTtsProfiles, saveTtsProfiles, type TtsProfile } from './auth';
 import { createLogger } from '../logger';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_DEFAULT_VOICE,
-  ORKAS_API_KEYS_URL,
-  ORKAS_API_PROVIDER,
-  ORKAS_API_TTS_MODEL,
-} from './orkas_api';
+  ZI_KEYLESS_SENTINEL,
+  ZI_TTS_DEFAULT_VOICE,
+  ZI_TTS_MODEL,
+  ZI_TTS_PROVIDER,
+} from './autonomous_media';
 
 import { aliyunTtsBaseUrl, DOUBAO_TTS_FORMATS, TTS_MODELS, ttsModelPreset, type TtsModelPreset } from './tts_catalog';
 
@@ -78,11 +77,12 @@ export interface AddTtsProfileInput {
 
 export function addTtsProfile(input: AddTtsProfileInput): { ok: true; id: string } | { ok: false; error: string } {
   const provider = String(input.provider || 'custom').trim() || 'custom';
-  const apiKey = String(input.apiKey || '').trim();
+  const rawApiKey = String(input.apiKey || '').trim();
+  const apiKey = rawApiKey || (provider === ZI_TTS_PROVIDER || provider === 'custom' ? ZI_KEYLESS_SENTINEL : '');
   let voice = String(input.voice || '').trim();
   let format = String(input.format || '').trim();
 
-  if (provider === 'orkas-voice') return { ok: false, error: 'provider unavailable in open-source build' };
+  if (provider === 'orkas-voice' || provider === 'orkas-api') return { ok: false, error: 'Hosted Orkas Voice is disabled' };
   if (provider === 'doubao') return addDoubaoProfile({ apiKey, voice, format, input });
 
   const preset = listTtsProviderPresets().find(entry => entry.id === provider);
@@ -168,13 +168,12 @@ export function listTtsProviderPresets(): Array<{
 }> {
   return [
     {
-      id: ORKAS_API_PROVIDER,
-      label: 'Orkas · Voice',
-      baseUrl: ORKAS_API_BASE_URL,
-      defaultModel: ORKAS_API_TTS_MODEL,
-      defaultVoice: ORKAS_API_DEFAULT_VOICE,
+      id: ZI_TTS_PROVIDER,
+      label: 'ZI-Commander · Neural TTS',
+      baseUrl: 'https://local.zi-orkas/tts',
+      defaultModel: ZI_TTS_MODEL,
+      defaultVoice: ZI_TTS_DEFAULT_VOICE,
       defaultFormat: DEFAULT_TTS_FORMAT,
-      docs: ORKAS_API_KEYS_URL,
     },
     { id: 'doubao', label: 'DouBao · Voice', baseUrl: DOUBAO_TTS_BASE_URL, defaultVoice: DOUBAO_DEFAULT_VOICE, defaultFormat: DEFAULT_TTS_FORMAT, docs: 'https://www.volcengine.com/docs/6561/1598757' },
     { id: 'minimax', label: 'MiniMax', baseUrl: 'https://api.minimax.cn/v1', defaultModel: TTS_MODELS.minimax[0].id, defaultVoice: TTS_MODELS.minimax[0].defaultVoice, models: TTS_MODELS.minimax, docs: 'https://platform.minimax.cn/docs/api-reference/speech-t2a-http' },

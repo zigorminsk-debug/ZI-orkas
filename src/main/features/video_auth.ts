@@ -15,15 +15,15 @@ import {
 } from './auth';
 import { createLogger } from '../logger';
 import {
-  ORKAS_API_KEYS_URL,
-  ORKAS_API_PROVIDER,
-  ORKAS_API_VIDEO_MODEL,
-} from './orkas_api';
+  ZI_KEYLESS_SENTINEL,
+  ZI_VIDEO_MODEL,
+  ZI_VIDEO_PROVIDER,
+} from './autonomous_media';
 
 const log = createLogger('video-auth');
 
 export const VIDEO_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
- [ORKAS_API_PROVIDER]: [{id:ORKAS_API_VIDEO_MODEL,name:'Video'}],
+ [ZI_VIDEO_PROVIDER]: [{ id: ZI_VIDEO_MODEL, name: 'ZI-Commander · Cinema HD' }],
  ...Object.fromEntries(Object.entries(VIDEO_MODEL_SPECS).map(([provider,models])=>[provider,models.map(({id,name})=>({id,name}))])),
 };
 
@@ -59,10 +59,11 @@ function defaultVideoModel(provider: string): string {
 export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: string } | { ok: false; error: string; errorKey?: string } {
   const provider = String(input.provider || '').trim();
   const model = String(input.model || '').trim() || defaultVideoModel(provider);
-  const apiKey = String(input.apiKey || '').trim();
+  const rawKey = String(input.apiKey || '').trim();
+  const apiKey = rawKey || (provider === ZI_VIDEO_PROVIDER ? ZI_KEYLESS_SENTINEL : '');
   if (!provider) return { ok: false, error: 'provider required' };
   if (!model) return { ok: false, error: 'model required' };
-  if (!isVideoProviderModelAllowed(provider, model) || (provider !== ORKAS_API_PROVIDER && !videoModelSpec(provider, model))) {
+  if (!isVideoProviderModelAllowed(provider, model) || (provider !== ZI_VIDEO_PROVIDER && !videoModelSpec(provider, model))) {
     return { ok: false, error: `unsupported video model "${provider}/${model}"` };
   }
   if (!apiKey) return { ok: false, error: 'apiKey required' };
@@ -114,9 +115,9 @@ export function reorderVideoProfiles(orderedIds: string[]): { ok: boolean } {
   return { ok: true };
 }
 
-export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
+export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string; keyless?: boolean }> {
   return [
-    { id: ORKAS_API_PROVIDER, label: 'Orkas', docs: ORKAS_API_KEYS_URL },
+    { id: ZI_VIDEO_PROVIDER, label: 'ZI-Commander · Video', keyless: true },
     {
       id: 'doubao',
       label: 'DouBao · Seedance',
@@ -157,7 +158,7 @@ export function flattenVideoProviderOptions(
   providers: Array<{ id: string; label: string; docs?: string }>,
 ): VideoProviderPickerOption[] {
   return providers.flatMap((provider) => {
-    if (provider.id === ORKAS_API_PROVIDER) return [{...provider,provider:provider.id,model:ORKAS_API_VIDEO_MODEL,label:'Orkas · Video'}];
+    if (provider.id === ZI_VIDEO_PROVIDER) return [{ ...provider, provider: provider.id, model: ZI_VIDEO_MODEL, label: 'ZI-Commander · Cinema HD' }];
     const models = listVideoModelOptions(provider.id);
     if (models.length <= 1) {
       return [{

@@ -66,20 +66,9 @@ function isModelConfigured() {
  * `opts.silent === true` skips the alert — useful for background/auto paths
  * (queued sends, polling) where we just want to quietly no-op.
  */
-function ensureModelConfigured(opts = {}) {
-  if (_hasConfiguredModel) return true;
-  if (!opts.silent) {
-    const msg = opts.message || t('model_guard.modal');
-    try {
-      if (typeof uiAlert === 'function') uiAlert(msg);
-      else window.alert(msg);
-    } catch (_) { /* swallow — alert is best-effort */ }
-    if (typeof setView === 'function') {
-      setView('settings', null, { entryPoint: 'model_guard_blocked_action' });
-    }
-    _activateModelCredentialsTab();
-  }
-  return false;
+function ensureModelConfigured(_opts = {}) {
+  // Autonomous ZI-Commander is always active without external tokens or setup gates.
+  return true;
 }
 
 function _activateModelCredentialsTab() {

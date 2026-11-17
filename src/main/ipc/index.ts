@@ -3186,24 +3186,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.updateEntryModel':async ({ entryId, model }) => auth.updateEntryModel(entryId, model),
 
   // ── Orkas public API key quick setup (open-source build only) ──
-  'orkasApi.configureAll': async ({ apiKey }) => auth.configureAllOrkasApiServices(apiKey),
-  'orkasApi.getStatus': async () => auth.getOrkasApiCredentialStatus(),
+  'ziCommander.status': async (payload) => {
+    const mod = await import('../model/autonomous-commander');
+    return mod.getAutonomousCommanderStatus({ rescanLocal: payload?.rescanLocal === true });
+  },
+  'ziCommander.test': async (payload) => {
+    const mod = await import('../model/autonomous-commander');
+    return mod.testAutonomousCommander(payload?.modelId);
+  },
+  'ziCommander.importLocal': async () => auth.importDiscoveredLocalModels(),
+  'ziCommander.restoreDefaults': async () => auth.restoreAutonomousDefaults(),
   'voiceInput.status': async () => voiceInput.getVoiceStatus(),
+  'voiceInput.transcribePcm': async (payload) => voiceInput.transcribeVoicePcm(payload || {}),
   'voice.status': async () => voiceInput.getVoiceStatus(),
   'voice.createSession': async () => voiceInput.createVoiceSession(),
+  'voice.transcribePcm': async (payload) => voiceInput.transcribeVoicePcm(payload || {}),
   'voice.ensureMicrophoneAccess': async () => voiceInput.ensureMicrophoneAccess(),
-  'orkasApi.save': async ({ apiKey }, ctx) => {
-    const credential = auth.prepareOrkasApiCredential(apiKey);
-    const previousKey = auth.getOrkasApiKey();
-    if (previousKey && previousKey !== credential.key) {
-      await removeApiKeyConnectorsForCredentialChange(ctx.userId);
-    }
-    return auth.saveOrkasApiCredential(credential);
-  },
-  'orkasApi.remove': async (_payload, ctx) => {
-    await removeApiKeyConnectorsForCredentialChange(ctx.userId);
-    return auth.removeOrkasApiCredential();
-  },
 
   // ── Image-generation API key (independent from chat entries) ──
   // `list` strips raw apiKey and replaces it with `apiKeyMasked` so

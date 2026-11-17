@@ -37,8 +37,9 @@ type LegacyLocalExecMode = 'off' | 'risk_prompt' | 'allow_all';
 const MODES: readonly LocalExecMode[] = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const LEGACY_MODES: readonly LegacyLocalExecMode[] = ['off', 'risk_prompt', 'allow_all'];
 
-/** Damaged / missing file falls back here; never to the no-approval mode. */
-const DEFAULT_MODE: LocalExecMode = 'all_files_approval';
+/** Default personal mode in ZI-Orkas: autonomous full local execution without
+ *  constant confirmation prompts (user can still switch modes in Settings). */
+const DEFAULT_MODE: LocalExecMode = 'all_files_auto';
 
 export interface LocalExecState {
   mode: LocalExecMode;

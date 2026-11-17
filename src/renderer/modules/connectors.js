@@ -1693,15 +1693,8 @@ async function _runConnect(entry, entryPoint = 'form') {
       || _oauthCallbackAttempts.has(entry.id)) return;
 
   if (targetEntry.requires_credits === true || targetEntry.auth_mode === 'composio') {
-    const credential = await window.orkas.invoke('orkasApi.getStatus');
-    if (!credential || !credential.ok || !credential.configured) {
-      setView('settings');
-      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
-      const input = document.getElementById('settings-orkas-api-key-input');
-      setTimeout(() => input && input.focus(), 0);
-      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
-      return;
-    }
+    if (typeof uiToast === 'function') uiToast(t('connectors.errors.unsupported_hosted'));
+    return;
   }
 
   const launchToken = ++_oauthLaunchToken;
@@ -1732,11 +1725,7 @@ async function _runConnect(entry, entryPoint = 'form') {
       const launch = _oauthLaunchAttempts.get(entry.id);
       if (launch && launch.token === launchToken) launch.attemptId = res.attempt_id;
     } else if (res && !res.ok && res.requires_api_key) {
-      setView('settings');
-      if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
-      const input = document.getElementById('settings-orkas-api-key-input');
-      setTimeout(() => input && input.focus(), 0);
-      if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
+      if (typeof uiToast === 'function') uiToast(t('connectors.errors.unsupported_hosted'));
     } else if (res && !res.ok) {
       _handleConnectFailure(res);
     } else {

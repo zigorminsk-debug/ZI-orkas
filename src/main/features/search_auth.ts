@@ -72,9 +72,12 @@ export interface AddSearchProfileInput {
   extras?: Record<string, string>;
 }
 
+import { ZI_KEYLESS_SENTINEL, ZI_SEARCH_PROVIDER } from './autonomous_media';
+
 export function addSearchProfile(input: AddSearchProfileInput): { ok: true; id: string } | { ok: false; error: string } {
   const provider = String(input.provider || '').trim();
-  const apiKey = String(input.apiKey || '').trim();
+  const rawKey = String(input.apiKey || '').trim();
+  const apiKey = rawKey || (provider === ZI_SEARCH_PROVIDER ? ZI_KEYLESS_SENTINEL : '');
   if (!provider) return { ok: false, error: 'provider required' };
   if (!apiKey) return { ok: false, error: 'apiKey required' };
   if (!searchAdaptersByProvider[provider]) {

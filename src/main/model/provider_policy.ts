@@ -17,7 +17,12 @@ export function isDeepSeekModelId(modelId: string): boolean {
   return /deepseek/i.test(String(modelId || ''));
 }
 
+export function isOrkasHostedProviderId(providerId: string): boolean {
+  return String(providerId || '').trim().toLowerCase() === 'orkas-api';
+}
+
 export function isModelProviderAllowed(providerId: string, modelId?: string): boolean {
+  if (isOrkasHostedProviderId(providerId)) return false;
   if (isDeepSeekIntegrationEnabled()) return true;
   if (isDeepSeekProviderId(providerId)) return false;
   if (modelId && isDeepSeekModelId(modelId)) return false;
@@ -25,7 +30,10 @@ export function isModelProviderAllowed(providerId: string, modelId?: string): bo
 }
 
 export function assertModelProviderAllowed(providerId: string, modelId?: string): void {
+  if (isOrkasHostedProviderId(providerId)) {
+    throw new Error('Hosted Orkas API is disabled in autonomous ZI-Orkas');
+  }
   if (!isModelProviderAllowed(providerId, modelId)) {
-    throw new Error('DeepSeek is disabled in this build');
+    throw new Error('Provider is disabled in this build');
   }
 }

@@ -44,10 +44,10 @@ export { estimateNarrationDuration, measureNarrationUnits } from '../util/narrat
 export type { NarrationDurationEstimate } from '../util/narration-timing';
 
 import {
-  ORKAS_API_PROVIDER,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from './orkas_api';
+  autonomousGenerateSpeech,
+  ZI_TTS_PROVIDER,
+} from './autonomous_media';
+import type { OrkasApiUsageContext } from './orkas_api';
 
 const log = createLogger('tts');
 
@@ -470,8 +470,12 @@ class HttpAudioTtsBackend implements TtsBackend {
     const voice = p.voice || this.profile.voice;
     const format = (p.format || this.profile.format || 'mp3').toLowerCase();
     let url = `${base}/audio/speech`;
-    let headers: Record<string, string> = { Authorization: `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json',
-      ...(this.profile.provider === ORKAS_API_PROVIDER ? orkasApiUsageHeaders(p.usageContext) : {}) };
+    let headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(this.profile.apiKey && this.profile.apiKey !== 'zi-autonomous' && this.profile.apiKey !== 'local-no-key'
+        ? { Authorization: `Bearer ${this.profile.apiKey}` }
+        : {}),
+    };
     let body: Record<string, unknown> = {
       model: this.profile.model,
       input: p.text,
@@ -843,18 +847,35 @@ class DoubaoTtsBackend implements TtsBackend {
   }
 }
 
-class UnconfiguredTtsBackend implements TtsBackend {
-  readonly id = 'unconfigured';
-  async synthesize(): Promise<TtsResult> {
-    return {
-      ok: false,
-      errorCode: 'E_TTS_NOT_CONFIGURED',
-      message: 'No TTS provider is configured. Configure Doubao or an OpenAI-compatible speech provider before generating narration.',
-    };
+class AutonomousTtsBackend implements TtsBackend {
+  readonly id = ZI_TTS_PROVIDER;
+  constructor(private readonly voice?: string, private readonly format?: string) {}
+  async synthesize(p: TtsParams): Promise<TtsResult> {
+    try {
+      p.onProgress?.({ phase: 'tts.request', message: 'Synthesizing speech via ZI-Commander autonomous TTS' });
+      const res = await autonomousGenerateSpeech({
+        text: p.text,
+        voice: p.voice || this.voice,
+        format: p.format || this.format || path.extname(p.outputAbsPath).slice(1) || 'mp3',
+        speed: p.speed,
+        outputPath: p.outputAbsPath,
+        signal: p.signal,
+      });
+      return { ok: true, path: p.outputAbsPath, bytes: res.bytes, backend: this.id };
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'E_TTS_API_ERROR',
+        message: (err as Error)?.message || String(err),
+        requestDisposition: 'not_sent',
+        chargeStatus: 'not_charged',
+        retryPolicy: 'unknown',
+      };
+    }
   }
 }
 
-/** Resolve the active TTS backend: env override -> ordered saved profile list -> explicit setup error. */
+/** Resolve the active TTS backend: env override -> ordered saved profile list -> built-in autonomous TTS. */
 function resolveTtsBackend(routeRef?: string): TtsBackend {
   const envBase = process.env.ORKAS_TTS_BASE_URL;
   const envKey = process.env.ORKAS_TTS_API_KEY;
@@ -871,6 +892,9 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
   try { profiles = listUsableTtsProfiles(); } catch { log.warn('list TTS profiles failed'); }
   const p = routeRef ? profiles.find((profile) => profile.id === routeRef) : profiles[0];
   if (p) {
+    if (p.provider === ZI_TTS_PROVIDER || p.provider === 'orkas-api') {
+      return new AutonomousTtsBackend(p.voice, p.format);
+    }
     if (p.provider === 'doubao') {
       return new DoubaoTtsBackend({
         baseUrl: p.baseUrl, apiKey: p.apiKey,
@@ -883,13 +907,12 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
     if (['minimax', 'aliyun', 'google'].includes(p.provider)) return new NativeTtsBackend(p);
     return new HttpAudioTtsBackend(p);
   }
-  return new UnconfiguredTtsBackend();
+  return new AutonomousTtsBackend();
 }
 
-/** True when a BYO TTS provider is configured (env or saved profile). */
+/** True when any TTS backend is ready (always true with built-in autonomous TTS). */
 export function hasConfiguredTtsProvider(): boolean {
-  if (process.env.ORKAS_TTS_BASE_URL && process.env.ORKAS_TTS_API_KEY && process.env.ORKAS_TTS_MODEL) return true;
-  try { return listUsableTtsProfiles().length > 0; } catch { return false; }
+  return true;
 }
 
 /** Non-secret active backend identity used to scope persisted duration

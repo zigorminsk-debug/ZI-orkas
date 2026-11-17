@@ -112,6 +112,9 @@ import {
   buildOrkasApiModel,
   createOrkasApiProvider,
   buildMoonshotModel,
+  buildZiCommanderModel,
+  createZiCommanderProvider,
+  ZI_COMMANDER_PROVIDER,
   buildDeepSeekModel,
   buildDoubaoModel,
   buildConfiguredOpenAICompatibleModel,
@@ -175,8 +178,9 @@ function buildExternalProviderModel(
   customConfig?: ChatEntryChoice['customConfig'],
 ): Model<Api> | null {
   switch (providerId) {
+    case ZI_COMMANDER_PROVIDER:
     case 'orkas-api':
-      return buildOrkasApiModel(modelId);
+      return buildZiCommanderModel(modelId);
     case 'moonshot':
       return buildMoonshotModel(modelId);
     case 'deepseek':
@@ -1790,8 +1794,9 @@ async function buildExternalProvider(
 ): Promise<LLMProvider> {
   const { provider: providerId, apiKey, model: modelId } = choice;
   switch (providerId) {
+    case ZI_COMMANDER_PROVIDER:
     case 'orkas-api':
-      return await createOrkasApiProvider({ apiKey, modelId, usageContext, userCacheKey });
+      return createZiCommanderProvider({ modelId });
     case 'moonshot':
       return await createMoonshotProvider({ apiKey, modelId, userCacheKey });
     case 'deepseek':
