@@ -38,6 +38,9 @@ jobs:
       - name: Test GitHub connector and Commander stream watchdog
         run: node --test scripts/test-github-connector.cjs scripts/test-commander-stream.cjs
 
+      - name: Test Chromium page-sharing extension
+        run: node --test scripts/test-page-share.cjs
+
       - name: Check Web App SDK documentation contract
         run: npm run web-app-sdk:check
 
