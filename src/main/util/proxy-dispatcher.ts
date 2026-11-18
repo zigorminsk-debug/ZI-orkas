@@ -1,0 +1,1055 @@
+/**
+ * proxy-dispatcher — make main-process HTTP(S) follow the user's proxy policy.
+ *
+ * Electron has two unrelated fetch stacks:
+ *   - `net.fetch`, backed by Chromium. It evaluates the OS proxy policy for
+ *     every request, including PAC, per-host DIRECT rules, proxy auth, and
+ *     runtime VPN/proxy changes.
+ *   - Node's global `fetch`, backed by undici. pi-ai/core-agent and several
+ *     SDKs use this stack, which otherwise connects directly.
+ *
+ * For the OS system-proxy path we resolve the actual request origin. DIRECT
+ * requests stay on Node's original fetch (so a machine without a proxy keeps
+ * the pre-existing network behaviour); proxy routes use `net.fetch`, which
+ * supports Chromium's HTTP(S)/SOCKS routing and proxy authentication.
+ *
+ * Explicit HTTP(S)_PROXY / ALL_PROXY launch environment variables retain
+ * precedence and use undici's EnvHttpProxyAgent. That path is installed before
+ * app-ready; the system path is installed after app-ready because `net.fetch`
+ * is not available earlier.
+ *
+ * A stable delegating fetch wrapper is installed synchronously in phase 1.
+ * fetch-diag may wrap it afterwards; phase 2 changes only the delegate, so the
+ * diagnostic wrapper stays intact.
+ */
+
+import { createLogger } from '../logger';
+import { logErrorSummary } from './log-redact';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
+import { isRetriableHttpStatus, retryAsync } from './retry';
+
+const log = createLogger('proxy-dispatcher');
+
+const LOCAL_NO_PROXY = ['localhost', '127.0.0.1', '::1', '*.local'];
+const SYSTEM_ROUTE_CACHE_MS = 2_000;
+const SYSTEM_ROUTE_CACHE_MAX_ORIGINS = 256;
+
+// The turn-level watchdog owns idle/abort for model streaming. Connection
+// setup remains bounded while long response bodies are allowed to continue.
+const DISPATCHER_OPTS = { headersTimeout: 0, bodyTimeout: 0, connect: { timeout: 30_000 } };
+
+type FetchLike = typeof globalThis.fetch;
+
+export interface BinaryFetchResult {
+  status: number;
+  body: Buffer;
+}
+
+export interface BinaryFetchOptions {
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+  maxBytes?: number;
+  redirect?: RequestRedirect;
+  /** Applied only to direct connections. Proxy routes deliberately leave
+   * destination resolution to the configured proxy. */
+  isAllowedDirectAddress?: (address: string) => boolean;
+}
+
+export type BinaryFetchLike = (
+  url: string,
+  options?: BinaryFetchOptions,
+) => Promise<BinaryFetchResult>;
+
+export interface BinaryDownloadOptions extends BinaryFetchOptions {
+  label: string;
+  retries?: number;
+  delaysMs?: number[];
+  validate?: (body: Buffer) => void;
+}
+
+class BinaryFetchSizeError extends Error {
+  constructor(maxBytes: number) {
+    super(`binary response exceeds ${maxBytes} bytes`);
+    this.name = 'BinaryFetchSizeError';
+  }
+}
+
+class BinaryDownloadHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, label: string) {
+    super(`${label} returned HTTP ${status}`);
+    this.name = 'BinaryDownloadHttpError';
+    this.status = status;
+  }
+}
+
+/** Statuses that may be temporary for a newly-published CDN object. */
+function isRetriableBinaryDownloadStatus(status: number): boolean {
+  return status === 404 || status === 409 || status === 425 || isRetriableHttpStatus(status);
+}
+
+export interface EnvProxyConfig {
+  httpProxy?: string;
+  httpsProxy?: string;
+  noProxy: string;
+}
+
+export type ResolvedProxyRoute =
+  | { kind: 'direct' }
+  | { kind: 'proxy'; url: string }
+  | { kind: 'unsupported'; value: string };
+
+export type ChildProxyEnvironment = Record<string, string>;
+
+let _active: string | undefined;
+let _envActive = false;
+let _envConfig: EnvProxyConfig | undefined;
+let _originalFetchValue: FetchLike | undefined;
+let _baseFetch: FetchLike | undefined;
+let _fetchDelegate: FetchLike | undefined;
+let _fetchRouter: FetchLike | undefined;
+let _baseBinaryFetch: BinaryFetchLike | undefined;
+let _binaryFetchDelegate: BinaryFetchLike | undefined;
+let _uploadRoute: ((url: URL) => Promise<ResolvedProxyRoute>) | undefined;
+let _childFetchBridge: Promise<ChildFetchBridge> | undefined;
+
+interface ChildFetchBridge {
+  url: string;
+  token: string;
+  close: () => Promise<void>;
+}
+
+interface ChildFetchRequestMeta {
+  url: string;
+  method: string;
+  headers: Array<[string, string]>;
+  redirect: RequestRedirect;
+}
+
+interface ChildFetchResponseMeta {
+  status: number;
+  statusText: string;
+  headers: Array<[string, string]>;
+}
+
+function redact(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
+  } catch {
+    return 'set';
+  }
+}
+
+/** Merge caller NO_PROXY with mandatory loopback bypasses. */
+export function buildNoProxy(env: NodeJS.ProcessEnv = process.env): string {
+  const existing = String(env.NO_PROXY || env.no_proxy || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // Undici recognizes the all-hosts bypass only as the entire value. It
+  // already includes loopback, so appending local entries would weaken it.
+  if (existing.includes('*')) return '*';
+  return [...new Set([...existing, ...LOCAL_NO_PROXY])].join(',');
+}
+
+/**
+ * Resolve standard proxy environment variables without collapsing distinct
+ * HTTP and HTTPS routes. ALL_PROXY is the final fallback for both schemes;
+ * HTTP_PROXY alone also covers HTTPS, matching EnvHttpProxyAgent semantics.
+ */
+export function envProxyConfig(env: NodeJS.ProcessEnv = process.env): EnvProxyConfig {
+  const http = env.HTTP_PROXY || env.http_proxy || undefined;
+  const https = env.HTTPS_PROXY || env.https_proxy || undefined;
+  const all = env.ALL_PROXY || env.all_proxy || undefined;
+  return {
+    httpProxy: http || all,
+    httpsProxy: https || http || all,
+    noProxy: buildNoProxy(env),
+  };
+}
+
+/** Kept as a compact presence/diagnostic helper for callers and tests. */
+export function envProxyUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const config = envProxyConfig(env);
+  return config.httpsProxy || config.httpProxy;
+}
+
+/** Parse the first route in Chromium's semicolon-separated proxy chain. */
+export function parseResolvedProxyRoute(result: string | undefined): ResolvedProxyRoute {
+  const first = String(result || '').split(';')[0]?.trim() || '';
+  if (!first || /^DIRECT$/i.test(first)) return { kind: 'direct' };
+  const match = first.match(/^([A-Za-z0-9]+)\s+(\S+:\d+)$/);
+  if (!match) return { kind: 'unsupported', value: first || 'empty' };
+  const scheme = match[1].toUpperCase();
+  const hostPort = match[2];
+  if (scheme === 'PROXY' || scheme === 'HTTP') return { kind: 'proxy', url: `http://${hostPort}` };
+  if (scheme === 'HTTPS') return { kind: 'proxy', url: `https://${hostPort}` };
+  if (scheme === 'SOCKS5' || scheme === 'SOCKS') {
+    // Chromium's SOCKS route is host-based. Preserve that behaviour for Node
+    // SDK adapters by delegating destination DNS to the proxy as well; a plain
+    // socks5:// URL would resolve locally and can fail (or leak DNS) when the
+    // VPN intentionally provides no virtual interface.
+    return { kind: 'proxy', url: `socks5h://${hostPort}` };
+  }
+  return { kind: 'unsupported', value: first };
+}
+
+/** Standard NO_PROXY host/port matching used by non-undici SDK adapters. */
+function shouldBypassProxy(url: string, noProxy: string): boolean {
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return false; }
+  const hostname = parsed.hostname.toLowerCase();
+  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+  for (const rawEntry of String(noProxy || '').split(/[,\s]+/)) {
+    const raw = rawEntry.trim().toLowerCase();
+    if (!raw) continue;
+    if (raw === '*') return true;
+    const match = raw.match(/^(.+):(\d+)$/);
+    const entryPort = match ? Number(match[2]) : 0;
+    if (entryPort && entryPort !== port) continue;
+    const entryHost = (match ? match[1] : raw).replace(/^\*?\./, '');
+    if (hostname === entryHost || hostname.endsWith(`.${entryHost}`)) return true;
+  }
+  return false;
+}
+
+/** Resolve the current route for a known URL for SDKs that cannot use net.fetch. */
+export async function resolveProxyRouteForUrl(
+  targetUrl: string,
+  resolveProxyOverride?: (url: string) => Promise<string>,
+): Promise<ResolvedProxyRoute> {
+  const envConfig = envProxyConfig();
+  const protocol = (() => { try { return new URL(targetUrl).protocol; } catch { return ''; } })();
+  const envProxy = protocol === 'http:' ? envConfig.httpProxy : envConfig.httpsProxy;
+  if (envProxy) {
+    return shouldBypassProxy(targetUrl, envConfig.noProxy)
+      ? { kind: 'direct' }
+      : { kind: 'proxy', url: envProxy };
+  }
+  if (process.env.ORKAS_NO_AUTO_PROXY === '1') return { kind: 'direct' };
+  try {
+    let resolveProxy = resolveProxyOverride;
+    if (!resolveProxy) {
+      const { session } = await import('electron');
+      resolveProxy = (url: string) => session.defaultSession.resolveProxy(url);
+    }
+    return parseResolvedProxyRoute(await resolveProxy(targetUrl));
+  } catch {
+    return { kind: 'unsupported', value: 'resolve_failed' };
+  }
+}
+
+/**
+ * Build the minimal environment consumed by `bin/proxy-bootstrap.cjs` in an
+ * app-owned Node child. Explicit launch env has precedence. A DIRECT target
+ * leaves the child on its original fetch stack. If its known service target
+ * needs a system proxy, child fetches stream through a token-protected
+ * loopback bridge and Electron makes the PROXY/DIRECT decision for every
+ * actual URL. This is deliberately a fetch bridge, not a frozen HTTP_PROXY
+ * value: one child may call domains with different PAC rules, and proxy
+ * settings may change while it is alive.
+ *
+ * Custom third-party children without a known target can inherit explicit env
+ * proxy settings, but system PAC cannot be evaluated for an unknown URL.
+ */
+export async function buildChildProxyEnvironment(
+  targetUrl?: string,
+  bridgeOverride?: () => Promise<{ url: string; token: string }>,
+  resolveProxyOverride?: (url: string) => Promise<string>,
+): Promise<ChildProxyEnvironment> {
+  const envConfig = envProxyConfig();
+  if (envConfig.httpProxy || envConfig.httpsProxy) {
+    return {
+      ORKAS_PROXY_MODE: 'env',
+      ...(envConfig.httpProxy ? { ORKAS_PROXY_HTTP_URL: envConfig.httpProxy } : {}),
+      ...(envConfig.httpsProxy ? { ORKAS_PROXY_HTTPS_URL: envConfig.httpsProxy } : {}),
+      ORKAS_PROXY_NO_PROXY: envConfig.noProxy,
+      ...(envConfig.httpProxy ? { HTTP_PROXY: envConfig.httpProxy } : {}),
+      ...(envConfig.httpsProxy ? { HTTPS_PROXY: envConfig.httpsProxy } : {}),
+      NO_PROXY: envConfig.noProxy,
+      NODE_USE_ENV_PROXY: '1',
+    };
+  }
+  if (!targetUrl || process.env.ORKAS_NO_AUTO_PROXY === '1') return {};
+
+  try {
+    const route = await resolveProxyRouteForUrl(targetUrl, resolveProxyOverride);
+    if (route.kind === 'direct') return { ORKAS_PROXY_MODE: 'direct' };
+    if (route.kind === 'unsupported') {
+      log.warn('child proxy route could not be resolved', {
+        target: (() => { try { return new URL(targetUrl).origin; } catch { return 'invalid'; } })(),
+      });
+      return {
+        ORKAS_PROXY_MODE: 'unsupported',
+        ORKAS_PROXY_UNSUPPORTED: 'route_resolution_failed',
+      };
+    }
+    const bridge = bridgeOverride ? await bridgeOverride() : await ensureChildFetchBridge();
+    return {
+      ORKAS_PROXY_MODE: 'system-fetch',
+      ORKAS_PROXY_BRIDGE_URL: bridge.url,
+      ORKAS_PROXY_BRIDGE_TOKEN: bridge.token,
+    };
+  } catch (err) {
+    log.warn('child fetch bridge setup failed', {
+      target: (() => { try { return new URL(targetUrl).origin; } catch { return 'invalid'; } })(),
+      error: logErrorSummary(err),
+    });
+    return { ORKAS_PROXY_MODE: 'unsupported', ORKAS_PROXY_UNSUPPORTED: 'bridge_setup_failed' };
+  }
+}
+
+function encodeBridgeMeta(value: ChildFetchRequestMeta | ChildFetchResponseMeta): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+function decodeBridgeMeta<T>(value: string | string[] | undefined): T {
+  if (typeof value !== 'string' || !value) throw new Error('missing bridge metadata');
+  return JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as T;
+}
+
+function validBridgeToken(actual: string | string[] | undefined, expected: string): boolean {
+  if (typeof actual !== 'string') return false;
+  const a = Buffer.from(actual);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** Chromium can reject a proxy connection with only a net error message.
+ * Add a transport code at the Electron boundary so provider retry accounting
+ * can use structured facts without interpreting arbitrary error prose. */
+export function normalizeElectronNetFetchError(error: unknown): unknown {
+  if (!(error instanceof Error) || error.name !== 'Error'
+    || error.message !== 'net::ERR_PROXY_CONNECTION_FAILED') return error;
+  const facts = error as Error & { code?: unknown; cause?: unknown };
+  if (facts.code != null || facts.cause != null) return error;
+  return Object.assign(new Error(error.message, { cause: error }), { code: 'EHOSTUNREACH' });
+}
+
+/** Chromium owns Content-Length: an explicit one fails with
+ * net::ERR_INVALID_ARGUMENT before sending, where the Node route accepts it.
+ * Chromium sends the same length from the body, preserving a signed upload. */
+function withoutContentLength(init?: Parameters<FetchLike>[1]): Parameters<FetchLike>[1] {
+  if (!init?.headers) return init;
+  const headers = new Headers(init.headers);
+  if (!headers.has('content-length')) return init;
+  headers.delete('content-length');
+  return { ...init, headers };
+}
+
+async function electronSystemFetch(): Promise<FetchLike> {
+  const { net } = await import('electron');
+  return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+    const normalized = input instanceof URL ? input.href : input;
+    try {
+      return await net.fetch(
+        normalized as Parameters<typeof net.fetch>[0],
+        withoutContentLength(init) as Parameters<typeof net.fetch>[1],
+      ) as Response;
+    } catch (error) {
+      throw normalizeElectronNetFetchError(error);
+    }
+  }) as FetchLike;
+}
+
+export type UploadProgress = (sent: number, total: number) => void;
+
+/** Bounded JSON uploads use transport byte events, never body-producer reads.
+ * Keep environment/DIRECT on Node and system proxy routes on Chromium. */
+export async function fetchUploadWithProxyPolicy(
+  url: string, init: RequestInit, onProgress: UploadProgress,
+): Promise<Response> {
+  if (typeof init.body !== 'string') throw new TypeError('upload requires a serialized body');
+  const body = Buffer.from(init.body);
+  if (_uploadRoute && !_envActive && (await _uploadRoute(new URL(url))).kind !== 'direct') {
+    return electronUpload(url, init, body, onProgress);
+  }
+  const { fetch: nodeFetch, getGlobalDispatcher } = require('undici') as typeof import('undici');
+  const base = getGlobalDispatcher();
+  let active = true;
+  const dispatcher = {
+    dispatch(options: import('undici').Dispatcher.DispatchOptions, handler: import('undici').Dispatcher.DispatchHandler) {
+      let sent = 0;
+      return base.dispatch({...options, ...(options.body ? {body: Readable.from(chunks(), {objectMode: false})} : {})}, new Proxy(handler, {
+        get(target, key) {
+          if (key === 'onBodySent') return (chunk: Uint8Array) => {
+            // The installed undici runtime supplies the chunk (its .d.ts differs).
+            sent += chunk.byteLength;
+            if (active && !init.signal?.aborted) onProgress(Math.min(sent, body.length), body.length);
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }));
+    },
+  } as import('undici').Dispatcher;
+  // Subdivide within the same HTTP request. Socket backpressure controls pacing;
+  // no extra round trips or artificial progress timers are introduced.
+  async function* chunks() {
+    for (let offset = 0; offset < body.length; offset += 16 * 1024) yield body.subarray(offset, offset + 16 * 1024);
+  }
+  try {
+    // Retain fetch's replayable serialized body and redirect policy; split only
+    // at dispatch so 307/308 retries can obtain a fresh iterator.
+    return await nodeFetch(url, { ...init, headers: Object.fromEntries(new Headers(init.headers)), dispatcher,
+    } as Parameters<typeof nodeFetch>[1]) as unknown as Response;
+  } finally { active = false; }
+}
+
+async function electronUpload(url: string, init: RequestInit, body: Buffer, onProgress: UploadProgress): Promise<Response> {
+  const { net, session } = await import('electron');
+  return new Promise((resolve, reject) => {
+    const signal = init.signal;
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const request = net.request({url, method: init.method || 'POST', session: session.defaultSession, redirect: init.redirect || 'follow'});
+    let settled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const finish = (error?: unknown, response?: Response) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      signal?.removeEventListener('abort', abort);
+      if (error) reject(error); else resolve(response!);
+    };
+    const abort = () => { finish(signal?.reason || new Error('upload aborted')); request.abort(); };
+    const report = () => {
+      if (settled || signal?.aborted) return;
+      const value = request.getUploadProgress();
+      if (value.active && value.started) onProgress(Math.min(value.current, body.length), body.length);
+    };
+    request.on('error', error => finish(normalizeElectronNetFetchError(error)));
+    request.on('abort', () => finish(new Error('upload aborted')));
+    // ClientRequest's writable side can close immediately after finish, before
+    // response headers arrive. Only the response or an error/abort settles it;
+    // the caller's signal still bounds a request that receives no response.
+    request.on('response', response => {
+      report(); clearInterval(timer);
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer) => chunks.push(chunk));
+      response.on('error', error => finish(error));
+      response.on('aborted', () => finish(new Error('upload response aborted')));
+      response.on('end', () => {
+        if (settled) return;
+        try {
+          const headers = new Headers();
+          for (const [name, values] of Object.entries(response.headers)) {
+            for (const value of Array.isArray(values) ? values : [values]) headers.append(name, value);
+          }
+          finish(undefined, new Response([204,205,304].includes(response.statusCode) ? null : Buffer.concat(chunks),
+            {status: response.statusCode, headers}));
+        } catch (error) { finish(error); }
+      });
+    });
+    try {
+      new Headers(init.headers).forEach((value, name) => request.setHeader(name, value));
+      signal?.addEventListener('abort', abort, {once: true});
+      timer = setInterval(report, 100);
+      request.end(body);
+    } catch (error) { finish(error); request.abort(); }
+  });
+}
+
+/**
+ * Electron's `net.fetch` materialises every response header as a WHATWG
+ * `Headers` value. Some object-storage providers return non-Latin-1 metadata
+ * headers; Chromium decodes those to Unicode and the subsequent ByteString
+ * conversion throws before callers can read the body. `net.request` exposes a
+ * byte stream instead, so binary delivery can deliberately ignore all
+ * upstream headers and consume only the status code and body.
+ */
+async function electronSystemBinaryFetch(
+  url: string,
+  options: BinaryFetchOptions = {},
+): Promise<BinaryFetchResult> {
+  const { net, session } = await import('electron');
+  const signal = options.signal;
+  return await new Promise<BinaryFetchResult>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('operation aborted'));
+      return;
+    }
+
+    const request = net.request({
+      url,
+      method: 'GET',
+      redirect: options.redirect || 'follow',
+      session: session.defaultSession,
+    });
+    let settled = false;
+    const finish = (err?: Error, result?: BinaryFetchResult) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.('abort', onAbort);
+      if (err) reject(err);
+      else resolve(result as BinaryFetchResult);
+    };
+    const onAbort = () => {
+      request.abort();
+      finish(new Error('operation aborted'));
+    };
+
+    request.on('response', (response) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      response.on('data', (chunk: Buffer | Uint8Array) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buffer.length;
+        if (options.maxBytes && total > options.maxBytes) {
+          finish(new BinaryFetchSizeError(options.maxBytes));
+          request.abort();
+          return;
+        }
+        chunks.push(buffer);
+      });
+      response.on('end', () => {
+        finish(undefined, {
+          status: response.statusCode,
+          body: Buffer.concat(chunks),
+        });
+      });
+      response.on('aborted', () => finish(new Error('binary response aborted')));
+      response.on('error', (err: Error) => finish(err));
+    });
+    request.on('error', (err) => finish(err));
+    for (const [name, value] of Object.entries(options.headers || {})) {
+      request.setHeader(name, value);
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    request.end();
+  });
+}
+
+async function readBinaryFetchBody(response: Response, maxBytes?: number): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (maxBytes && total > maxBytes) {
+        throw new BinaryFetchSizeError(maxBytes);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  } catch (err) {
+    try { await reader.cancel(err); } catch { /* response may already be closed */ }
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
+  return async (url, options = {}) => {
+    const target = inputUrl(url);
+    const environmentProxyApplies = _envActive && _envConfig && target
+      ? envProxyAppliesToUrl(target, _envConfig)
+      : false;
+    if (options.isAllowedDirectAddress && !environmentProxyApplies) {
+      return await directBinaryFetchWithAddressPolicy(url, options);
+    }
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      ...(options.headers ? { headers: options.headers } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.redirect ? { redirect: options.redirect } : {}),
+    });
+    return {
+      status: response.status,
+      body: await readBinaryFetchBody(response, options.maxBytes),
+    };
+  };
+}
+
+/** Match the EnvHttpProxyAgent selection contract so a caller-specific direct
+ * address policy still applies to NO_PROXY routes without bypassing proxies. */
+export function envProxyAppliesToUrl(url: URL, config: EnvProxyConfig): boolean {
+  const proxy = url.protocol === 'https:' ? config.httpsProxy : config.httpProxy;
+  if (!proxy) return false;
+  const noProxy = config.noProxy.trim();
+  if (!noProxy) return true;
+  if (noProxy === '*') return false;
+  const hostname = url.host.replace(/:\d*$/, '').toLowerCase();
+  const port = Number.parseInt(url.port, 10) || (url.protocol === 'https:' ? 443 : 80);
+  for (const rawEntry of noProxy.split(/[,\s]/)) {
+    if (!rawEntry) continue;
+    const parsed = rawEntry.match(/^(.+):(\d+)$/);
+    const entryHostname = (parsed ? parsed[1] : rawEntry).replace(/^\*?\./, '').toLowerCase();
+    const entryPort = parsed ? Number.parseInt(parsed[2], 10) : 0;
+    if (entryPort && entryPort !== port) continue;
+    if (hostname === entryHostname || hostname.endsWith(`.${entryHostname}`)) return false;
+  }
+  return true;
+}
+
+/**
+ * Use the same DNS lookup that opens the direct socket, so validation cannot
+ * race a second resolution. This branch is never used for an environment or
+ * system proxy: those transports must resolve the destination themselves.
+ */
+async function directBinaryFetchWithAddressPolicy(
+  url: string,
+  options: BinaryFetchOptions,
+): Promise<BinaryFetchResult> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { Agent, buildConnector, fetch: undiciFetch } = require('undici') as typeof import('undici');
+  const isAllowed = options.isAllowedDirectAddress as (address: string) => boolean;
+  const rejectAddress = () => new Error('direct download resolved to a disallowed address');
+  const baseConnect = buildConnector({
+    ...(DISPATCHER_OPTS.connect || {}),
+    lookup: ((hostname: string, lookupOptions: unknown, callback: (...args: unknown[]) => void) => {
+      // Requiring here avoids a separate preflight lookup: net.connect owns
+      // this exact resolution and connects to the returned address(es).
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const nodeDns = require('node:dns') as typeof import('node:dns');
+      nodeDns.lookup(hostname, lookupOptions as import('node:dns').LookupAllOptions, (err, address, family) => {
+        if (err) {
+          callback(err);
+          return;
+        }
+        const addresses = Array.isArray(address) ? address.map(entry => entry.address) : [address];
+        let allowed = false;
+        try {
+          allowed = addresses.length > 0 && addresses.every(candidate => isAllowed(candidate));
+        } catch {
+          allowed = false;
+        }
+        if (!allowed) {
+          callback(rejectAddress());
+          return;
+        }
+        callback(null, address, family);
+      });
+    }) as import('node:net').LookupFunction,
+  });
+  const dispatcher = new Agent({
+    headersTimeout: DISPATCHER_OPTS.headersTimeout,
+    bodyTimeout: DISPATCHER_OPTS.bodyTimeout,
+    connect(connectOptions, callback) {
+      baseConnect(connectOptions, (err, socket) => {
+        if (err || !socket) {
+          callback(err as Error, null);
+          return;
+        }
+        const address = socket.remoteAddress || '';
+        let allowed = false;
+        try { allowed = !!address && isAllowed(address); }
+        catch { allowed = false; }
+        if (!allowed) {
+          socket.destroy();
+          callback(rejectAddress(), null);
+          return;
+        }
+        callback(null, socket);
+      });
+    },
+  });
+  try {
+    const response = await undiciFetch(url, {
+      method: 'GET',
+      ...(options.headers ? { headers: options.headers } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.redirect ? { redirect: options.redirect } : {}),
+      dispatcher,
+    });
+    return {
+      status: response.status,
+      body: await readBinaryFetchBody(response as unknown as Response, options.maxBytes),
+    };
+  } finally {
+    await dispatcher.close();
+  }
+}
+
+/**
+ * Start the loopback fetch bridge used by app-owned Node children. The random
+ * token prevents unrelated local processes from turning it into an open
+ * proxy. Request and response bodies stay streamed in both directions.
+ */
+export async function startChildFetchBridge(
+  systemFetchOverride?: FetchLike,
+): Promise<{ url: string; token: string; close: () => Promise<void> }> {
+  const systemFetch = systemFetchOverride || await electronSystemFetch();
+  const token = randomBytes(32).toString('base64url');
+  const server = createServer({ maxHeaderSize: 128 * 1024 }, async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/v1/fetch'
+      || !validBridgeToken(req.headers['x-orkas-proxy-token'], token)) {
+      res.writeHead(404).end();
+      return;
+    }
+
+    const abort = new AbortController();
+    let upstreamBody: ReadableStream<Uint8Array> | null = null;
+    let upstreamReadable: Readable | null = null;
+    const cancelUpstream = () => {
+      if (!abort.signal.aborted) abort.abort();
+      if (upstreamReadable) upstreamReadable.destroy();
+      else if (upstreamBody) void upstreamBody.cancel().catch(() => undefined);
+    };
+    req.once('aborted', cancelUpstream);
+    res.once('close', () => {
+      if (!res.writableEnded) cancelUpstream();
+    });
+    try {
+      const meta = decodeBridgeMeta<ChildFetchRequestMeta>(req.headers['x-orkas-fetch-meta']);
+      const target = new URL(meta.url);
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        throw new Error('bridge target must use HTTP(S)');
+      }
+      const hasBody = meta.method !== 'GET' && meta.method !== 'HEAD';
+      const response = await systemFetch(meta.url, {
+        method: meta.method,
+        headers: meta.headers,
+        redirect: meta.redirect,
+        signal: abort.signal,
+        ...(hasBody ? {
+          body: Readable.toWeb(req) as unknown as BodyInit,
+          // Electron/undici accepts streaming bodies even though DOM types do
+          // not expose the Node-specific duplex field.
+          duplex: 'half',
+        } : {}),
+      } as RequestInit);
+      const responseMeta: ChildFetchResponseMeta = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Array.from(response.headers.entries()),
+      };
+      res.writeHead(200, { 'x-orkas-fetch-meta': encodeBridgeMeta(responseMeta) });
+      if (!response.body) {
+        res.end();
+      } else {
+        upstreamBody = response.body as ReadableStream<Uint8Array>;
+        upstreamReadable = Readable.fromWeb(
+          upstreamBody as unknown as import('node:stream/web').ReadableStream,
+        );
+        upstreamReadable
+          .once('error', () => res.destroy())
+          .pipe(res);
+      }
+    } catch (err) {
+      if (!res.headersSent) {
+        log.warn('child fetch bridge request failed', logErrorSummary(err));
+        res.writeHead(502, { 'x-orkas-bridge-error': 'upstream_fetch_failed' });
+        res.end();
+      } else {
+        res.destroy();
+      }
+    }
+  });
+  // The bridge is loopback-only and bodies are streamed. Do not let Node's
+  // five-minute request-body timeout truncate a large/slow connector upload;
+  // headers remain tightly bounded in both size and time.
+  server.requestTimeout = 0;
+  server.headersTimeout = 30_000;
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+  server.unref();
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    server.close();
+    throw new Error('child fetch bridge did not bind a TCP port');
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}/v1/fetch`,
+    token,
+    close: () => new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    }),
+  };
+}
+
+async function ensureChildFetchBridge(): Promise<ChildFetchBridge> {
+  if (!_childFetchBridge) {
+    _childFetchBridge = startChildFetchBridge().catch((err) => {
+      _childFetchBridge = undefined;
+      throw err;
+    });
+  }
+  return _childFetchBridge;
+}
+
+function ensureFetchRouter(): void {
+  if (_fetchRouter) return;
+  const current = globalThis.fetch;
+  if (typeof current !== 'function') throw new Error('global fetch is unavailable');
+  _originalFetchValue = current;
+  _baseFetch = current.bind(globalThis) as FetchLike;
+  _fetchDelegate = _baseFetch;
+  _baseBinaryFetch = createFetchBinary(_baseFetch);
+  _binaryFetchDelegate = _baseBinaryFetch;
+  _fetchRouter = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+    return (_fetchDelegate as FetchLike)(input, init);
+  }) as FetchLike;
+  Object.defineProperty(_fetchRouter, '__orkasProxyFetchRouter', { value: true });
+  globalThis.fetch = _fetchRouter;
+}
+
+function inputUrl(input: Parameters<FetchLike>[0]): URL | undefined {
+  let raw: string;
+  if (typeof input === 'string') raw = input;
+  else if (input instanceof URL) raw = input.href;
+  else if (input && typeof (input as Request).url === 'string') raw = (input as Request).url;
+  else return undefined;
+  try {
+    return new URL(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build the phase-2 delegate. DIRECT HTTP(S) requests retain Node's original
+ * fetch stack. Routes that name a proxy are handed to Electron so Chromium
+ * applies HTTP(S), SOCKS, authentication, and PAC fallbacks. Resolution
+ * failures also use Electron rather than risking an unintended direct leak.
+ *
+ * The small per-origin cache prevents PAC evaluation from becoming a hot-path
+ * cost while keeping runtime proxy changes responsive. Domain-rule proxy
+ * configurations naturally map to the same cache key.
+ */
+/** Per-origin route resolution shared by the header and binary wrappers:
+ *  one PAC evaluation per origin per cache window, bounded origins, and a
+ *  resolution failure that reads as an unsupported route (fail closed). */
+function createProxyRouteResolver(
+  resolveProxy: (url: string) => Promise<string>,
+  routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
+): (url: URL) => Promise<ResolvedProxyRoute> {
+  const cache = new Map<string, { expiresAt: number; route: Promise<ResolvedProxyRoute> }>();
+  return (url: URL) => {
+    const now = Date.now();
+    let entry = cache.get(url.origin);
+    if (!entry || entry.expiresAt <= now) {
+      if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
+        for (const [origin, cached] of cache) {
+          if (cached.expiresAt <= now) cache.delete(origin);
+        }
+        if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
+          const oldestOrigin = cache.keys().next().value as string | undefined;
+          if (oldestOrigin) cache.delete(oldestOrigin);
+        }
+      }
+      const route = resolveProxy(url.href)
+        .then(parseResolvedProxyRoute)
+        .catch(() => ({ kind: 'unsupported', value: 'resolve_failed' }) as ResolvedProxyRoute);
+      entry = { expiresAt: now + Math.max(0, routeCacheMs), route };
+      cache.set(url.origin, entry);
+    }
+    return entry.route;
+  };
+}
+
+export function createSystemProxyFetch(
+  fallbackFetch: FetchLike,
+  systemFetch: FetchLike,
+  resolveProxy: (url: string) => Promise<string>,
+  routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
+): FetchLike {
+  const resolveRoute = createProxyRouteResolver(resolveProxy, routeCacheMs);
+
+  return (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+    const url = inputUrl(input);
+    if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+      return fallbackFetch(input, init);
+    }
+    const route = await resolveRoute(url);
+    return route.kind === 'direct'
+      ? fallbackFetch(input, init)
+      : systemFetch(input, init);
+  }) as FetchLike;
+}
+
+/**
+ * Binary counterpart to `createSystemProxyFetch`. The routing policy is the
+ * same, but the system-proxy branch may use a header-agnostic transport such
+ * as Electron `net.request`.
+ */
+export function createSystemProxyBinaryFetch(
+  fallbackFetch: BinaryFetchLike,
+  systemFetch: BinaryFetchLike,
+  resolveProxy: (url: string) => Promise<string>,
+  routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
+): BinaryFetchLike {
+  const resolveRoute = createProxyRouteResolver(resolveProxy, routeCacheMs);
+
+  return async (rawUrl, options = {}) => {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return fallbackFetch(rawUrl, options);
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return fallbackFetch(rawUrl, options);
+    }
+    const route = await resolveRoute(url);
+    return route.kind === 'direct'
+      ? fallbackFetch(rawUrl, options)
+      : systemFetch(rawUrl, options);
+  };
+}
+
+/** Download bytes through the same direct/environment/system proxy policy as global fetch. */
+async function fetchBinaryWithProxyPolicy(
+  url: string,
+  options: BinaryFetchOptions = {},
+): Promise<BinaryFetchResult> {
+  ensureFetchRouter();
+  return await (_binaryFetchDelegate as BinaryFetchLike)(url, options);
+}
+
+/**
+ * Retry an idempotent binary GET without replaying the operation that produced
+ * it. Callers provide byte validation so a transient CDN HTML/XML body with a
+ * misleading 200 status is retried at the delivery boundary as well.
+ */
+export async function downloadBinaryWithProxyPolicy(
+  url: string,
+  options: BinaryDownloadOptions,
+): Promise<BinaryFetchResult> {
+  return await retryAsync(options.label, async () => {
+    const result = await fetchBinaryWithProxyPolicy(url, options);
+    if (result.status < 200 || result.status >= 300) {
+      throw new BinaryDownloadHttpError(result.status, options.label);
+    }
+    options.validate?.(result.body);
+    return result;
+  }, {
+    retries: options.retries ?? 2,
+    delaysMs: options.delaysMs ?? [500, 1_500],
+    signal: options.signal,
+    isRetriable: (err) => {
+      if (options.signal?.aborted) return false;
+      if (err instanceof BinaryFetchSizeError) return false;
+      if (err instanceof BinaryDownloadHttpError) return isRetriableBinaryDownloadStatus(err.status);
+      return true;
+    },
+  });
+}
+
+/**
+ * Phase 1 — install the stable router and honor explicit launch-environment
+ * proxy settings. This function performs the dispatcher change synchronously
+ * before returning its resolved Promise, so early provider imports cannot race
+ * the environment-proxy setup.
+ */
+export async function installEnvProxyDispatcher(): Promise<boolean> {
+  ensureFetchRouter();
+  const config = envProxyConfig();
+  if (!config.httpProxy && !config.httpsProxy) return false;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EnvHttpProxyAgent, setGlobalDispatcher } = require('undici') as typeof import('undici');
+    setGlobalDispatcher(new EnvHttpProxyAgent({
+      ...(config.httpProxy ? { httpProxy: config.httpProxy } : {}),
+      ...(config.httpsProxy ? { httpsProxy: config.httpsProxy } : {}),
+      noProxy: config.noProxy,
+      ...DISPATCHER_OPTS,
+    }));
+    _envActive = true;
+    _envConfig = config;
+    const routes = [
+      config.httpProxy ? `http=${redact(config.httpProxy)}` : '',
+      config.httpsProxy ? `https=${redact(config.httpsProxy)}` : '',
+    ].filter(Boolean).join(',');
+    _active = `env:${routes}`;
+    log.info('installed environment proxy dispatcher for global fetch', {
+      http_proxy: config.httpProxy ? redact(config.httpProxy) : undefined,
+      https_proxy: config.httpsProxy ? redact(config.httpsProxy) : undefined,
+    });
+    return true;
+  } catch (err) {
+    _envActive = false;
+    _envConfig = undefined;
+    log.warn('env proxy dispatcher install failed; system proxy may still be used after app-ready',
+      logErrorSummary(err));
+    return false;
+  }
+}
+
+/**
+ * Phase 2 — choose the main-process HTTP(S) fetch stack from Electron's
+ * per-origin system-proxy decision. DIRECT keeps Node's original stack;
+ * proxied routes use Chromium, preserving PAC/bypass rules, proxy auth, and
+ * runtime proxy changes.
+ *
+ * `systemFetchOverride` exists for deterministic unit tests; production loads
+ * Electron's net.fetch after app-ready.
+ */
+export async function installSystemProxyDispatcher(
+  systemFetchOverride?: FetchLike,
+  resolveProxyOverride?: (url: string) => Promise<string>,
+): Promise<boolean> {
+  ensureFetchRouter();
+  if (_envActive) return false;
+  if (process.env.ORKAS_NO_AUTO_PROXY === '1') {
+    log.info('auto system-proxy routing disabled (ORKAS_NO_AUTO_PROXY=1)');
+    return false;
+  }
+  try {
+    let systemFetch = systemFetchOverride;
+    let resolveProxy = resolveProxyOverride;
+    if (!systemFetch) {
+      systemFetch = await electronSystemFetch();
+    }
+    if (!resolveProxy) {
+      const { session } = await import('electron');
+      resolveProxy = (url: string) => session.defaultSession.resolveProxy(url);
+    }
+    _fetchDelegate = createSystemProxyFetch(_baseFetch as FetchLike, systemFetch, resolveProxy);
+    _binaryFetchDelegate = createSystemProxyBinaryFetch(
+      _baseBinaryFetch as BinaryFetchLike,
+      electronSystemBinaryFetch,
+      resolveProxy,
+    );
+    _uploadRoute = createProxyRouteResolver(resolveProxy);
+    _active = 'system:per-request';
+    log.info('installed per-request Electron system-proxy routing for global fetch');
+    return true;
+  } catch (err) {
+    log.warn('system proxy routing install failed; leaving global fetch on its previous route',
+      logErrorSummary(err));
+    return false;
+  }
+}
+
+/** Current route summary; proxy credentials and full URLs are never exposed. */
+export function activeProxy(): string | undefined {
+  return _active;
+}
+
+/** Test-only: restore the global fetch value that preceded the stable router. */
+export function _resetProxyRoutingForTests(): void {
+  if (_fetchRouter && globalThis.fetch === _fetchRouter && _originalFetchValue) {
+    globalThis.fetch = _originalFetchValue;
+  }
+  _active = undefined;
+  _envActive = false;
+  _envConfig = undefined;
+  _originalFetchValue = undefined;
+  _baseFetch = undefined;
+  _fetchDelegate = undefined;
+  _fetchRouter = undefined;
+  _baseBinaryFetch = undefined;
+  _binaryFetchDelegate = undefined;
+  _uploadRoute = undefined;
+  if (_childFetchBridge) {
+    void _childFetchBridge.then(({ close }) => close()).catch(() => undefined);
+    _childFetchBridge = undefined;
+  }
+}

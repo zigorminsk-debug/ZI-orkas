@@ -1,0 +1,706 @@
+/**
+ * External providers — factories for chat providers with app-specific ids
+ * and endpoint configuration.
+ *
+ * Each factory hand-builds a pi-ai `Model<TApi>` object and passes it to
+ * `createPiProvider({ customModel })`. That route bypasses pi-ai's
+ * `getModel()` catalog (which would throw for unknown providers) but still
+ * reuses pi-ai's API dispatcher — the `api` field on the Model
+ * (`"openai-completions"` / `"anthropic-messages"`) tells pi-ai which
+ * provider-side implementation to use.
+ *
+ * ## Currently registered
+ *
+ *   moonshot → https://api.moonshot.cn/v1
+ *     OpenAI-compatible, pay-as-you-go "open platform" account.
+ *     Independent from pi-ai's `kimi-coding` provider, which hits
+ *     `api.kimi.com/coding` and requires a Kimi Coding Plan subscription.
+ *
+ *   deepseek → https://api.deepseek.com/v1
+ *     OpenAI-compatible. pi-ai 0.68.1 only carries DeepSeek models inside
+ *     the OpenRouter aggregate; direct billing requires this adapter.
+ *
+ *   doubao → https://ark.cn-beijing.volces.com/api/v3
+ *     OpenAI-compatible (Volcengine Ark). User must create a "model
+ *     endpoint" (endpoint id) in the ark console and use that id as the
+ *     model — the curated list is just a hint.
+ *
+ * ## Adding a new external provider
+ *
+ *   1. Export a factory `createXxxProvider({ apiKey, modelId })` here.
+ *   2. Add its id to `EXTERNAL_API_PROVIDERS` in `provider_catalog.ts`.
+ *   3. Add a CATALOG entry + `CURATED_MODELS[id]` entries (and a
+ *      `subscriptionNote` if users might confuse it with another brand's
+ *      endpoint).
+ *   4. Route to the factory from `runner.ts::buildExternalProvider` and
+ *      `auth.ts::testConnection`.
+ */
+
+import type { LLMProvider } from '#core-agent';
+import type { Model } from '@earendil-works/pi-ai';
+import { isBearerTokenHeaderSafe } from '../../util/http-authorization';
+import {
+  curatedModelsFor,
+  getConfiguredOpenAICompatibleProvider,
+  modelInputFromConfiguredCapabilities,
+  type CustomOpenAICompatibleRuntimeConfig,
+} from '../provider_catalog';
+import { repairOpenAIToolMessageOrder } from './openai-payload';
+import { createCustomOutputLimitCompatibility } from './custom-output-limit';
+import {
+  buildZiCommanderModel,
+  createZiCommanderProvider,
+  ZI_COMMANDER_PROVIDER,
+} from '../autonomous-commander';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
+
+export { buildZiCommanderModel, createZiCommanderProvider, ZI_COMMANDER_PROVIDER };
+
+// core-agent is an ESM package and the Orkas main process is CJS, so
+// **static import is not allowed**. Reuse the dynamic-import + lazy cache
+// pattern from runner.ts / session-store.ts.
+type CA = typeof import('#core-agent');
+let _caPromise: Promise<CA> | null = null;
+function ca(): Promise<CA> {
+  if (!_caPromise) _caPromise = import('#core-agent') as Promise<CA>;
+  return _caPromise;
+}
+
+function configuredPositiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? value
+    : fallback;
+}
+
+/**
+ * OpenAI-compatible endpoints do not expose a portable capability-discovery
+ * API. Treat unknown custom models as multimodal so attached images reach new
+ * models without a client release, while retaining a narrow list of official
+ * DeepSeek aliases that are documented as text-only. Dated snapshots and the
+ * official `[1m]` alias share the same capability; names containing an
+ * explicit vision variant intentionally do not match.
+ */
+const KNOWN_TEXT_ONLY_OPENAI_COMPATIBLE_MODELS = [
+  /^deepseek-(?:chat|reasoner)$/i,
+  /^deepseek-v4-(?:pro|flash)(?:-\d{4,8})?(?:\[[^\]]+\])?$/i,
+];
+
+function openAICompatibleModelSupportsImages(
+  modelId: string,
+  declared: boolean | undefined,
+  unknownDefault: boolean,
+): boolean {
+  const leafId = String(modelId || '').trim().split('/').pop()?.split(':', 1)[0] || '';
+  if (KNOWN_TEXT_ONLY_OPENAI_COMPATIBLE_MODELS.some((pattern) => pattern.test(leafId))) {
+    return false;
+  }
+  return declared ?? unknownDefault;
+}
+
+function configuredModelVisionDeclaration(model: {
+  supportsVision?: boolean;
+  maxInputImages?: number;
+} | undefined): boolean | undefined {
+  if (typeof model?.supportsVision === 'boolean') return model.supportsVision;
+  if (typeof model?.maxInputImages === 'number') return model.maxInputImages > 0;
+  return undefined;
+}
+
+export function repairOpenAICompatiblePayload(params: unknown): unknown {
+  return repairOpenAIToolMessageOrder(params);
+}
+
+export function repairDeepSeekPayload(params: unknown): unknown {
+  return repairOpenAIToolMessageOrder(params);
+}
+
+
+/** Remove an output limit the host added from its own model-default
+ * reservation so selected providers can apply their native output default. */
+function omitReservedOutputLimit(
+  params: unknown,
+  reservation: number | undefined,
+  outputLimitSource: unknown,
+): unknown {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return params;
+  if (!Number.isFinite(reservation) || Number(reservation) <= 0) return params;
+  if (outputLimitSource !== 'model_default') return params;
+  const reserved = Math.trunc(Number(reservation));
+  const payload = params as Record<string, unknown>;
+  const keys = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
+    .filter((key) => payload[key] === reserved);
+  if (!keys.length) return params;
+  const result = { ...payload };
+  for (const key of keys) delete result[key];
+  return result;
+}
+
+const PROVIDER_DEFAULT_OUTPUT_LIMIT_PROVIDERS: ReadonlySet<string> = new Set(['openai', 'openai-codex']);
+
+type PayloadHookModel = { api?: string; id?: string; provider?: string; maxTokens?: number };
+
+export function omitReservedOutputLimitForProvider(
+  providerId: string,
+  inner: (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown,
+): (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown {
+  if (!PROVIDER_DEFAULT_OUTPUT_LIMIT_PROVIDERS.has(providerId)) return inner;
+  return (params, model, requestMetadata) => {
+    const metadata = requestMetadata && typeof requestMetadata === 'object' && !Array.isArray(requestMetadata)
+      ? requestMetadata as Record<string, unknown>
+      : {};
+    return inner(omitReservedOutputLimit(params, model?.maxTokens, metadata.outputLimitSource), model, requestMetadata);
+  };
+}
+
+// ── ZI-Commander autonomous adapter (legacy orkas-api callers redirect here) ──
+
+export function buildOrkasApiModel(modelId: string): Model<'openai-completions'> {
+  return buildZiCommanderModel(modelId) as Model<'openai-completions'>;
+}
+
+export async function createOrkasApiProvider(config: {
+  apiKey?: string;
+  modelId: string;
+  userCacheKey?: string;
+  usageContext?: OrkasApiUsageContext;
+}): Promise<LLMProvider> {
+  void curatedModelsFor;
+  return createZiCommanderProvider({ modelId: config.modelId });
+}
+
+// ── Moonshot open-platform (https://api.moonshot.cn/v1) ─────────────────
+
+const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
+
+/**
+ * Context windows by Moonshot model id. Numbers come from
+ * platform.kimi.com/docs/models (checked 2026-06). Fallback 131072 for
+ * ids we haven't catalogued — safe lower bound given every current kimi
+ * model is at least 128k. K3 uses the host-selected decimal 1M window.
+ * Legacy K2 preview ids still resolve via fallback
+ * if a stale credential references them.
+ */
+const MOONSHOT_CONTEXT_WINDOW: Record<string, number> = {
+  'kimi-k3': 1_000_000,
+  'kimi-k2.7-code': 262144,
+  'kimi-k2.7-code-highspeed': 262144,
+  'kimi-k2.6': 262144,
+  'kimi-k2.5': 262144,
+};
+
+function moonshotContextWindow(modelId: string): number {
+  return MOONSHOT_CONTEXT_WINDOW[modelId] ?? 131072;
+}
+
+// Per-model max output tokens. Why this needs a per-model table: pi-ai's
+// `simple-options.buildBaseOptions` reads `model.maxTokens` as the default
+// `max_tokens` request param and fits it to the remaining context; a single
+// hard-coded value caps every model at the lowest common denominator and complex
+// structured replies get cut mid-stream with `stopReason: "length"` while
+// the renderer just shows whatever streamed before the cap. Numbers from
+// platform.kimi.com/docs/models (2026-06). Unknown ids fall back to 8192
+// to stay safe against providers that 400 on over-cap requests.
+const MOONSHOT_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'kimi-k3': 131072,
+  'kimi-k2.7-code': 32768,
+  'kimi-k2.7-code-highspeed': 32768,
+  'kimi-k2.6': 32768,
+  'kimi-k2.5': 16384,
+};
+
+function moonshotMaxOutputTokens(modelId: string): number {
+  return MOONSHOT_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
+// K3 was added to pi-ai in 0.80.9. Keep this small local fallback so the
+// synchronous catalog/window path remains accurate, but use pi-ai's native
+// model at runtime (see buildRuntimeMoonshotModel) so future protocol changes
+// do not have to be mirrored here before requests can work.
+const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
+  Model<'openai-completions'>,
+  'reasoning' | 'thinkingLevelMap' | 'input' | 'compat'
+> = {
+  reasoning: true,
+  thinkingLevelMap: {
+    off: null,
+    minimal: null,
+    low: null,
+    medium: null,
+    high: null,
+    xhigh: null,
+    max: 'max',
+  },
+  input: ['text', 'image'],
+  compat: {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: false,
+    maxTokensField: 'max_tokens',
+    supportsStrictMode: false,
+    thinkingFormat: 'deepseek',
+    requiresReasoningContentOnAssistantMessages: true,
+    supportsMidConvoSystemMessages: true,
+    supportsMidConvoToolAdditions: true,
+  },
+};
+
+type PiBuiltinCatalog = typeof import('@earendil-works/pi-ai/providers/all');
+let _piBuiltinCatalogPromise: Promise<PiBuiltinCatalog> | null = null;
+function piBuiltinCatalog(): Promise<PiBuiltinCatalog> {
+  if (!_piBuiltinCatalogPromise) {
+    _piBuiltinCatalogPromise = import('@earendil-works/pi-ai/providers/all');
+  }
+  return _piBuiltinCatalogPromise;
+}
+
+/**
+ * Build a `Model<"openai-completions">` object for a Moonshot model.
+ * Exported for tests — production code usually goes through
+ * `createMoonshotProvider()`.
+ */
+export function buildMoonshotModel(
+  modelId: string,
+  nativeModel?: Model<'openai-completions'>,
+): Model<'openai-completions'> {
+  // Server model_catalog metadata is authoritative when present. The local
+  // tables remain conservative fallbacks for offline/stale configurations.
+  const curated = curatedModelsFor('moonshot').find((m) => m.id === modelId);
+  const fallbackProtocol = modelId === 'kimi-k3' ? MOONSHOT_K3_PROTOCOL_FALLBACK : null;
+  const protocol = nativeModel || fallbackProtocol;
+  return {
+    id: modelId,
+    name: curated?.name || modelId,
+    api: 'openai-completions',
+    // `Provider` in pi-ai accepts arbitrary strings (not just KnownProvider)
+    // so using a custom id here is supported.
+    provider: 'moonshot' as any,
+    baseUrl: MOONSHOT_BASE_URL,
+    reasoning: protocol?.reasoning ?? false,
+    ...(protocol?.thinkingLevelMap
+      ? { thinkingLevelMap: { ...protocol.thinkingLevelMap as object } }
+      : {}),
+    input: modelInputFromConfiguredCapabilities(
+      protocol ? [...protocol.input] : ['text', 'image'],
+      curated,
+    ),
+    // The Moonshot open platform bills per token, but pi-ai's `cost`
+    // field is only used for local cost-statistics display and does not
+    // affect the actual request. Filling 0 means "not accounted for here";
+    // users check the actual price on their Moonshot bill.
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, moonshotMaxOutputTokens(modelId)),
+    ...(nativeModel?.headers ? { headers: { ...nativeModel.headers } } : {}),
+    ...(protocol?.compat ? { compat: { ...protocol.compat } } : {}),
+  };
+}
+
+/** Build the request-time model with pi-ai's native Moonshot protocol data. */
+export async function buildRuntimeMoonshotModel(modelId: string): Promise<Model<'openai-completions'>> {
+  const catalog = await piBuiltinCatalog();
+  const nativeModel = (catalog.getBuiltinModel as (
+    providerId: string,
+    requestedModelId: string,
+  ) => Model<'openai-completions'> | undefined)('moonshotai-cn', modelId);
+  return buildMoonshotModel(modelId, nativeModel);
+}
+
+export interface CreateMoonshotProviderConfig {
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+/**
+ * Build an LLMProvider wired to the Moonshot open-platform endpoint.
+ *
+ * Async because core-agent is loaded on-demand (ESM from CJS main).
+ * Calling this does NOT talk to the network — it just wires a pi-ai
+ * provider wrapper around our hand-built Model. First network request
+ * is deferred until the returned provider's `complete` / `stream` is
+ * invoked.
+ */
+export async function createMoonshotProvider(config: CreateMoonshotProviderConfig): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('moonshot: apiKey required');
+  if (!config.modelId) throw new Error('moonshot: modelId required');
+  const [mod, model] = await Promise.all([
+    ca(),
+    buildRuntimeMoonshotModel(config.modelId),
+  ]);
+  return mod.createPiProvider({
+    provider: 'moonshot',
+    apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
+// ── DeepSeek (https://api.deepseek.com/v1) ──────────────────────────────
+
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
+
+// Match pi-ai's current direct DeepSeek window: 1M means 1,000,000 tokens.
+// Legacy V4 Flash ids retain that capacity through the host fallback;
+// unknown ids retain the conservative 131072 window.
+const DEEPSEEK_CONTEXT_WINDOW: Record<string, number> = {
+  'deepseek-flash':              1_000_000,
+  'deepseek-v4-pro':              1_000_000,
+  'deepseek-v4-flash-vision-exp': 1_000_000,
+  'deepseek-v4-flash':            1_000_000,
+};
+
+function deepseekContextWindow(modelId: string): number {
+  return DEEPSEEK_CONTEXT_WINDOW[modelId] ?? 131072;
+}
+
+// The host's output reservation for V4 Pro, Flash (including V4.1) and Flash
+// Vision Exp — not DeepSeek's 384K ceiling. It is subtracted from the window
+// when deriving input budgets, and on main turns it is dropped from the wire
+// (`repairDeepSeekRequest`) so DeepSeek applies its own mode default: 8K
+// non-thinking, 64K thinking, 128K at reasoning_effort=max. 128K covers the
+// largest of those. Reserving the 384K ceiling left a third of the 1M window
+// idle for output no turn ever produced. Unknown/legacy ids keep 8192.
+const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'deepseek-flash':              128_000,
+  'deepseek-v4-pro':              128_000,
+  'deepseek-v4-flash-vision-exp': 128_000,
+  'deepseek-v4-flash':            128_000,
+};
+
+function deepseekMaxOutputTokens(modelId: string): number {
+  return DEEPSEEK_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
+export function buildDeepSeekModel(modelId: string): Model<'openai-completions'> {
+  const curated = curatedModelsFor('deepseek').find((m) => m.id === modelId);
+  const configuredVision = configuredModelVisionDeclaration(curated);
+  return {
+    id: modelId,
+    name: curated?.name || modelId,
+    api: 'openai-completions',
+    provider: 'deepseek' as any,
+    baseUrl: DEEPSEEK_BASE_URL,
+    // Keep the known Flash/V4 families reasoning-capable. The core adapter
+    // retains explicit choices and removes SDK-synthesized off controls only
+    // when the caller left thinking at the provider default.
+    reasoning: modelId === 'deepseek-flash' || /^deepseek-v4-/.test(modelId),
+    // Official Pro/Flash aliases remain text-only. Flash Vision and remotely
+    // configured models can declare supportsVision explicitly; an omitted
+    // declaration defaults to visual for parity with user-defined endpoints.
+    input: openAICompatibleModelSupportsImages(modelId, configuredVision, true)
+      ? ['text', 'image']
+      : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
+    // DeepSeek manages context caching itself and rejects OpenAI cache keys.
+    compat: { supportsLongCacheRetention: false },
+  };
+}
+
+export interface CreateDeepSeekProviderConfig {
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfig): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('deepseek: apiKey required');
+  if (!config.modelId) throw new Error('deepseek: modelId required');
+  const mod = await ca();
+  const model = buildDeepSeekModel(config.modelId);
+  return mod.createPiProvider({
+    provider: 'deepseek',
+    apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
+    customModel: model,
+    // The core adapter fills missing tool-turn reasoning after SDK conversion.
+    // Preserve the caller's thinking/effort; this hook owns output limits and
+    // existing tool-receipt ordering only.
+    onPayload: repairDeepSeekRequest,
+  });
+}
+
+// ── Doubao / Volcengine Ark (https://ark.cn-beijing.volces.com/api/v3) ───
+
+const DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
+
+// Seed 2.0 keeps its 256K window; September Seed 2.1 Pro uses the host-selected
+// decimal 1M. Endpoint ids (ep-xxxx) and unknown models use the conservative
+// 131072 fallback when the catalog does not provide a window.
+const DOUBAO_CONTEXT_WINDOW: Record<string, number> = {
+  'doubao-seed-2-1-pro-260915': 1_000_000,
+  'doubao-seed-2-0-pro-260215':  262144,
+  'doubao-seed-2-0-lite-260215': 262144,
+  'doubao-seed-2-0-lite-260428': 262144,
+};
+
+function doubaoContextWindow(modelId: string): number {
+  return DOUBAO_CONTEXT_WINDOW[modelId] ?? 131072;
+}
+
+// Host output reservations vary by dated model id. Endpoint ids (ep-xxxx)
+// use the conservative 8192 fallback to avoid upstream 400s.
+const DOUBAO_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'doubao-seed-2-1-pro-260915': 32768,
+  'doubao-seed-2-0-pro-260215':  16384,
+  'doubao-seed-2-0-lite-260215': 16384,
+  'doubao-seed-2-0-lite-260428': 32768,
+};
+
+function doubaoMaxOutputTokens(modelId: string): number {
+  return DOUBAO_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
+export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
+  const curated = curatedModelsFor('doubao').find((m) => m.id === modelId);
+  return {
+    id: modelId,
+    name: curated?.name || modelId,
+    api: 'openai-completions',
+    provider: 'doubao' as any,
+    baseUrl: DOUBAO_BASE_URL,
+    // Seed 2.0 Pro defaults to the reasoning channel; Lite is the
+    // non-reasoning budget tier. Seed 1.x distinguished reasoning via a
+    // `-thinking-` suffix, but Seed 2.0 switched to per-tier naming —
+    // we recognize both naming schemes for compatibility.
+    reasoning: /-pro-/.test(modelId) || /thinking/.test(modelId),
+    // Volcengine Ark's OpenAI-compatible endpoint only accepts
+    // system/assistant/user/tool; pi-ai by default auto-enables OpenAI's
+    // developer role for unknown providers, which Ark rejects with a
+    // 400. Disable it explicitly.
+    compat: { supportsDeveloperRole: false },
+    input: modelInputFromConfiguredCapabilities(['text', 'image'], curated),
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, doubaoContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, doubaoMaxOutputTokens(modelId)),
+  };
+}
+
+export interface CreateDoubaoProviderConfig {
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('doubao: apiKey required');
+  if (!config.modelId) throw new Error('doubao: modelId required');
+  const mod = await ca();
+  const model = buildDoubaoModel(config.modelId);
+  return mod.createPiProvider({
+    provider: 'doubao',
+    apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
+// ── User-configured endpoint ──────────────────────────
+
+export interface CreateCustomOpenAICompatibleProviderConfig
+  extends CustomOpenAICompatibleRuntimeConfig {
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+export function buildCustomOpenAICompatibleModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'openai-completions'> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: 'openai-completions',
+    provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning ?? !!config.reasoningEffort,
+    // Custom gateways own model aliases and image handling. Preserve their
+    // declaration instead of inferring capability from an official model name.
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+    // The custom contract deliberately targets the broadly supported Chat
+    // Completions subset. Provider-specific roles, storage flags, strict tool
+    // schemas, and reasoning controls require a curated adapter instead.
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsReasoningEffort: !!config.reasoningEffort,
+      supportsStrictMode: false,
+      // The SDK otherwise assumes unknown endpoints support OpenAI's 24h
+      // cache extension, which strict Chat-compatible gateways reject.
+      supportsLongCacheRetention: false,
+    },
+  };
+}
+
+export function buildCustomAnthropicModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'anthropic-messages'> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: 'anthropic-messages',
+    provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning === true,
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+  };
+}
+
+export const KEYLESS_CUSTOM_API_KEY = 'local-no-key';
+
+export async function createCustomOpenAICompatibleProvider(
+  config: CreateCustomOpenAICompatibleProviderConfig,
+): Promise<LLMProvider> {
+  const effectiveKey = String(config.apiKey || '').trim() || KEYLESS_CUSTOM_API_KEY;
+  if (!isBearerTokenHeaderSafe(effectiveKey)) {
+    throw Object.assign(
+      new Error(
+        'Custom model has an invalid API key for HTTP Authorization headers. Re-enter it in Settings.',
+      ),
+      { code: 'CUSTOM_API_KEY_INVALID' },
+    );
+  }
+  if (!config.modelId) throw new Error('custom: modelId required');
+  if (!config.baseUrl) throw new Error('custom: baseUrl required');
+  const mod = await ca();
+  const isAnthropic = config.protocol === 'anthropic';
+  const isResponses = config.protocol === 'responses';
+  const compatibility = isAnthropic || isResponses ? null : createCustomOutputLimitCompatibility(config);
+  const isKeyless = effectiveKey === KEYLESS_CUSTOM_API_KEY;
+  const stripAuthFetch = (baseFetch: typeof fetch): typeof fetch => async (input, init) => {
+    if (!init?.headers) return baseFetch(input, init);
+    const h = new Headers(init.headers as HeadersInit);
+    h.delete('authorization');
+    h.delete('x-api-key');
+    return baseFetch(input, { ...init, headers: h });
+  };
+  const wrapFetch = isKeyless
+    ? (inner: typeof fetch) => {
+        const stripped = stripAuthFetch(inner);
+        return compatibility ? compatibility.wrapFetch(stripped) : stripped;
+      }
+    : compatibility?.wrapFetch;
+  return mod.createPiProvider({
+    provider: 'custom',
+    apiKey: effectiveKey,
+    userCacheKey: config.userCacheKey,
+    customModel: isAnthropic
+      ? buildCustomAnthropicModel(config.modelId, config)
+      : isResponses ? buildCustomResponsesModel(config.modelId, config)
+        : buildCustomOpenAICompatibleModel(config.modelId, config),
+    normalizeLiteralLeadingThinkText: !isAnthropic && !isResponses,
+    ...(compatibility ? {
+      onPayload: (payload: unknown) => compatibility.onPayload(repairOpenAICompatiblePayload(payload)),
+    } : {}),
+    ...(wrapFetch ? { wrapFetch } : {}),
+    ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
+  });
+}
+
+export function buildCustomResponsesModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'openai-responses'> {
+  return {
+    id: modelId, name: modelId, api: 'openai-responses', provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: config.supportsReasoning ?? !!config.reasoningEffort,
+    input: config.supportsVision === false ? ['text'] : ['text', 'image'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow, maxTokens: config.maxTokens,
+    // Responses otherwise normalizes omitted strictness. Keep ordinary tools
+    // explicitly non-strict so optional fields retain their executor contract.
+    compat: { supportsStrictMode: true, supportsLongCacheRetention: false },
+  };
+}
+
+const CONFIGURED_OPENAI_CONTEXT_WINDOW = 131_072;
+
+const CONFIGURED_OPENAI_MAX_TOKENS = 32_768;
+
+export function buildConfiguredOpenAICompatibleModel(
+  providerId: string,
+  modelId: string,
+): Model<'openai-completions'> | null {
+  const provider = getConfiguredOpenAICompatibleProvider(providerId);
+  const model = curatedModelsFor(providerId).find((entry) => entry.id === modelId);
+  if (!provider || !model) return null;
+  return {
+    id: modelId,
+    name: model.name || modelId,
+    api: 'openai-completions',
+    provider: providerId as any,
+    baseUrl: provider.baseUrl,
+    reasoning: false,
+    input: openAICompatibleModelSupportsImages(
+      modelId,
+      configuredModelVisionDeclaration(model),
+      true,
+    )
+      ? ['text', 'image']
+      : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(model.contextWindow, CONFIGURED_OPENAI_CONTEXT_WINDOW),
+    maxTokens: configuredPositiveInteger(model.maxTokens, CONFIGURED_OPENAI_MAX_TOKENS),
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: 'max_tokens',
+    },
+  };
+}
+
+export interface CreateConfiguredOpenAICompatibleProviderConfig {
+  providerId: string;
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+export async function createConfiguredOpenAICompatibleProvider(
+  config: CreateConfiguredOpenAICompatibleProviderConfig,
+): Promise<LLMProvider> {
+  if (!config.providerId) throw new Error('configured provider: providerId required');
+  if (!config.apiKey) throw new Error(`${config.providerId}: apiKey required`);
+  if (!isBearerTokenHeaderSafe(config.apiKey)) {
+    throw Object.assign(
+      new Error('Configured provider has an invalid API key for HTTP Authorization headers.'),
+      { code: 'API_KEY_INVALID' },
+    );
+  }
+  if (!config.modelId) throw new Error(`${config.providerId}: modelId required`);
+  const model = buildConfiguredOpenAICompatibleModel(config.providerId, config.modelId);
+  if (!model) throw new Error(`${config.providerId}: model is not configured`);
+  const mod = await ca();
+  return mod.createPiProvider({
+    provider: config.providerId,
+    apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
+export function repairDeepSeekRequest(
+  params: unknown,
+  model: { maxTokens?: number } | undefined,
+  requestMetadata?: unknown,
+): unknown {
+  const metadata = requestMetadata && typeof requestMetadata === 'object' && !Array.isArray(requestMetadata)
+    ? requestMetadata as Record<string, unknown>
+    : {};
+  return repairDeepSeekPayload(omitReservedOutputLimit(params, model?.maxTokens, metadata.outputLimitSource));
+}

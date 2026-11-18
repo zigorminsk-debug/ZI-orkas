@@ -1,0 +1,755 @@
+/**
+ * Pure builders that translate structured tool input into OfficeCLI `batch`
+ * command arrays. Kept dependency-free so they are unit-testable without
+ * dragging in the heavy tool/feature graph. The array is serialized to JSON
+ * and piped to `officecli batch <file>` over stdin (one open/save cycle).
+ *
+ * Op shapes are exactly what `officecli` consumes (verified via `dump` and live
+ * runs against the checksum-pinned v1.0.139):
+ *   - docx / pptx body content → `add` ops: {command,parent,type,props}
+ *   - xlsx cells               → `set` ops: {command,path,props}
+ */
+
+export type OfficeBatchOp =
+  | { command: 'add'; parent: string; type: string; props: Record<string, string> }
+  | { command: 'set'; path: string; props: Record<string, string> }
+  | { command: 'remove'; path: string };
+
+/**
+ * Serialize batch commands as ASCII-only JSON. On Windows, hidden console
+ * processes can receive a truncated UTF-8 stdin payload through Node's child
+ * process pipe. JSON `\uXXXX` escapes preserve the exact Unicode content while
+ * keeping the transport byte-for-byte ASCII and avoiding that runtime bug.
+ */
+export function serializeOfficeBatch(operations: readonly unknown[]): string {
+  return JSON.stringify(operations).replace(
+    /[\u007f-\uffff]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
+/**
+ * Copy every key of `src` not in `skip` into `props`, coercing the value to
+ * OfficeCLI's on-the-wire string form: drops null / undefined / '' (an empty
+ * value is never meaningful at create time), bools → "true"/"false", numbers →
+ * decimal string, and a leading '=' on `formula` is stripped (OfficeCLI wants
+ * it without). A key already present in `props` is left untouched, so the
+ * structural fields each builder sets explicitly win over a passthrough of the
+ * same name. This is what lets `create_*` reach the engine's full property
+ * surface (fill / color / font / size / borders / shape geometry …) instead of
+ * the narrow placeholder subset the structural fields cover.
+ */
+function addPassthrough(
+  props: Record<string, string>,
+  src: Record<string, unknown>,
+  skip: ReadonlySet<string>,
+): void {
+  for (const [k, v] of Object.entries(src)) {
+    if (skip.has(k) || k in props) continue;
+    if (v === null || v === undefined || v === '') continue;
+    props[k] = k === 'formula' ? String(v).replace(/^=/, '') : String(v);
+  }
+}
+
+/** A shared empty skip-set: pass every key straight through. Used where a spec
+ *  has no structural fields of its own — shapes, pictures, columns. */
+const PASS_ALL: ReadonlySet<string> = new Set();
+
+/** Dimensions of a cell grid: row count + the widest row's column count.
+ *  Non-array rows count as empty (0 columns). */
+function gridDims(rows: readonly unknown[]): { rowCount: number; colCount: number } {
+  let colCount = 0;
+  for (const row of rows) if (Array.isArray(row) && row.length > colCount) colCount = row.length;
+  return { rowCount: rows.length, colCount };
+}
+
+// ── Word ────────────────────────────────────────────────────────────────
+
+/** One body paragraph for a Word document. Beyond the structural fields, any
+ *  extra key is passed straight through to OfficeCLI's `add p` as a
+ *  run/paragraph property (`bold`, `italic`, `font`, `size`, `color`,
+ *  `underline`, `highlight`, …), so styled text is expressible at create time. */
+export type DocxParagraphSpec = {
+  /** Paragraph text. Required; entries without a string `text` are dropped. */
+  text: string;
+  /** Paragraph style id, e.g. `Heading1`, `Heading2`, `Normal`, `Quote`. */
+  style?: string;
+  /** Horizontal alignment. */
+  align?: 'left' | 'center' | 'right' | 'justify';
+  /** Turn the paragraph into a list item. */
+  list?: 'bullet' | 'ordered';
+  /** Passthrough OfficeCLI run/paragraph props (bold, font, size, color, …). */
+  [key: string]: unknown;
+};
+
+/** Structural docx keys handled explicitly below — excluded from passthrough so
+ *  `list` (→ `listStyle`) isn't also forwarded verbatim. */
+const DOCX_STRUCTURAL = new Set(['text', 'style', 'align', 'list']);
+
+/** A docx body table: a grid of cell text plus optional table props. `rows` is
+ *  a grid of cells; any extra key (`colWidths`, `align`, `layout`, …) is passed
+ *  through to OfficeCLI's `add table`. */
+export type DocxTableSpec = {
+  rows: readonly (readonly (string | number | null | undefined)[])[];
+  colWidths?: string;
+  [key: string]: unknown;
+};
+
+/** A docx body image. `src` is the file path (the tool layer resolves it to an
+ *  absolute, sandbox-checked path before this runs); `align` styles the host
+ *  paragraph, every other key (`width`, `height`, `crop`, …) goes to the
+ *  picture. */
+export type DocxImageSpec = {
+  src: string;
+  width?: string | number;
+  height?: string | number;
+  align?: string;
+  [key: string]: unknown;
+};
+
+/** `rows` is the grid (not the engine's int `rows` prop) and `align` lands on
+ *  the host paragraph — both excluded from the respective passthrough. */
+const DOCX_TABLE_STRUCTURAL = new Set(['rows']);
+const DOCX_IMAGE_STRUCTURAL = new Set(['src', 'align']);
+
+/**
+ * Build the `batch` ops for a docx body, in order: `paragraphs`, then `tables`,
+ * then `images`. Non-object entries and paragraphs without a string `text` are
+ * skipped (the LLM occasionally emits a stray null / wrong-typed item). `align`
+ * maps to the paragraph `align` prop and `list` to `listStyle`; every other
+ * paragraph key is passed through as a run/paragraph style prop.
+ *
+ * A table emits `add table {rows,cols}` then one `set` per non-empty cell at
+ * `/body/table[K]/tr[i]/tc[j]/p[1]` (K = 1-based table index — `table[N]` counts
+ * only tables). An image emits a host `add p` then `add picture` under it; the
+ * paragraph index is tracked across paragraphs + image hosts (a fresh docx has
+ * zero body paragraphs, and `p[N]` counts only paragraphs, so tables in between
+ * don't shift it).
+ */
+export function buildDocxBatch(
+  paragraphs: readonly DocxParagraphSpec[],
+  tables: readonly DocxTableSpec[] = [],
+  images: readonly DocxImageSpec[] = [],
+): OfficeBatchOp[] {
+  const ops: OfficeBatchOp[] = [];
+  let paraCount = 0;
+  let tableCount = 0;
+
+  for (const p of paragraphs) {
+    if (!p || typeof p.text !== 'string') continue;
+    const props: Record<string, string> = { text: p.text };
+    if (typeof p.style === 'string' && p.style) props.style = p.style;
+    if (typeof p.align === 'string' && p.align) props.align = p.align;
+    if (p.list === 'bullet' || p.list === 'ordered') props.listStyle = p.list;
+    addPassthrough(props, p, DOCX_STRUCTURAL);
+    ops.push({ command: 'add', parent: '/body', type: 'p', props });
+    paraCount += 1;
+  }
+
+  for (const t of tables) {
+    if (!t || !Array.isArray(t.rows)) continue;
+    const { rowCount, colCount } = gridDims(t.rows);
+    if (!rowCount || !colCount) continue;
+    const tProps: Record<string, string> = { rows: String(rowCount), cols: String(colCount) };
+    addPassthrough(tProps, t, DOCX_TABLE_STRUCTURAL);
+    ops.push({ command: 'add', parent: '/body', type: 'table', props: tProps });
+    tableCount += 1;
+    t.rows.forEach((row, i) => {
+      if (!Array.isArray(row)) return;
+      row.forEach((cell, j) => {
+        if (cell === null || cell === undefined || cell === '') return;
+        ops.push({ command: 'set', path: `/body/table[${tableCount}]/tr[${i + 1}]/tc[${j + 1}]/p[1]`, props: { text: String(cell) } });
+      });
+    });
+  }
+
+  for (const img of images) {
+    if (!img || typeof img.src !== 'string' || !img.src) continue;
+    const hostProps: Record<string, string> = {};
+    if (typeof img.align === 'string' && img.align) hostProps.align = img.align;
+    ops.push({ command: 'add', parent: '/body', type: 'p', props: hostProps });
+    paraCount += 1;
+    const picProps: Record<string, string> = { src: img.src };
+    addPassthrough(picProps, img, DOCX_IMAGE_STRUCTURAL);
+    ops.push({ command: 'add', parent: `/body/p[${paraCount}]`, type: 'picture', props: picProps });
+  }
+
+  return ops;
+}
+
+// ── Excel ───────────────────────────────────────────────────────────────
+
+/** A spreadsheet cell: a bare value, or an object for formulas / formatting.
+ *  The object form passes any extra key straight through to OfficeCLI's cell
+ *  `set` (`fill`, `font.color`, `font.size`, `italic`, `underline`, `halign`,
+ *  `valign`, `wrap`, `border`, `merge`, …), so styled cells are expressible at
+ *  create time. */
+export type XlsxCellProperties = {
+  value?: string | number | boolean;
+  formula?: string;
+  format?: string;
+  bold?: boolean;
+  [key: string]: unknown;
+};
+
+export type XlsxCell = string | number | boolean | XlsxCellProperties;
+
+/** Structural xlsx cell keys handled explicitly below — excluded from
+ *  passthrough (`format` → `numberformat`). */
+const XLSX_STRUCTURAL = new Set(['value', 'formula', 'format', 'bold']);
+
+/** Normalize the shared XLSX cell property contract used by both
+ * `create_xlsx` rows and `edit_office` cell `set` operations. Formula wins
+ * over value, `format` is normalized to OfficeCLI's canonical
+ * `numberformat`, and the remaining scalar cell properties pass through.
+ * Editing may explicitly write an empty value to clear existing content;
+ * create-time sparse grids continue to skip empty cells. */
+export function buildXlsxCellProps(
+  cell: XlsxCellProperties,
+  options: { allowEmptyValue?: boolean } = {},
+): Record<string, string> {
+  const props: Record<string, string> = {};
+  if (typeof cell.formula === 'string' && cell.formula) {
+    props.formula = cell.formula.replace(/^=/, '');
+  } else if (
+    cell.value !== undefined
+    && cell.value !== null
+    && (options.allowEmptyValue || cell.value !== '')
+  ) {
+    props.value = String(cell.value);
+  }
+  if (typeof cell.format === 'string' && cell.format) props.numberformat = cell.format;
+  if (typeof cell.bold === 'boolean') props.bold = String(cell.bold);
+  addPassthrough(props, cell, XLSX_STRUCTURAL);
+  return props;
+}
+
+/** 0-based column index → Excel column letters (0→A, 25→Z, 26→AA). */
+export function columnLetter(index: number): string {
+  let s = '';
+  let n = index;
+  do {
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return s;
+}
+
+/**
+ * Build `set` ops writing `rows` into `sheet`, addressing cells by their A1
+ * position (row 0 col 0 → A1). Empty cells (null / undefined / '') are skipped
+ * so a ragged grid leaves gaps rather than blanking cells. A `formula` wins
+ * over `value`; a leading `=` on the formula is stripped (OfficeCLI wants it
+ * without).
+ */
+export function buildXlsxBatch(sheet: string, rows: readonly (readonly XlsxCell[])[]): OfficeBatchOp[] {
+  const ops: OfficeBatchOp[] = [];
+  rows.forEach((row, r) => {
+    if (!Array.isArray(row)) return;
+    row.forEach((cell, c) => {
+      if (cell === null || cell === undefined || cell === '') return;
+      const props: Record<string, string> = {};
+      if (typeof cell === 'object') {
+        Object.assign(props, buildXlsxCellProps(cell));
+      } else {
+        props.value = String(cell);
+      }
+      if (!Object.keys(props).length) return;
+      ops.push({ command: 'set', path: `/${sheet}/${columnLetter(c)}${r + 1}`, props });
+    });
+  });
+  return ops;
+}
+
+/** One column's width/visibility. `name` is the column letter (e.g. "A"); any
+ *  extra key is passed through to `add column`. */
+export type XlsxColumnSpec = { name?: string; width?: string | number; hidden?: boolean; [key: string]: unknown };
+
+/**
+ * One native Excel chart. `type` is normalized to OfficeCLI's `chartType`;
+ * every other key is forwarded to `add chart`. Charts should normally bind to
+ * worksheet cells with `dataRange` plus an optional `categories` range so the
+ * resulting object stays editable and updates with the source cells.
+ */
+export type XlsxChartSpec = {
+  type?: string;
+  dataRange?: string;
+  categories?: string;
+  data?: string;
+  title?: string;
+  anchor?: string;
+  [key: string]: unknown;
+};
+
+const XLSX_CHART_STRUCTURAL = new Set(['type', 'chartType']);
+// OfficeCLI 1.0.139 accepts axismin/axismax while adding a chart but does not
+// persist those scaling nodes at add-time. Re-applying them to the newly
+// created chart does persist <c:min>/<c:max>, so emit a targeted post-add set.
+const XLSX_CHART_POST_ADD_PROPS = ['axismin', 'axismax'] as const;
+
+/** One worksheet: a tab `name`, its cell `rows`, optional columns, and native charts. */
+export type XlsxSheetSpec = {
+  name?: string;
+  rows?: readonly (readonly XlsxCell[])[];
+  columns?: readonly XlsxColumnSpec[];
+  charts?: readonly XlsxChartSpec[];
+};
+
+/**
+ * Build the `batch` ops for a multi-sheet workbook. A freshly created xlsx has
+ * exactly one sheet, `Sheet1`; the first spec reuses it (renamed via `set` when
+ * its `name` differs), and each later spec is `add`ed. This is deliberately
+ * four-pass: create every sheet, establish every column layout, populate cells,
+ * then add charts after their source cells exist. OfficeCLI's column additions
+ * shift existing quoted cross-sheet references, even when used for widths, so
+ * no sheet's layout may be added after another sheet's formulas are written.
+ */
+export function buildXlsxWorkbookBatch(sheets: readonly XlsxSheetSpec[]): OfficeBatchOp[] {
+  const ops: OfficeBatchOp[] = [];
+  const normalized: Array<{ sheet: XlsxSheetSpec; name: string }> = [];
+  sheets.forEach((sheet, idx) => {
+    if (!sheet || typeof sheet !== 'object') return;
+    const name = typeof sheet.name === 'string' && sheet.name ? sheet.name : (idx === 0 ? 'Sheet1' : `Sheet${idx + 1}`);
+    normalized.push({ sheet, name });
+    if (idx === 0) {
+      if (name !== 'Sheet1') ops.push({ command: 'set', path: '/Sheet1', props: { name } });
+    } else {
+      ops.push({ command: 'add', parent: '/', type: 'sheet', props: { name } });
+    }
+  });
+  for (const { sheet, name } of normalized) {
+    if (Array.isArray(sheet.columns)) {
+      for (const col of sheet.columns) {
+        if (!col || typeof col !== 'object') continue;
+        const colProps: Record<string, string> = {};
+        addPassthrough(colProps, col, PASS_ALL);
+        if (!colProps.name) continue; // a column add needs at least its letter
+        ops.push({ command: 'add', parent: `/${name}`, type: 'column', props: colProps });
+      }
+    }
+  }
+  for (const { sheet, name } of normalized) {
+    if (Array.isArray(sheet.rows)) ops.push(...buildXlsxBatch(name, sheet.rows));
+  }
+  for (const { sheet, name } of normalized) {
+    if (Array.isArray(sheet.charts)) {
+      let chartIndex = 0;
+      for (const chart of sheet.charts) {
+        if (!chart || typeof chart !== 'object') continue;
+        const chartType = typeof chart.type === 'string' && chart.type
+          ? chart.type
+          : (typeof chart.chartType === 'string' ? chart.chartType : '');
+        if (!chartType) continue;
+        const chartProps: Record<string, string> = { chartType };
+        addPassthrough(chartProps, chart, XLSX_CHART_STRUCTURAL);
+        ops.push({ command: 'add', parent: `/${name}`, type: 'chart', props: chartProps });
+        chartIndex += 1;
+        const postAddProps: Record<string, string> = {};
+        for (const key of XLSX_CHART_POST_ADD_PROPS) {
+          if (key in chartProps) postAddProps[key] = chartProps[key];
+        }
+        if (Object.keys(postAddProps).length) {
+          ops.push({ command: 'set', path: `/${name}/chart[${chartIndex}]`, props: postAddProps });
+        }
+      }
+    }
+  }
+  return ops;
+}
+
+// ── PowerPoint ────────────────────────────────────────────────────────────
+
+/** A free-positioned shape (text box) on a slide. `x`/`y`/`width`/`height` take
+ *  OfficeCLI length units (e.g. "1in", "2.5cm", "120pt"). Every key is passed
+ *  through to `add shape` — position plus style (`text`, `fill`, `color`,
+ *  `size`, `bold`, `align`, `font`, `geometry`, `opacity`, …) — so a designed
+ *  slide is expressible at create time. */
+export type PptxShapeSpec = {
+  text?: string;
+  x?: string | number;
+  y?: string | number;
+  width?: string | number;
+  height?: string | number;
+  fill?: string;
+  color?: string;
+  [key: string]: unknown;
+};
+
+/** A picture on a slide. `src` is the file path (the tool layer resolves it to
+ *  an absolute, sandbox-checked path first); position via `x`/`y`/`width`/
+ *  `height`. */
+export type PptxImageSpec = {
+  src?: string;
+  x?: string | number;
+  y?: string | number;
+  width?: string | number;
+  height?: string | number;
+  [key: string]: unknown;
+};
+
+/** A table on a slide: a grid of cell text plus optional position / props.
+ *  `rows` is the grid; extra keys (`x`, `y`, `width`, `colWidths`, `firstRow`,
+ *  …) pass through to `add table`. */
+export type PptxTableSpec = {
+  rows: readonly (readonly (string | number | null | undefined)[])[];
+  x?: string | number;
+  y?: string | number;
+  [key: string]: unknown;
+};
+
+/** A native, editable PowerPoint chart. `type` is normalized to OfficeCLI's
+ *  `chartType`; data is supplied as `Series:1,2,3;Series 2:4,5,6` and every
+ *  other key (categories, title, colors, legend, dataLabels, axes, position,
+ *  …) passes through to `add chart`. */
+export type PptxChartSpec = {
+  type?: string;
+  chartType?: string;
+  data?: string;
+  categories?: string;
+  [key: string]: unknown;
+};
+
+export const PPTX_THEME_KEYS = [
+  'headingFont', 'bodyFont', 'headingFont.ea', 'bodyFont.ea',
+  'headingFont.cs', 'bodyFont.cs', 'dk1', 'lt1', 'dk2', 'lt2',
+  'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6',
+] as const;
+
+export type PptxCreationOptions = {
+  canvas?: { size?: 'widescreen' | 'standard' | '16:10'; width?: string; height?: string };
+  theme?: Partial<Record<typeof PPTX_THEME_KEYS[number], string>>;
+};
+
+/** A native editable relationship graph inside an explicit slide rectangle.
+ * Never pass browser/image-rendering, source-file or slide-growth options. */
+export type PptxDiagramSpec = {
+  mermaid: string;
+  x: string;
+  y: string;
+  width: string;
+  height: string;
+};
+
+/** One slide. `title`/`body` auto-emit the title/body placeholder shapes;
+ *  `shapes` add free-positioned text boxes; `images`/`charts`/`tables` add
+ *  pictures, native charts, and grids; `background`/`transition` style the
+ *  slide itself. */
+export type PptxSlideSpec = {
+  title?: string;
+  body?: string;
+  titleStyle?: Record<string, unknown>;
+  bodyStyle?: Record<string, unknown>;
+  layout?: string;
+  background?: string;
+  transition?: string;
+  shapes?: PptxShapeSpec[];
+  images?: PptxImageSpec[];
+  charts?: PptxChartSpec[];
+  tables?: PptxTableSpec[];
+  diagrams?: PptxDiagramSpec[];
+};
+
+/** `rows` is the grid (not the engine's int `rows` prop) — excluded from a
+ *  table's passthrough. */
+const PPTX_TABLE_STRUCTURAL = new Set(['rows']);
+const PPTX_CHART_STRUCTURAL = new Set(['type', 'chartType']);
+const PPTX_SHAPE_FILL_CARRIERS = ['fill', 'gradient', 'pattern'] as const;
+
+/**
+ * OfficeCLI's PPTX `shadow` property is an outer-shadow color/spec, with
+ * `true` selecting its default black shadow. Older Orkas tool metadata called
+ * it a "preset", which taught models to emit the PptxGenJS-style token
+ * `outer`. Preserve that single legacy intent without forwarding an invalid
+ * color token that would make the entire atomic batch fail.
+ */
+function normalizePptxShapeShadow(props: Record<string, string>): void {
+  if (props.shadow?.trim().toLowerCase() === 'outer') props.shadow = 'true';
+}
+
+function normalizePptxShapeProps(shapeProps: Record<string, string>, shape: PptxShapeSpec): void {
+  normalizePptxShapeShadow(shapeProps);
+  // OfficeCLI treats opacity as a modifier of an explicit fill carrier.
+  // Models occasionally add `opacity: 0` to an otherwise unfilled text
+  // box; passing that orphan modifier makes the whole batch fail even
+  // though it has no visual meaning. Drop only the meaningless modifier
+  // and preserve opacity whenever a real fill/gradient/pattern exists.
+  if (
+    'opacity' in shapeProps
+    && !PPTX_SHAPE_FILL_CARRIERS.some((key) => key in shapeProps)
+  ) {
+    delete shapeProps.opacity;
+  }
+  // The outline equivalent has the same carrier relationship.
+  if ('lineOpacity' in shapeProps && !('line' in shapeProps)) {
+    delete shapeProps.lineOpacity;
+  } else if (
+    typeof shape.lineOpacity === 'number'
+    && Number.isFinite(shape.lineOpacity)
+    && shape.lineOpacity >= 0 && shape.lineOpacity <= 100
+  ) {
+    // create_pptx declares percentages; OfficeCLI expects a 0..1
+    // fraction for outlines. Even 1 means 1%, not full opacity.
+    // Leave invalid inputs to engine validation, without clamping.
+    shapeProps.lineOpacity = String(shape.lineOpacity / 100);
+  }
+}
+
+/**
+ * Build `add slide` ops, in order, each optionally followed by `add shape`
+ * (text boxes), `add picture`, `add chart`, and `add table` ops. A slide with no
+ * fields still produces a blank slide. `body` maps to OfficeCLI's `text` prop
+ * (newlines become separate body lines); `background`/`transition` style the
+ * slide. Shapes/pictures/charts/tables are added under `/slide[N]` where N is
+ * the slide's
+ * 1-based position (OfficeCLI numbers slides from 1 in add-order). A table emits
+ * `add table {rows,cols}` then one `set` per non-empty cell at
+ * `/slide[N]/table[K]/tr[i]/tc[j]` (K = 1-based table index on that slide;
+ * pptx table cells hold text directly, with no `/p[1]`). Shapes/pictures that
+ * coerce to no props are skipped.
+ */
+export function buildPptxBatch(slides: readonly PptxSlideSpec[], options: PptxCreationOptions = {}): OfficeBatchOp[] {
+  const ops: OfficeBatchOp[] = [];
+  if (options.canvas) {
+    const { size, width, height } = options.canvas;
+    const props: Record<string, string> = size ? { slideSize: size } : { slideWidth: width!, slideHeight: height! };
+    ops.push({ command: 'set', path: '/', props });
+  }
+  if (options.theme) {
+    const props: Record<string, string> = {};
+    for (const key of PPTX_THEME_KEYS) {
+      if (options.theme[key] !== undefined) props[key] = options.theme[key]!;
+    }
+    if (Object.keys(props).length) ops.push({ command: 'set', path: '/theme', props });
+  }
+  let slideNo = 0;
+  for (const slide of slides) {
+    if (!slide || typeof slide !== 'object') continue;
+    for (const operation of buildPptxSlideBatch(slide, `/slide[${++slideNo}]`)) ops.push(operation);
+  }
+  return ops;
+}
+
+const PPTX_SLIDE_STRUCTURAL = new Set([
+  'body', 'titleStyle', 'bodyStyle', 'shapes', 'images', 'charts', 'tables', 'diagrams',
+]);
+
+/** Compile one new slide at its creation-time path. Edits use the engine's
+ * last() selector immediately after the corresponding add, so earlier removes
+ * and multiple appends need neither guessed source indices nor another read. */
+function buildPptxSlideBatch(
+  s: PptxSlideSpec,
+  slidePath: string,
+  props: Record<string, string> = {},
+): OfficeBatchOp[] {
+  if (typeof s.title === 'string' && s.title) props.title = s.title;
+  if (typeof s.body === 'string' && s.body) props.text = s.body;
+  if (typeof s.layout === 'string' && s.layout) props.layout = s.layout;
+  if (typeof s.background === 'string' && s.background) props.background = s.background;
+  if (typeof s.transition === 'string' && s.transition) props.transition = s.transition;
+  const ops: OfficeBatchOp[] = [{ command: 'add', parent: '/', type: 'slide', props }];
+  // These are the objects just emitted by add-slide, not guessed source paths.
+  // Native title precedes body; styling does not duplicate either placeholder.
+  let placeholderNo = 0;
+  for (const [text, style] of [[props.title, s.titleStyle], [props.text, s.bodyStyle]] as const) {
+    if (!text) continue;
+    placeholderNo += 1;
+    const styleProps = normProps(style);
+    normalizePptxShapeProps(styleProps, style ?? {});
+    if (Object.keys(styleProps).length) {
+      ops.push({ command: 'set', path: `${slidePath}/shape[${placeholderNo}]`, props: styleProps });
+    }
+  }
+
+  if (Array.isArray(s.diagrams)) {
+    for (const diagram of s.diagrams) {
+      ops.push({ command: 'add', parent: slidePath, type: 'diagram', props: {
+        mermaid: diagram.mermaid, render: 'native', poster: 'false',
+        x: diagram.x, y: diagram.y, width: diagram.width, height: diagram.height,
+      } });
+    }
+  }
+
+  if (Array.isArray(s.shapes)) {
+    for (const shape of s.shapes) {
+      if (!shape || typeof shape !== 'object') continue;
+      const shapeProps: Record<string, string> = {};
+      addPassthrough(shapeProps, shape, PASS_ALL);
+      normalizePptxShapeProps(shapeProps, shape);
+      if (!Object.keys(shapeProps).length) continue;
+      ops.push({ command: 'add', parent: slidePath, type: 'shape', props: shapeProps });
+    }
+  }
+
+  if (Array.isArray(s.images)) {
+    for (const img of s.images) {
+      if (!img || typeof img !== 'object') continue;
+      const picProps: Record<string, string> = {};
+      addPassthrough(picProps, img, PASS_ALL);
+      if (!picProps.src) continue; // a picture needs a source path
+      ops.push({ command: 'add', parent: slidePath, type: 'picture', props: picProps });
+    }
+  }
+
+  if (Array.isArray(s.charts)) {
+    for (const chart of s.charts) {
+      if (!chart || typeof chart !== 'object') continue;
+      const chartType = typeof chart.type === 'string' && chart.type
+        ? chart.type
+        : (typeof chart.chartType === 'string' ? chart.chartType : '');
+      if (!chartType) continue;
+      const chartProps: Record<string, string> = { chartType };
+      addPassthrough(chartProps, chart, PPTX_CHART_STRUCTURAL);
+      ops.push({ command: 'add', parent: slidePath, type: 'chart', props: chartProps });
+    }
+  }
+
+  if (Array.isArray(s.tables)) {
+    let tableNo = 0;
+    for (const t of s.tables) {
+      if (!t || !Array.isArray(t.rows)) continue;
+      const { rowCount, colCount } = gridDims(t.rows);
+      if (!rowCount || !colCount) continue;
+      const tProps: Record<string, string> = { rows: String(rowCount), cols: String(colCount) };
+      addPassthrough(tProps, t, PPTX_TABLE_STRUCTURAL);
+      ops.push({ command: 'add', parent: slidePath, type: 'table', props: tProps });
+      tableNo += 1;
+      t.rows.forEach((row, i) => {
+        if (!Array.isArray(row)) return;
+        row.forEach((cell, j) => {
+          if (cell === null || cell === undefined || cell === '') return;
+          ops.push({ command: 'set', path: `${slidePath}/table[${tableNo}]/tr[${i + 1}]/tc[${j + 1}]`, props: { text: String(cell) } });
+        });
+      });
+    }
+  }
+  return ops;
+}
+
+// ── Existing-file edit operations (any format) ─────────────────────────────
+
+/** A single edit on an existing document. The tool layer applies these to a
+ *  validated temporary/working copy. `set`/`remove` target an element by
+ *  `path` (from `office_read`); `add` inserts under `parent`. */
+export type EditOp =
+  | { action: 'set'; path: string; props?: Record<string, unknown> }
+  | { action: 'add'; parent: string; type: string; props?: Record<string, unknown> }
+  | { action: 'remove'; path: string };
+
+/** Raised when an otherwise well-formed edit operation contains a property
+ *  shape that OfficeCLI cannot represent safely. The tool layer turns this
+ *  into E_BAD_INPUT before it creates or edits a working copy. */
+export class OfficeEditInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OfficeEditInputError';
+  }
+}
+
+/** OfficeCLI props are scalar strings on the wire. Coerce scalar values and
+ *  drop null/undefined, but never silently flatten arrays/objects: `String()`
+ *  would turn a table grid into a comma string and an object into
+ *  "[object Object]", producing misleading downstream engine errors. */
+function normProps(
+  props?: Record<string, unknown>,
+  skip: ReadonlySet<string> = PASS_ALL,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (props && typeof props === 'object') {
+    for (const [k, v] of Object.entries(props)) {
+      if (skip.has(k) || v === null || v === undefined) continue;
+      if (Array.isArray(v) || typeof v === 'object') {
+        throw new OfficeEditInputError(
+          `property \`${k}\` must be a scalar; nested arrays/objects are unsupported except \`props.rows\` when adding a table`,
+        );
+      }
+      const s = String(v);
+      out[k] = k === 'formula' ? s.replace(/^=/, '') : s;
+    }
+  }
+  return out;
+}
+
+const EDIT_TABLE_GRID_STRUCTURAL = new Set(['rows', 'cols', 'data']);
+const EDIT_TABLE_CELL_PROP = /^r\d+c\d+$/i;
+
+/** Convert an add-table `rows: [[cell]]` grid into OfficeCLI's scalar add
+ *  props (`rows`, `cols`, `r1c1`, ...). Seeding cells on the add itself avoids
+ *  guessing the new table's positional index in an existing document and also
+ *  makes multiple table additions in one batch independent. */
+function normAddProps(op: Extract<EditOp, { action: 'add' }>): Record<string, string> {
+  const props = op.props;
+  const rows = props?.rows;
+  if (op.type !== 'table' || !Array.isArray(rows)) return normProps(props);
+  if (!rows.length) {
+    throw new OfficeEditInputError('table `props.rows` must contain at least one row');
+  }
+  if (props && Object.entries(props).some(([key, value]) => (
+    key !== 'rows'
+    && value !== null
+    && value !== undefined
+    && (EDIT_TABLE_GRID_STRUCTURAL.has(key) || EDIT_TABLE_CELL_PROP.test(key))
+  ))) {
+    throw new OfficeEditInputError(
+      'table `props.rows` grid cannot be combined with `cols`, `data`, or `r{row}c{column}` properties',
+    );
+  }
+
+  let colCount = -1;
+  const cells: Array<{ row: number; col: number; value: string }> = [];
+  rows.forEach((row, rowIndex) => {
+    if (!Array.isArray(row) || !row.length) {
+      throw new OfficeEditInputError(`table \`props.rows[${rowIndex}]\` must be a non-empty array`);
+    }
+    if (colCount < 0) colCount = row.length;
+    if (row.length !== colCount) {
+      throw new OfficeEditInputError(
+        `table \`props.rows\` must be rectangular; row ${rowIndex + 1} has ${row.length} cells, expected ${colCount}`,
+      );
+    }
+    row.forEach((cell, colIndex) => {
+      if (cell === null || cell === undefined || cell === '') return;
+      if (Array.isArray(cell) || typeof cell === 'object') {
+        throw new OfficeEditInputError(
+          `table cell at row ${rowIndex + 1}, column ${colIndex + 1} must be a string, number, boolean, or null`,
+        );
+      }
+      cells.push({ row: rowIndex + 1, col: colIndex + 1, value: String(cell) });
+    });
+  });
+
+  const out: Record<string, string> = {
+    rows: String(rows.length),
+    cols: String(colCount),
+    ...normProps(props, EDIT_TABLE_GRID_STRUCTURAL),
+  };
+  for (const cell of cells) out[`r${cell.row}c${cell.col}`] = cell.value;
+  return out;
+}
+
+/**
+ * Translate high-level edit operations into OfficeCLI `batch` ops. Malformed
+ * entries (missing path/parent/type, unknown action) are dropped. Unsupported
+ * property shapes fail explicitly before a working copy is created; the caller
+ * runs accepted batches with `--stop-on-error` for per-op engine failures.
+ */
+export function buildEditBatch(ops: readonly EditOp[], options: { pptx?: boolean } = {}): OfficeBatchOp[] {
+  const out: OfficeBatchOp[] = [];
+  for (const op of ops) {
+    if (!op || typeof op !== 'object') continue;
+    if (op.action === 'set' && typeof op.path === 'string' && op.path) {
+      out.push({ command: 'set', path: op.path, props: normProps(op.props) });
+    } else if (op.action === 'add' && typeof op.parent === 'string' && op.parent && typeof op.type === 'string' && op.type) {
+      if (options.pptx && op.parent === '/' && op.type === 'slide'
+        && op.props && [...PPTX_SLIDE_STRUCTURAL].some(key => key in op.props!)) {
+        for (const operation of buildPptxSlideBatch(op.props as PptxSlideSpec, '/slide[last()]', normProps(op.props, PPTX_SLIDE_STRUCTURAL))) {
+          out.push(operation);
+        }
+      } else {
+        out.push({ command: 'add', parent: op.parent, type: op.type, props: normAddProps(op) });
+      }
+    } else if (op.action === 'remove' && typeof op.path === 'string' && op.path) {
+      out.push({ command: 'remove', path: op.path });
+    }
+  }
+  return out;
+}

@@ -1,0 +1,950 @@
+/**
+ * orkas-bridge host — lets every supported external CLI agent
+ * perceive and call the Orkas environment (plan §D).
+ *
+ * Per CLI dispatch the runner starts one host: a local-IPC socket server
+ * (unix domain socket / Windows named pipe — NOT a TCP port, per the
+ * PC/CLAUDE.md "no occupied port" boundary) plus a generated MCP server
+ * config file. The CLI agent spawns `bin/orkas-bridge.cjs` as a stdio MCP
+ * server; that client connects back here and proxies tool calls.
+ *
+ * Auth: a per-run random token lives in a 0600 env file consumed by the
+ * spawned server and must prefix every request; the socket file lives in
+ * os.tmpdir() with 0600 modes. The token dies with the run (`close()`).
+ *
+ * Capability surface (decisions I15–I17 plus the least-privilege update in
+ * I31 in the plan):
+ *   - skills.list / skills.read / skills.run_info — trusted, external and own
+ *     private package skills, disabled ids filtered; resource pages and runs
+ *     are path-checked against listed skill dirs.
+ *   - connectors.list / connectors.call — registered only when the ordinary
+ *     group-chat Agent connector policy resolves at least one user-connected,
+ *     enabled connector; actions use Orkas operation permissions independently
+ *     of native CLI approvals. Large results have run-local read cursors.
+ *   - library — reuses the in-process Library tool's list/search/read actions,
+ *     scoped to global + current project when the conversation belongs to a
+ *     project.
+ *   - chat_history — reuses the in-process conversation-history tool's
+ *     search/read actions with a host-bound current-only scope and
+ *     triggering-message bound.
+ *   - todo_tasks / auto_tasks — operations bound to global scope outside a project,
+ *     or only the current project inside one.
+ *   - memory.agent — reads and updates the calling Agent/current project memory;
+ *     user/shared global memory is read-only. Identity is bound by the host.
+ *   - publish_outputs — selects current-turn files (observed writes, or files
+ *     created during the run by native shell commands) through the host
+ *     callback without changing bytes; an empty declaration clears selection.
+ *   - commander.handoff — records one bounded, run-local request for the bus;
+ *     it does not expose any Commander mutation or orchestration method.
+ *
+ * Protocol: NDJSON over the socket.
+ *   request  {id, token, method, params}
+ *   response {id, ok, result} | {id, ok:false, error}
+ * First request with a bad token destroys the connection.
+ */
+
+import { librarySaveFieldError } from '../../util/library-save-input';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry, batchMemoryEntries } from '../memory-writes';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { outputPublicationReceipt } from '../../util/output-publication';
+
+import { createLogger } from '../../logger';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
+import { listSkillsForBridge, type BridgeSkillRow } from '../../model/core-agent/skill-registry';
+import { readDisabledSets } from '../component_enabled';
+import { createLibraryTool } from '../../model/core-agent/kb-tools';
+import { createChatHistoryTool } from '../../model/core-agent/chat-history-tools';
+import { projectExists, readProjectInstructions, writeProjectInstructionsIfUnchanged } from '../projects';
+import * as projectFiles from '../project_files';
+import * as memory from '../memory';
+import { getWorkspacePath } from '../user_workspace';
+import { isPathAllowed } from '../../util/path-sandbox';
+import { persistToolResult } from '../../util/tool-result-cap';
+import { bridgeResourceRealpath, readBridgeFilePage, resolveBridgeSkillResource } from './bridge-files';
+import { buildConversationBrowserTool } from '../group_chat/browser_tool';
+import { browserTaskRunId } from '../web_assist_lifecycle';
+import { getActiveUserId } from '../users';
+import { applyConnectorArgDefaults } from '../../model/core-agent/connector-meta-tools';
+import {
+  listAgentEntries,
+  removeAgentEntry,
+} from '../memory';
+import * as connectors from '../connectors';
+import { createConnectorToolDiscovery, validateDiscoveryParams } from '../connectors/tool-discovery';
+import { requestActionConfirm, connectorAccountKey } from '../connectors/action_confirm';
+import { connectorActionRisk, isConnectorActionBlocked } from '../connectors/action_policy';
+import { observeTaskDraftResult } from '../connectors/task-created-drafts';
+import {
+  type LocalCliPermissionPolicy,
+  type LocalCliType,
+} from './registry';
+
+const log = createLogger('local-agents:bridge');
+
+const MAX_LINE_BYTES = 1024 * 1024;
+const CONNECTOR_RESULT_CAP = 100_000;
+
+function _argumentsWithinBatchLimit(value: unknown, limit: number): boolean {
+  if (!Number.isInteger(limit) || limit < 1) return false;
+  if (Array.isArray(value)) {
+    return value.length <= limit && value.every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>)
+      .every((item) => _argumentsWithinBatchLimit(item, limit));
+  }
+  return true;
+}
+
+function bridgeLogContext(opts: Pick<StartBridgeOpts, 'uid' | 'cid' | 'agentId' | 'projectId' | 'runId' | 'configDir'>, socketPath?: string): Record<string, unknown> {
+  return {
+    run_id: maskId(opts.runId),
+    user_id: maskId(opts.uid),
+    cid: maskId(opts.cid),
+    agent_id: maskId(opts.agentId),
+    project_id: maskId(opts.projectId),
+    config_dir: logPathRef(opts.configDir),
+    socket: socketPath ? logPathRef(socketPath) : undefined,
+  };
+}
+
+export interface BridgeHandle {
+  socketPath: string;
+  token: string;
+  /** Path of the generated MCP config file (claude `--mcp-config`). */
+  mcpConfigPath: string;
+  /** Non-secret env block used to launch orkas-bridge.cjs. */
+  serverEnv: Record<string, string>;
+  /** Exact MCP/RPC capability categories granted to this run. */
+  capabilities: readonly BridgeCapability[];
+  /** First accepted Commander handoff request, if the CLI made one. */
+  getCommanderHandoff(): CommanderHandoffRequest | null;
+  /** UI-only display metadata for a Skill already admitted to this run's
+   * source/enablement scope. The runner uses it to keep internal ids out of
+   * persisted process labels without rescanning Skill roots. */
+  getSkillDisplayName(ref: string): string | null;
+  /** UI-only display metadata for a Connector already admitted by the same
+   * connected + enabled policy that grants this run connector capability. */
+  getConnectorDisplayName(id: string): string | null;
+  close(): Promise<void>;
+}
+
+export type BridgeCapability =
+  | 'browser'
+  | 'skills.read'
+  | 'skills.run'
+  | 'connectors'
+  | 'kb.read'
+  | 'chat.read'
+  | 'tasks.read'
+  | 'tasks.write'
+  | 'automation'
+  | 'memory.agent'
+  | 'project.context.write'
+  | 'outputs.publish'
+  | 'commander.handoff';
+
+export interface CommanderHandoffRequest {
+  reason: string;
+  context?: string;
+}
+
+/** Host-only observation; never a model receipt, permission grant or public event. */
+export interface BridgeCallObservation {
+  method: string;
+  params: Readonly<Record<string, unknown>>;
+  ok: boolean;
+}
+
+export interface StartBridgeOpts {
+  uid: string;
+  cid: string;
+  agentId: string;
+  agentName: string;
+  /** Optional in-process audit sink. No raw results or failure messages. */
+  onCallObserved?: (observation: BridgeCallObservation) => void;
+  conversationTitle?: string;
+  cli: LocalCliType;
+  permissionPolicy: LocalCliPermissionPolicy;
+  /** Inbound message that triggered this CLI run. Current history stops
+   * strictly before it. */
+  currentMessageId: string;
+  /** Current conversation project, if any. Enables project + global Library tools. */
+  projectId?: string;
+  /** Host-resolved CLI working directory; never supplied by an RPC caller. */
+  workingDir?: string;
+  signal?: AbortSignal;
+  /** Host-owned selection of this turn's observed produced files. */
+  onOutputsPublished?: (paths: string[]) => string[];
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
+  runId: string;
+  /** Where to write the per-run mcp-config file (the persist run dir). */
+  configDir: string;
+  /** Static skill-sandbox env (ORKAS_NODE / ORKAS_PC_DIR /
+   *  ORKAS_WORKSPACE_ROOT plus bundled runtimes). The bridge replaces the
+   *  Electron-flavoured ORKAS_NODE with ORKAS_BUNDLED_NODE so headless helper
+   *  launches never inherit the macOS GUI application identity. */
+  sandboxEnv: Record<string, string>;
+  /** Keep the owning run visibly alive while a connector approval waits. */
+  onPermissionWaiting?: (elapsedMs: number) => void;
+  /** Suspend only the caller's idle clock while awaiting authorization. */
+  onPermissionWaitStart?: () => () => void;
+  /** A resumed CLI may call a Skill id learned in an earlier turn before
+   * invoking skills.list in this host. Prime display metadata only for that
+   * path; fresh runs keep Skill discovery lazy. */
+  preloadSkillDisplayNames?: boolean;
+}
+
+function _socketPath(runId: string): string {
+  if (process.platform === 'win32') return `\\\\.\\pipe\\orkas-bridge-${runId}`;
+  // tmpdir keeps the path well under the unix sun_path limit (~104 bytes)
+  // — the per-uid data root can be arbitrarily deep.
+  return path.join(os.tmpdir(), `orkas-bridge-${runId}.sock`);
+}
+
+/** `signal` aborts when the client withdrew this request (its own timeout or
+ *  an MCP cancellation) or asked `connectors.cancel` for it. */
+type BridgeMethod = (
+  params: Record<string, unknown>,
+  call: { signal: AbortSignal },
+) => Promise<unknown>;
+
+const BASE_CAPABILITIES: readonly BridgeCapability[] = [
+  'skills.read',
+  'skills.run',
+  'kb.read',
+  'chat.read',
+  'commander.handoff',
+];
+
+type AgentMemoryAction = 'add' | 'replace' | 'remove' | 'list' | 'batch';
+
+const AGENT_MEMORY_ACTION_FIELDS: Readonly<Record<AgentMemoryAction, ReadonlySet<string>>> = {
+  add: new Set(['action', 'target', 'content']),
+  replace: new Set(['action', 'target', 'content', 'old_text']),
+  remove: new Set(['action', 'target', 'old_text']),
+  list: new Set(['action', 'target']),
+  batch: new Set(['action', 'target', 'expected_revision', 'operations']),
+};
+
+async function _capabilitiesForRun(
+  opts: StartBridgeOpts,
+  recordConnectorDisplayName: (id: string, name: string) => void,
+): Promise<BridgeCapability[]> {
+  const capabilities = [...BASE_CAPABILITIES];
+  if (browserTaskRunId(opts.uid, opts.cid)) capabilities.push('browser');
+  if (!opts.projectId || await projectExists(opts.uid, opts.projectId)) {
+    capabilities.push('tasks.read', 'tasks.write', 'automation');
+    if (opts.projectId) capabilities.push('project.context.write');
+  }
+  if (opts.agentId) capabilities.push('memory.agent');
+  if (opts.workingDir && opts.onOutputsPublished) capabilities.push('outputs.publish');
+  try {
+    // Match the ordinary gmember path in core-agent/runner: group-chat Agents
+    // share the user's connected + enabled connector set.
+    const visible = await connectors.resolveVisibleConnectors(opts.uid);
+    if (visible.length) {
+      capabilities.push('connectors');
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
+    }
+  } catch (err) {
+    // Connector discovery is optional for the CLI bridge. Fail this category
+    // closed without taking away skills, Library, chat, or handback.
+    log.warn('bridge connector capability resolution failed', {
+      ...bridgeLogContext(opts),
+      error: logErrorRef(err),
+    });
+  }
+  return capabilities;
+}
+
+function _buildMethods(
+  opts: StartBridgeOpts,
+  capabilities: ReadonlySet<BridgeCapability>,
+  recordCommanderHandoff: (request: CommanderHandoffRequest) => boolean,
+  recordConnectorDisplayName: (id: string, name: string) => void,
+  isBridgeActive: () => boolean,
+): {
+  methods: Record<string, BridgeMethod>;
+  preloadSkillDisplayNames(): Promise<void>;
+  getSkillDisplayName(ref: string): string | null;
+} {
+  // Read-only model tools are reused as-is; map by tool name for dispatch.
+  const readTools = new Map([
+    createLibraryTool({
+      userId: opts.uid,
+      ...(opts.projectId ? { projectId: opts.projectId } : {}),
+    }),
+    createChatHistoryTool({
+      userId: opts.uid,
+      currentCid: opts.cid,
+      currentMessageId: opts.currentMessageId,
+      ...(opts.projectId ? { projectId: opts.projectId } : {}),
+      allowedScopes: ['current'],
+    }),
+  ].map((t) => [t.name, t]));
+  const runReadTool = async (name: string, params: Record<string, unknown>) => {
+    const tool = readTools.get(name);
+    if (!tool) throw new Error(`read tool unavailable: ${name}`);
+    const result = await tool.execute(params, { state: {} } as never);
+    const content = result?.content;
+    const text = typeof content === 'string'
+      ? content
+      : (Array.isArray(content) ? content : [])
+        .map((c: { type?: string; text?: string }) => (c?.type === 'text' ? c.text || '' : ''))
+        .join('\n');
+    if (result?.isError) throw new Error(text || 'read tool failed');
+    return { text };
+  };
+
+  let skillRowsCache: BridgeSkillRow[] | null = null;
+  const skillRoots = new Map<string, string>();
+  const listSkills = async (): Promise<BridgeSkillRow[]> => {
+    if (skillRowsCache) return skillRowsCache;
+    try {
+      const users = await import('../users');
+      if (users.getActiveUserId() === opts.uid) {
+        const skills = await import('../skills');
+        await skills.repairLegacySkillEnabledIdsForActiveUser();
+      }
+    } catch (err) {
+      log.warn('bridge legacy skill enabled-state repair failed', {
+        user_id: maskId(opts.uid),
+        error: (err as Error).message,
+      });
+    }
+    const disabled = readDisabledSets(opts.uid).skills;
+    const rows = (await listSkillsForBridge(opts.uid, opts.agentId)).filter((r) => !disabled.has(r.id));
+    for (const row of rows) skillRoots.set(row.dir, bridgeResourceRealpath(row.dir));
+    skillRowsCache = rows;
+    return rows;
+  };
+  const getSkillDisplayName = (ref: string): string | null => {
+    const normalized = String(ref || '').trim();
+    if (!normalized || !skillRowsCache) return null;
+    const row = skillRowsCache.find((candidate) => candidate.id === normalized)
+      || skillRowsCache.find((candidate) => candidate.name === normalized);
+    return row?.name || null;
+  };
+
+  const methods: Record<string, BridgeMethod> = {};
+  const assertActive = () => {
+    if (!isBridgeActive() || opts.signal?.aborted || getActiveUserId() !== opts.uid) throw new Error('run is no longer active for this account');
+  };
+  const resolveSkill = async (ref: unknown) => {
+    assertActive();
+    if (typeof ref !== 'string' || !ref.trim()) throw new Error('id required');
+    ref = ref.trim();
+    const rows = await listSkills();
+    assertActive();
+    const exact = rows.find((row) => row.id === ref);
+    const matches = exact ? [exact] : rows.filter((row) => row.name === ref);
+    if (matches.length > 1) throw new Error('Skill name is ambiguous; use its exact id from orkas_list_skills');
+    const row = matches[0];
+    if (!row || readDisabledSets(opts.uid).skills.has(row.id)) throw new Error('unknown skill or Skill is disabled');
+    const root = skillRoots.get(row.dir)!;
+    if (bridgeResourceRealpath(row.dir) !== root) throw new Error('Skill directory changed; start a new run');
+    return { row, root };
+  };
+  const connectorResults = new Map<string, { file: string; connectorId: string; accountKey: string; toolName: string; isError?: true }>();
+
+  if (capabilities.has('browser')) {
+    // CLI runtimes may issue parallel calls; never race a page mutation with
+    // another observation/action. Reuse one browser scope for the active run.
+    let signal: AbortSignal | undefined;
+    const browser = buildConversationBrowserTool(opts.uid, opts.cid,
+      () => isBridgeActive() && !signal?.aborted && getActiveUserId() === opts.uid);
+    let tail: Promise<unknown> = Promise.resolve();
+    methods.browser = (params, call) => {
+      const next = tail.then(async () => {
+        signal = call.signal;
+        return browser.execute(params, { state: {}, signal: call.signal } as never);
+      });
+      tail = next.catch(() => undefined);
+      return next;
+    };
+  }
+
+  if (capabilities.has('skills.read')) Object.assign(methods, {
+    'skills.list': async () => {
+      assertActive();
+      const rows = await listSkills();
+      assertActive();
+      const disabled = readDisabledSets(opts.uid).skills;
+      return {
+        skills: rows.filter((r) => !disabled.has(r.id)).map((r) => ({ id: r.id, name: r.name, description: r.description, source: r.source })),
+      };
+    },
+
+    'skills.read': async (params) => {
+      if (Object.keys(params).some((key) => !['id', 'path', 'offset', 'limit', 'encoding'].includes(key))) throw new Error('unsupported Skill read field');
+      const { row, root } = await resolveSkill(params.id);
+      const file = resolveBridgeSkillResource(root, row.skillFile, params.path);
+      const page = readBridgeFilePage(file, params);
+      return { id: row.id, name: row.name, source: row.source, ...page,
+        ...(params.path === undefined && page.encoding === 'utf8' ? { skill_md: page.content } : {}) };
+    },
+  });
+
+  if (capabilities.has('skills.run')) Object.assign(methods, {
+    'skills.run_info': async (params) => {
+      if (Object.keys(params).some((key) => key !== 'id')) throw new Error('unsupported Skill execution field');
+      const { row, root } = await resolveSkill(params.id);
+      resolveBridgeSkillResource(root, row.skillFile, undefined);
+      return { id: row.id, name: row.name, source: row.source, dir: root };
+    },
+  });
+
+  const discoverConnectorTools = createConnectorToolDiscovery();
+  if (capabilities.has('connectors')) Object.assign(methods, {
+    'connectors.list': async (params) => {
+      const discoveryParams = validateDiscoveryParams(params);
+      const visible = await connectors.resolveVisibleConnectors(opts.uid);
+      assertActive();
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
+      const result = discoverConnectorTools(visible, discoveryParams);
+      const text = JSON.stringify(result, null, 2);
+      if (Buffer.byteLength(text) <= CONNECTOR_RESULT_CAP) return result;
+      // Only explicit single-action expansion can exceed the discovery budget.
+      // Reuse run-local result reads; retrieval must never invoke the provider.
+      const target = visible.find(v => v.instance.id === discoveryParams.connector_id);
+      if (result.mode !== 'schema' || !target || !discoveryParams.tool_name) throw new Error('connector discovery result exceeds the inline budget');
+      const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector-schema', text);
+      const ref = crypto.randomBytes(16).toString('hex');
+      connectorResults.set(ref, { file, connectorId: target.instance.id, accountKey: connectorAccountKey(target.instance), toolName: discoveryParams.tool_name });
+      const page = readBridgeFilePage(file, {});
+      return { text: page.content, ...page, output_ref: ref };
+    },
+
+    'connectors.call': async (params, call) => {
+      assertActive();
+      if (params.action === 'read') {
+        if (Object.keys(params).some((key) => !['action', 'output_ref', 'offset', 'limit'].includes(key))) throw new Error('read accepts only output_ref, offset and limit');
+        const stored = connectorResults.get(String(params.output_ref || ''));
+        if (!stored) throw new Error('unknown output_ref for this run');
+        const visible = await connectors.resolveVisibleConnectors(opts.uid);
+        assertActive();
+        const current = visible.find(({ instance }) => instance.id === stored.connectorId);
+        if (!current || connectorAccountKey(current.instance) !== stored.accountKey || isConnectorActionBlocked(stored.connectorId, stored.toolName)
+            || !current.tools.some((tool) => tool.name === stored.toolName)) throw new Error('connector result is no longer available for this account');
+        const page = readBridgeFilePage(stored.file, params);
+        return { text: page.content, ...page, output_ref: params.output_ref,
+          ...(stored.isError ? { isError: true } : {}), };
+      }
+      const reject = (message: string): never => {
+        throw new Error(message);
+      };
+      if (params.action !== undefined && params.action !== 'call') reject('action must be call or read');
+      if (Object.keys(params).some((key) => !['action', 'connector_id', 'tool_name', 'args'].includes(key))) reject('call accepts only connector_id, tool_name and args');
+      const connectorId = String(params.connector_id || '');
+      const toolName = String(params.tool_name || '');
+      const rawArgs = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
+      if (!connectorId || !toolName) reject('connector_id and tool_name required');
+      // The client stops waiting on its own timeout or an MCP cancel. Once it
+      // has, no later user approval may run the side effect: the model has
+      // already been told the call failed and may have retried it.
+      const cancelled = () => new Error('E_BRIDGE_CALL_CANCELLED: the CLI stopped waiting for this connector call');
+      if (call.signal.aborted) throw cancelled();
+      const visible = await connectors.resolveVisibleConnectors(opts.uid);
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
+      const target = visible.find((v) => v.instance.id === connectorId);
+      if (!target) reject(`connector not available: ${connectorId}`);
+      const tool = target.tools.find((item) => item.name === toolName);
+      if (!tool) {
+        reject(`tool not exposed by connector ${connectorId}: ${toolName}`);
+      }
+      if (isConnectorActionBlocked(connectorId, toolName)) {
+        reject('E_CONNECTOR_ACTION_UNAVAILABLE: this action is not available in Orkas');
+      }
+      // Same normalisation as the in-process `call_connector_tool` (camelCase
+      // keys, Gmail defaults): an external CLI must not reach the provider with
+      // a different request shape than a built-in Agent for the same action.
+      const args = applyConnectorArgDefaults(
+        connectorId,
+        toolName,
+        rawArgs,
+        (tool.input_schema && typeof tool.input_schema === 'object')
+          ? tool.input_schema as Record<string, unknown>
+          : undefined,
+      );
+      const policy = tool.orkas_action_policy;
+      const isComposioCommerce = !!target.instance.composio_grant
+        && connectors.findCatalogEntry(connectorId)?.category === 'commerce';
+      if (isComposioCommerce && !policy) {
+        reject('E_CONNECTOR_POLICY_MISSING: this commerce action has no trusted policy');
+      }
+      if (policy && !_argumentsWithinBatchLimit(args, policy.max_batch_size)) {
+        reject(`E_CONNECTOR_BATCH_LIMIT: at most ${policy.max_batch_size} items are allowed in any array argument`);
+      }
+
+      if (call.signal.aborted) throw cancelled();
+      const draftScope = !target.instance.composio_grant
+        ? { uid: opts.uid, cid: opts.cid, connectorId, accountKey: connectorAccountKey(target.instance) } : undefined;
+      const actionRisk = connectorActionRisk(target.instance, tool, args, draftScope);
+      if (actionRisk.risk === 'H' || actionRisk.risk === 'D') {
+        const resumeIdle = opts.onPermissionWaitStart?.();
+        let approved: boolean;
+        try {
+          approved = await requestActionConfirm({
+            userId: opts.uid,
+            cid: opts.cid,
+            connectorId,
+            displayName: target.instance.display_name,
+            accountKey: connectorAccountKey(target.instance),
+            accountLabel: target.instance.composio_grant?.account_label
+              || target.instance.oauth_grant?.account_label,
+            toolName,
+            risk: actionRisk.risk,
+            sensitiveOperation: actionRisk.sensitive_operation,
+            args,
+            signal: call.signal,
+            onWaiting: opts.onPermissionWaiting,
+          });
+        } finally {
+          resumeIdle?.();
+        }
+        if (call.signal.aborted) throw cancelled();
+        if (!approved) {
+          reject('E_CONNECTOR_CONFIRMATION_DENIED: the user declined this sensitive connector action');
+        }
+      }
+
+      const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
+        signal: call.signal, conversationId: opts.cid,
+      });
+      if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
+      const isError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
+      const text = connectors.stringifyMcpResult(raw);
+      assertActive();
+      const failureStatus = isError ? { isError: true as const } : {};
+      if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text, ...failureStatus };
+      try {
+        const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector', text);
+        const ref = crypto.randomBytes(16).toString('hex');
+        connectorResults.set(ref, { file, connectorId, accountKey: connectorAccountKey(target.instance), toolName, ...failureStatus });
+        const page = readBridgeFilePage(file, {});
+        return { text: page.content, ...page, output_ref: ref, ...failureStatus };
+      } catch {
+        return { text: '', execution_completed: true, result_unavailable: true, ...failureStatus,
+          error: 'The connector returned, but its result could not be retained. Do not repeat a modifying action to recover its output.' };
+      }
+
+    },
+  });
+
+  if (capabilities.has('outputs.publish')) Object.assign(methods, {
+    publish_outputs: async (params) => {
+      assertActive();
+      if (Object.keys(params).some((key) => key !== 'paths') || !Array.isArray(params.paths)
+          || params.paths.length > 50 || params.paths.some((p) => typeof p !== 'string' || !p.trim())) {
+        throw new Error('paths must contain at most 50 non-empty file paths');
+      }
+      const paths = [...new Set((params.paths as string[]).map((p) => path.resolve(opts.workingDir!, p)))];
+      if (paths.some((p) => !isPathAllowed(p, [opts.workingDir!]))) throw new Error('output must be inside the current workspace');
+      const accepted = opts.onOutputsPublished!(paths);
+      return outputPublicationReceipt(paths, accepted);
+    },
+  });
+
+  if (capabilities.has('kb.read')) Object.assign(methods, {
+    library: async (params) => runReadTool('library', params),
+  });
+
+  if (capabilities.has('chat.read')) Object.assign(methods, {
+    chat_history: async (params) => runReadTool('chat_history', params),
+  });
+
+  if (capabilities.has('automation')) Object.assign(methods, {
+    auto_tasks: async (params) => {
+      const { createAutoTasksTool } = await import('../auto_tasks_tool');
+      const result = await createAutoTasksTool({ userId: opts.uid, cid: opts.cid, projectId: opts.projectId || null,
+        onSaved: opts.onAutoTaskSaved, onDeleted: opts.onAutoTaskDeleted }).execute(params, { state: {} });
+      const receipt = JSON.parse(result.content);
+      if (result.isError) throw new Error(receipt.error || 'automation operation failed');
+      return receipt;
+    },
+  });
+
+  if (capabilities.has('tasks.read')) Object.assign(methods, {
+    todo_tasks: async (params, call) => {
+      if (opts.projectId && !(await projectExists(opts.uid, opts.projectId))) throw new Error('project_not_found');
+      const readOnly = !capabilities.has('tasks.write');
+      const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+      const { createProjectTasksHandler } = await import('../project_tasks_tool_handler');
+      const names = new Map<string, string>();
+      if (!readOnly && typeof params.owner === 'string' && params.owner.trim()) {
+        const { getActiveUserId } = await import('../users');
+        if (getActiveUserId() !== opts.uid) throw new Error('account_changed');
+        const { listAgentSummaries } = await import('../agents');
+        const agents = await listAgentSummaries();
+        if (getActiveUserId() !== opts.uid) throw new Error('account_changed');
+        for (const agent of agents) names.set(agent.agent_id, agent.name || agent.agent_id);
+      }
+      // Reads and writes share native validation, paging, scope and execution facts.
+      const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
+        actorId: opts.agentId,
+      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted, call.signal), { readOnly, globalScope: !opts.projectId });
+      const result = await tool.execute(params, { state: {} });
+      const receipt = JSON.parse(result.content);
+      if (result.isError) throw new Error(receipt.error || 'task operation failed');
+      return receipt;
+    },
+  });
+
+  if (capabilities.has('memory.agent')) Object.assign(methods, {
+    'memory.agent': async (params, call) => {
+      assertActive();
+      const action = String(params.action || '') as AgentMemoryAction;
+      const allowedFields = AGENT_MEMORY_ACTION_FIELDS[action];
+      if (!allowedFields) throw new Error('action must be one of: add, replace, remove, list, batch');
+      const unrelated = Object.keys(params).filter((key) => !allowedFields.has(key));
+      if (unrelated.length) {
+        throw new Error(`fields not allowed for ${action}: ${unrelated.sort().join(', ')}`);
+      }
+      const target = params.target === undefined ? 'agent' : String(params.target);
+      if (target === 'user' || target === 'shared') {
+        if (action !== 'list') throw new Error('user/shared memory is read-only for you; only Commander may write it');
+        return memory.listEntries(opts.uid, target === 'shared' ? 'memory' : 'user');
+      }
+      if (target === 'project' && capabilities.has('project.context.write') && opts.projectId) {
+        if (!(await projectExists(opts.uid, opts.projectId))) throw new Error('project_not_found');
+        assertActive();
+        const scope = { project: opts.projectId };
+        switch (action) {
+          case 'batch': return batchMemoryEntries(opts.uid, scope, params.expected_revision, params.operations, { signal: call.signal });
+          case 'add': return addMemoryEntry(opts.uid, scope, String(params.content || ''), { signal: call.signal });
+          case 'replace': return replaceMemoryEntry(opts.uid, scope, String(params.old_text || ''), String(params.content || ''), { signal: call.signal });
+          case 'remove': return removeMemoryEntry(opts.uid, scope, String(params.old_text || ''));
+          case 'list': return memory.listEntries(opts.uid, scope);
+        }
+      }
+      if (target !== 'agent') throw new Error('target must be "agent" for an external CLI Agent');
+
+      switch (action) {
+        case 'batch':
+          return batchMemoryEntries(opts.uid, { agent: opts.agentId }, params.expected_revision, params.operations, { signal: call.signal });
+        case 'add':
+          return addMemoryEntry(opts.uid, { agent: opts.agentId }, String(params.content || ''), { signal: call.signal });
+        case 'replace':
+          return replaceMemoryEntry(
+            opts.uid,
+            { agent: opts.agentId },
+            String(params.old_text || ''),
+            String(params.content || ''),
+            { signal: call.signal },
+          );
+        case 'remove':
+          return removeAgentEntry(opts.uid, opts.agentId, String(params.old_text || ''));
+        case 'list':
+          return listAgentEntries(opts.uid, opts.agentId);
+      }
+    },
+  });
+
+  if (capabilities.has('project.context.write') && opts.projectId) {
+    const pid = opts.projectId;
+    let instructionsSnapshot = readProjectInstructions(opts.uid, pid);
+    const workspace = opts.workingDir || getWorkspacePath(opts.uid, pid);
+    Object.assign(methods, {
+      project_instructions: async (params: Record<string, unknown>) => {
+        if (Object.keys(params).some((key) => key !== 'instructions')
+            || typeof params.instructions !== 'string' || !params.instructions.trim()) throw new Error('instructions is required; no scope overrides are accepted');
+        const previous = await instructionsSnapshot;
+        if (!previous.ok) return previous;
+        const result = await writeProjectInstructionsIfUnchanged(opts.uid, pid, previous.content, params.instructions);
+        if (result.ok) instructionsSnapshot = Promise.resolve({ ...previous, content: params.instructions });
+        return result;
+      },
+      library_save: async (params: Record<string, unknown>) => {
+        const fieldError = librarySaveFieldError(params);
+        if (fieldError) throw new Error(fieldError);
+        if (typeof params.source_path !== 'string' || !params.source_path.trim()) throw new Error('source_path must be a non-empty string');
+        const source = path.resolve(workspace, params.source_path.trim());
+        if (!isPathAllowed(source, [workspace])) throw new Error('source_path must be inside the current workspace');
+        const name = typeof params.name === 'string' ? params.name.trim() : '';
+        const target = name || path.basename(source);
+        if (params.action === 'checkout') {
+          if (!name || params.expected_revision !== undefined) throw new Error(!name ? 'name must be a non-empty string for checkout' : 'expected_revision is not accepted for checkout');
+          const result = await projectFiles.checkoutProjectFile(opts.uid, pid, name, source);
+          return result.ok ? { ...result, path: result.name } : result;
+        }
+        if (params.expected_revision !== undefined) {
+          const result = await projectFiles.replaceProjectFileFromPath(opts.uid, pid, source, target, params.expected_revision as string);
+          return result.ok ? { ...result, path: result.name } : result;
+        }
+        const result = await projectFiles.copyProjectEntryFromPath(opts.uid, pid, source, target);
+        return result.ok ? { ok: true, path: result.name, bytes: result.bytes } : result;
+      },
+    });
+  }
+
+  if (capabilities.has('commander.handoff')) Object.assign(methods, {
+    'commander.handoff': async (params) => {
+      const reason = String(params.reason || '').trim();
+      const context = String(params.context || '').trim();
+      if (!reason) throw new Error('reason required');
+      if (reason.length > 1_000) throw new Error('reason exceeds 1000 characters');
+      if (context.length > 6_000) throw new Error('context exceeds 6000 characters');
+      const accepted = recordCommanderHandoff({
+        reason,
+        ...(context ? { context } : {}),
+      });
+      return accepted
+        ? { accepted: true }
+        : { accepted: false, already_requested: true };
+    },
+  });
+
+  return {
+    methods,
+    preloadSkillDisplayNames: async () => {
+      if (capabilities.has('skills.read') || capabilities.has('skills.run')) {
+        await listSkills();
+      }
+    },
+    getSkillDisplayName,
+  };
+}
+
+export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> {
+  const token = crypto.randomBytes(24).toString('hex');
+  const socketPath = _socketPath(opts.runId);
+  // Resolve before opening the host socket so a broken runtime invariant
+  // fails without leaking a listener/socket file.
+  const backgroundNode = resolveBackgroundNodeRuntime({
+    bundledNode: opts.sandboxEnv.ORKAS_BUNDLED_NODE,
+  });
+  const connectorDisplayNameById = new Map<string, string>();
+  const recordConnectorDisplayName = (id: string, name: string): void => {
+    const normalizedId = String(id || '').trim();
+    const normalizedName = String(name || '').trim();
+    if (normalizedId && normalizedName) connectorDisplayNameById.set(normalizedId, normalizedName);
+  };
+  const capabilities = await _capabilitiesForRun(opts, recordConnectorDisplayName);
+  const capabilitySet = new Set(capabilities);
+  let closed = false;
+  let commanderHandoff: CommanderHandoffRequest | null = null;
+  const {
+    methods,
+    preloadSkillDisplayNames,
+    getSkillDisplayName,
+  } = _buildMethods(
+    opts,
+    capabilitySet,
+    (request) => {
+      if (commanderHandoff) return false;
+      commanderHandoff = request;
+      return true;
+    },
+    recordConnectorDisplayName,
+    () => !closed,
+  );
+  if (opts.preloadSkillDisplayNames && capabilitySet.has('skills.read')) {
+    try {
+      // Prime the same scoped registry before the resumed backend starts so
+      // its first Skill event has a stable display name. A failed scan leaves
+      // the bridge available and can still recover through a later list/read.
+      await preloadSkillDisplayNames();
+    } catch (err) {
+      log.warn('bridge skill display-name preload failed', {
+        ...bridgeLogContext(opts),
+        error: logErrorRef(err),
+      });
+    }
+  }
+
+  const sockets = new Set<net.Socket>();
+  // Cancellation is scoped to the socket that made the call: request ids are
+  // only unique per client process.
+  const inflight = new WeakMap<net.Socket, Map<string | number, AbortController>>();
+  const inflightFor = (socket: net.Socket): Map<string | number, AbortController> => {
+    let calls = inflight.get(socket);
+    if (!calls) {
+      calls = new Map();
+      inflight.set(socket, calls);
+    }
+    return calls;
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => {
+      sockets.delete(socket);
+      // A client that died mid-wait can no longer receive the result, so a
+      // pending approval must not run its side effect either.
+      for (const controller of inflightFor(socket).values()) controller.abort();
+      inflight.delete(socket);
+    });
+    socket.setEncoding('utf8');
+    let buf = '';
+    socket.on('data', (chunk: string) => {
+      buf += chunk;
+      if (buf.length > MAX_LINE_BYTES) { socket.destroy(); return; }
+      let idx: number;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        void handleLine(line, socket).catch(() => { try { socket.destroy(); } catch { /* gone */ } });
+      }
+    });
+    socket.on('error', () => { /* client died mid-run; harmless */ });
+  });
+
+  const observeCall = (method: string, params: Record<string, unknown>, ok: boolean) => {
+    if (!opts.onCallObserved) return;
+    try { opts.onCallObserved({ method, params, ok }); }
+    catch { log.warn('Bridge call observer failed'); }
+  };
+
+  async function handleLine(line: string, socket: net.Socket): Promise<void> {
+    let req: { id?: unknown; token?: unknown; method?: unknown; params?: unknown };
+    try { req = JSON.parse(line); }
+    catch { socket.destroy(); return; }
+    const id = typeof req.id === 'string' || typeof req.id === 'number' ? req.id : null;
+    // Constant-shape token check; wrong token = silent close (no oracle).
+    // Compare byte lengths (not UTF-16 code-unit lengths) so a multi-byte token
+    // can't slip past the length gate and make timingSafeEqual throw RangeError.
+    const reqTokenBuf = typeof req.token === 'string' ? Buffer.from(req.token) : null;
+    const tokenBuf = Buffer.from(token);
+    if (!reqTokenBuf
+      || reqTokenBuf.length !== tokenBuf.length
+      || !crypto.timingSafeEqual(reqTokenBuf, tokenBuf)) {
+      log.warn('bridge auth failure — destroying connection', bridgeLogContext(opts, socketPath));
+      socket.destroy();
+      return;
+    }
+    const method = typeof req.method === 'string' ? req.method : '';
+    const params = (req.params && typeof req.params === 'object') ? req.params as Record<string, unknown> : {};
+    let payload: string;
+    if (method === 'connectors.cancel') {
+      // Not a registered capability method: it only withdraws this socket's
+      // own pending call, so it needs no visibility of its own.
+      const callId = typeof params.call_id === 'string' || typeof params.call_id === 'number' ? params.call_id : null;
+      const controller = callId === null ? undefined : inflightFor(socket).get(callId);
+      controller?.abort();
+      payload = JSON.stringify({ id, ok: true, result: { cancelled: !!controller } });
+      try { socket.write(payload + '\n'); } catch { /* gone */ }
+      return;
+    }
+    const handler = methods[method];
+    if (!handler) {
+      payload = JSON.stringify({ id, ok: false, error: `unknown method: ${method}` });
+    } else {
+      const controller = new AbortController();
+      const calls = inflightFor(socket);
+      if (id !== null) calls.set(id, controller);
+      try {
+        const result = await handler(params, { signal: controller.signal });
+        payload = JSON.stringify({ id, ok: true, result });
+        observeCall(method, params, true);
+      } catch (err) {
+        payload = JSON.stringify({ id, ok: false, error: (err as Error).message || String(err) });
+        observeCall(method, params, false);
+      } finally {
+        if (id !== null && calls.get(id) === controller) calls.delete(id);
+      }
+    }
+    try { socket.write(payload + '\n'); } catch { /* gone */ }
+  }
+
+  try { fs.unlinkSync(socketPath); } catch { /* none */ }
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => resolve());
+  });
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(socketPath, 0o600); } catch { /* best effort */ }
+  }
+
+  fs.mkdirSync(opts.configDir, { recursive: true });
+  const skillOutputDir = capabilities.includes('skills.run')
+    ? path.join(opts.configDir, '.orkas-bridge-skill-output')
+    : null;
+  if (skillOutputDir) {
+    fs.mkdirSync(skillOutputDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(skillOutputDir, 0o700); } catch { /* best effort */ }
+    }
+  }
+
+  // Secret-bearing env lives in a separate 0600 file so Codex `-c`
+  // overrides and process-info events never need to serialize it.
+  const secretServerEnv: Record<string, string> = withBackgroundNodeEnv({
+    ...opts.sandboxEnv,
+    ORKAS_UID: opts.uid,
+    ORKAS_AGENT_ID: opts.agentId,
+    ORKAS_BRIDGE_SOCKET: socketPath,
+    ORKAS_BRIDGE_TOKEN: token,
+    ORKAS_BRIDGE_CAPABILITIES: capabilities.join(','),
+    ...(skillOutputDir ? { ORKAS_BRIDGE_SKILL_OUTPUT_DIR: skillOutputDir } : {}),
+  }, backgroundNode);
+  const serverEnvFilePath = path.join(opts.configDir, 'orkas-bridge-env.json');
+  const serverEnv: Record<string, string> = withBackgroundNodeEnv({
+    ORKAS_BRIDGE_ENV_FILE: serverEnvFilePath,
+    ...(opts.sandboxEnv.ORKAS_PC_DIR ? { ORKAS_PC_DIR: opts.sandboxEnv.ORKAS_PC_DIR } : {}),
+  }, backgroundNode);
+
+  // MCP config file the CLI agent consumes (claude `--mcp-config <path>`).
+  const bridgeEntry = path.join(opts.sandboxEnv.ORKAS_PC_DIR || '', 'bin', 'orkas-bridge.cjs');
+  const mcpConfig = {
+    mcpServers: {
+      orkas: {
+        command: backgroundNode.executable,
+        args: [bridgeEntry],
+        env: serverEnv,
+      },
+    },
+  };
+  const mcpConfigPath = path.join(opts.configDir, 'orkas-mcp-config.json');
+  fs.writeFileSync(serverEnvFilePath, JSON.stringify(secretServerEnv, null, 2), { mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(serverEnvFilePath, 0o600); } catch { /* best effort */ }
+  }
+  fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), { mode: 0o600 });
+
+  log.info('bridge started', {
+    ...bridgeLogContext(opts, socketPath),
+    mcp_config: logPathRef(mcpConfigPath),
+    env_file: logPathRef(serverEnvFilePath),
+  });
+
+  return {
+    socketPath,
+    token,
+    mcpConfigPath,
+    serverEnv,
+    capabilities,
+    getCommanderHandoff: () => commanderHandoff
+      ? { ...commanderHandoff }
+      : null,
+    getSkillDisplayName,
+    getConnectorDisplayName: (id) => connectorDisplayNameById.get(String(id || '').trim()) || null,
+    close: async () => {
+      closed = true;
+      for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== 'win32') {
+        try { fs.unlinkSync(socketPath); } catch { /* gone */ }
+      }
+      try { fs.unlinkSync(serverEnvFilePath); } catch { /* gone */ }
+      if (skillOutputDir) {
+        try { fs.rmSync(skillOutputDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+      try { fs.rmSync(path.join(opts.configDir, '.orkas-bridge-results'), { recursive: true, force: true }); } catch { /* best effort */ }
+      log.info('bridge closed', bridgeLogContext(opts, socketPath));
+    },
+  };
+}

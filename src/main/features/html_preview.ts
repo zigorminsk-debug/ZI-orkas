@@ -1,0 +1,1903 @@
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import type { BrowserWindow as ElectronBrowserWindow, Session } from 'electron';
+
+import { createPreviewSdk, previewBundle, previewPreload, type PreviewSdkEvidence } from './web_apps/preview';
+import type { Bundle } from './web_apps/runtime';
+import { ARTIFACT_FRAME, mimeFor as artifactMimeFor } from './chat_artifacts';
+import * as chatAttachments from './chat_attachments';
+import { chatMediaLocalPathFromUrl, chatMediaLocalUrl } from '../util/chat-media-url';
+import { serveFileRange } from '../util/http-range';
+import { isPathAllowed } from '../util/path-sandbox';
+import { hardenedWebPreferences, withHtmlPreviewAssetPolicy, withHtmlPreviewPolicy } from '../util/window-security';
+
+const HTML_PREVIEW_TIMEOUT_MS = 20_000;
+const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
+const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
+const HTML_PREVIEW_MAX_INLINE_DOWNLOAD_URL_CHARS = 2 * 1024 * 1024;
+const HTML_PREVIEW_MAX_INTERACTION_SAMPLES = 10;
+const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
+const HTML_PREVIEW_DESIGN_MAX_ELEMENTS = 4_000;
+const HTML_PREVIEW_DESIGN_MAX_TEXT_BOXES = 600;
+const HTML_PREVIEW_DESIGN_MAX_RULES = 20_000;
+/** A product type scale has about this many roles (display, page title,
+ *  section title, body, small body, caption, mono); more sizes on one screen
+ *  is drift from one-off values, not hierarchy. */
+const HTML_PREVIEW_FONT_SIZE_LIMIT = 8;
+
+export type HtmlPreviewViewportName = 'desktop' | 'mobile' | 'embed';
+
+export interface HtmlPreviewViewport {
+  name: HtmlPreviewViewportName;
+  width: number;
+  height: number;
+}
+
+export interface HtmlPreviewLayoutIssue {
+  selector: string;
+  kind: 'left-overflow' | 'right-overflow';
+  pixels: number;
+}
+
+export interface HtmlPreviewTextOverlap {
+  selector: string;
+  /** The unrelated text element or control the text collides with. */
+  other: string;
+  width: number;
+  height: number;
+}
+
+export interface HtmlPreviewLowContrastText {
+  selector: string;
+  ratio: number;
+  /** WCAG AA: 4.5 for body text, 3 for large text. */
+  required: number;
+  color: string;
+  background: string;
+  fontSize: number;
+}
+
+/** Measurable design consistency of the rendered page. These numbers find
+ *  drift and collisions; they do not judge taste, so they are warnings. */
+export interface HtmlPreviewDesignEvidence {
+  /** Distinct computed font sizes (px) of visible text, largest first. */
+  fontSizes: number[];
+  /** Distinct colors declared in color custom properties. */
+  colorTokenCount: number;
+  /** Used colors the author wrote as literals instead of tokens. Alpha is
+   *  ignored, so a translucent variant of a token still counts as the token;
+   *  browser-default colors of unstyled controls are not counted. */
+  nonTokenColorCount: number;
+  nonTokenColors: string[];
+  /** Text that collides with unrelated text or a control, after clipping. */
+  textOverlaps: HtmlPreviewTextOverlap[];
+  lowContrastCount: number;
+  lowContrastText: HtmlPreviewLowContrastText[];
+  /** Existing measurement limits reached; collected observations remain valid. */
+  incomplete?: string[];
+  /** Present when the measurement itself failed; the lists are then empty. */
+  error?: string;
+}
+
+export interface HtmlPreviewViewportEvidence {
+  name: HtmlPreviewViewportName;
+  width: number;
+  height: number;
+  screenshotWidth: number;
+  screenshotHeight: number;
+  readyState: string;
+  title: string;
+  visibleTextChars: number;
+  scrollWidth: number;
+  scrollHeight: number;
+  horizontalOverflowPx: number;
+  /** Content below the fold that no scroll — window or descendant — can
+   *  reach. Ordinary scrollable overflow reads as 0 here. */
+  unreachableOverflowPx: number;
+  focusableCount: number;
+  headingCount: number;
+  missingAltCount: number;
+  failedImageCount: number;
+  layoutIssues: HtmlPreviewLayoutIssue[];
+  ineffectiveTransforms?: string[];
+  design?: HtmlPreviewDesignEvidence;
+  consoleErrors: string[];
+}
+
+export interface HtmlPreviewDownloadEvidence {
+  filename: string;
+  mimeType: string;
+  totalBytes: number;
+  urlKind: 'data' | 'blob' | 'file' | 'other';
+}
+
+export interface HtmlPreviewKeyboardEvidence {
+  method: 'tab-key';
+  focusableFound: number;
+  tabStopsVisited: number;
+  uniqueTabStopsVisited: number;
+  visibleFocusIndicators: number;
+  sequence: string[];
+  failures: string[];
+}
+
+export interface HtmlPreviewInteractionEvidence {
+  performed: boolean;
+  viewport: HtmlPreviewViewportName;
+  controlsExercised: number;
+  stateChangesObserved: number;
+  artifactMessagesObserved: number;
+  stateControlsFound: number;
+  stateControlsExercised: number;
+  stateTransitionsObserved: number;
+  downloadCandidates: string[];
+  formsFound: number;
+  formsSubmitted: number;
+  hashLinksChecked: number;
+  mailtoLinksChecked: number;
+  downloads: HtmlPreviewDownloadEvidence[];
+  keyboard: HtmlPreviewKeyboardEvidence;
+  failureCount: number;
+  failures: string[];
+  /** Missing observable effects are inconclusive, not functional failures. */
+  warningCount?: number;
+  warnings?: string[];
+}
+
+export interface HtmlPreviewEvidence {
+  sdk?: PreviewSdkEvidence;
+  /** Per-viewport observations, not a functional verdict or delivery gate. */
+  sdkByViewport?: Array<PreviewSdkEvidence & { viewport: HtmlPreviewViewportName }>;
+  ok: boolean;
+  entryPath: string;
+  blockedResourceCount: number;
+  blockedResourceSamples: string[];
+  blockers: string[];
+  warnings: string[];
+  viewports: HtmlPreviewViewportEvidence[];
+  screenshotCaptures: Array<{
+    viewport: HtmlPreviewViewportName;
+    width: number;
+    height: number;
+    captured: true;
+  }>;
+  interactions: HtmlPreviewInteractionEvidence;
+}
+
+export interface HtmlPreviewRenderResult {
+  evidence: HtmlPreviewEvidence;
+  screenshots: Buffer[];
+}
+
+type ElectronRuntime = {
+  BrowserWindow?: new (options: Record<string, unknown>) => ElectronBrowserWindow;
+  session?: {
+    fromPartition(partition: string): Session;
+  };
+};
+
+export interface HtmlPreviewRuntimeDeps {
+  loadElectron?: () => Promise<ElectronRuntime>;
+}
+
+export interface HtmlPreviewRenderOptions {
+  interactions?: boolean;
+  /** Host-owned chat artifact bridge, served without changing the artifact files. */
+  bridgeJavaScript?: string;
+  /** Check a plain page the way the chat file viewer shows it: through
+   *  `chat-media://local` with the viewer's sandbox (no storage, CORS-gated
+   *  assets). Generated artifacts render in `chat-app://` and keep the default. */
+  fileViewer?: boolean;
+  /** Measure type sizes, token colors, text overlap, and contrast, and report
+   *  findings as warnings. Defaults to true; the chat-artifact smoke judges
+   *  operability only and turns it off. */
+  designAudit?: boolean;
+}
+
+type PageEvidence = Omit<
+  HtmlPreviewViewportEvidence,
+  'name' | 'width' | 'height' | 'screenshotWidth' | 'screenshotHeight' | 'consoleErrors'
+>;
+
+type PageInteractionEvidence = Omit<
+  HtmlPreviewInteractionEvidence,
+  'performed' | 'viewport' | 'downloads' | 'keyboard'
+>;
+
+type RenderInteractionEvidence = PageInteractionEvidence & {
+  performed: boolean;
+  keyboard: HtmlPreviewKeyboardEvidence;
+};
+
+function emptyPageInteractionEvidence(): PageInteractionEvidence {
+  return {
+    controlsExercised: 0,
+    stateChangesObserved: 0,
+    artifactMessagesObserved: 0,
+    stateControlsFound: 0,
+    stateControlsExercised: 0,
+    stateTransitionsObserved: 0,
+    downloadCandidates: [],
+    formsFound: 0,
+    formsSubmitted: 0,
+    hashLinksChecked: 0,
+    mailtoLinksChecked: 0,
+    failureCount: 0,
+    failures: [],
+    warningCount: 0,
+    warnings: [],
+  };
+}
+
+const READY_SCRIPT = `(async () => {
+  if (document.fonts && document.fonts.ready) await document.fonts.ready;
+  const images = Array.from(document.images || []);
+  await Promise.all(images.map((img) => img.complete ? Promise.resolve() : new Promise((resolve) => {
+    img.addEventListener('load', resolve, { once: true });
+    img.addEventListener('error', resolve, { once: true });
+  })));
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  return true;
+})()`;
+
+// CSS Transforms excludes non-replaced inline boxes. Check computed state,
+// including states reached by interactions, without interpreting app text.
+// https://www.w3.org/TR/css-transforms-1/#transformable-element
+const INEFFECTIVE_TRANSFORMS_SCRIPT = `
+  const ineffectiveTransforms = () => {
+    const issues = [];
+    for (const element of document.body?.querySelectorAll('*') || []) {
+      if (!(element instanceof HTMLElement)) continue;
+      const style = getComputedStyle(element);
+      if (style.display !== 'inline' || style.transform === 'none'
+        || style.visibility === 'hidden' || Number(style.opacity) === 0
+        || !element.getClientRects().length) continue;
+      // Replaced content and native controls can have transformable boxes.
+      if (element.matches('img,video,audio,canvas,iframe,embed,object,input,textarea,select,button')
+        || !['normal', 'none'].includes(style.content)) continue;
+      if (new DOMMatrixReadOnly(style.transform).isIdentity) continue;
+      const selector = element.id ? '#' + CSS.escape(element.id)
+        : element.tagName.toLowerCase() + Array.from(element.classList).slice(0, 2).map(c => '.' + CSS.escape(c)).join('');
+      issues.push(selector.slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}));
+      if (issues.length >= ${HTML_PREVIEW_MAX_DIAGNOSTICS}) break;
+    }
+    return issues;
+  };
+`;
+
+// Design audit, spliced into the evidence script after `visible` and
+// `selector`. It reads computed styles only. Colors are normalized through a
+// canvas so hex, rgb(), and named values compare equal; text boxes are Range
+// rects clipped by overflow ancestors, so a scrolled-away list item does not
+// "overlap" what sits below its scroller. Any failure is returned in
+// `design.error` rather than failing the preview.
+const DESIGN_EVIDENCE_SCRIPT = `
+  const designEvidence = () => {
+    const maxSamples = ${HTML_PREVIEW_MAX_DIAGNOSTICS};
+    const maxBoxes = ${HTML_PREVIEW_DESIGN_MAX_TEXT_BOXES};
+    const incomplete = new Set();
+    const colorCanvas = document.createElement('canvas');
+    colorCanvas.width = colorCanvas.height = 1;
+    const paint = colorCanvas.getContext('2d', { willReadFrequently: true });
+    const parsedColors = new Map();
+    const normalizeColor = (raw) => {
+      if (!raw || !paint || /^(none|currentcolor|inherit|initial|unset)$/i.test(raw)) return null;
+      paint.fillStyle = '#000001';
+      paint.fillStyle = raw;
+      const first = String(paint.fillStyle);
+      paint.fillStyle = '#000002';
+      paint.fillStyle = raw;
+      if (String(paint.fillStyle) !== first) return null;
+      if (first.charAt(0) === '#') {
+        const bits = parseInt(first.slice(1, 7), 16);
+        return [(bits >> 16) & 255, (bits >> 8) & 255, bits & 255, 1];
+      }
+      const match = first.match(/^rgba?\\(([^)]+)\\)$/);
+      if (!match) {
+        // CSS Color 4 values retain their syntax in fillStyle. Read the actual
+        // sRGB paint instead of treating a valid rendered color as unavailable.
+        paint.clearRect(0, 0, 1, 1);
+        paint.fillRect(0, 0, 1, 1);
+        const pixels = paint.getImageData(0, 0, 1, 1).data;
+        return [pixels[0], pixels[1], pixels[2], pixels[3] / 255];
+      }
+      const parts = match[1].split(',').map((part) => parseFloat(part));
+      if (parts.length < 3 || parts.some((part) => !Number.isFinite(part))) return null;
+      return [parts[0], parts[1], parts[2], parts.length > 3 ? parts[3] : 1];
+    };
+    const parseColor = (value) => {
+      const raw = String(value || '').trim();
+      if (!parsedColors.has(raw)) parsedColors.set(raw, normalizeColor(raw));
+      return parsedColors.get(raw);
+    };
+    const hex = (color) => '#' + color.slice(0, 3)
+      .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, '0'))
+      .join('');
+
+    // Tokens are color custom properties; "hard-coded" colors are color
+    // literals the author wrote anywhere else. A used color that is neither
+    // came from the browser's default styles, which is a different problem.
+    const tokenNames = new Set();
+    const tokenColors = [];
+    const literalColors = [];
+    const colorProperty = /color|^background|^border|^outline|^fill$|^stroke$|shadow|^column-rule|^text-decoration/;
+    const literalPattern = /#[0-9a-f]{3,8}\\b|\\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\\([^()]*\\)|\\b[a-z]{3,20}\\b/gi;
+    const collect = (value, into) => {
+      for (const literal of String(value || '').match(literalPattern) || []) {
+        const color = parseColor(literal);
+        if (color && color[3] > 0) into.push(color);
+      }
+    };
+    const scanDeclarations = (style) => {
+      for (let index = 0; index < style.length; index += 1) {
+        const name = String(style[index]);
+        if (name.startsWith('--')) collect(style.getPropertyValue(name), tokenColors);
+        else if (colorProperty.test(name)) collect(style.getPropertyValue(name), literalColors);
+      }
+    };
+    // Bounded so a full utility-class framework cannot stall the preview.
+    let rulesLeft = ${HTML_PREVIEW_DESIGN_MAX_RULES};
+    const scanRules = (rules) => {
+      for (let index = 0; index < (rules?.length || 0); index += 1) {
+        if (rulesLeft-- <= 0) { incomplete.add('stylesheet_rule_limit'); return; }
+        const rule = rules[index];
+        if (rule.style) {
+          scanDeclarations(rule.style);
+          if (/^\\s*(:root|html|body)\\b/i.test(String(rule.selectorText || ''))) {
+            for (let index = 0; index < rule.style.length; index += 1) {
+              if (String(rule.style[index]).startsWith('--')) tokenNames.add(rule.style[index]);
+            }
+          }
+        }
+        if (rule.cssRules) scanRules(rule.cssRules);
+      }
+    };
+    for (const sheet of Array.from(document.styleSheets || [])) {
+      let rules = [];
+      try { rules = sheet.cssRules || []; } catch (error) { continue; }
+      scanRules(rules);
+    }
+    for (const host of [document.documentElement, document.body]) {
+      if (!host) continue;
+      const style = getComputedStyle(host);
+      for (let index = 0; index < style.length; index += 1) {
+        if (String(style[index]).startsWith('--')) tokenNames.add(style[index]);
+      }
+    }
+    const rootStyle = getComputedStyle(document.documentElement);
+    const bodyStyle = document.body ? getComputedStyle(document.body) : rootStyle;
+    for (const name of tokenNames) {
+      collect(rootStyle.getPropertyValue(name) || bodyStyle.getPropertyValue(name), tokenColors);
+    }
+    const near = (list, color) => list.some((item) => Math.abs(item[0] - color[0]) <= 2
+      && Math.abs(item[1] - color[1]) <= 2 && Math.abs(item[2] - color[2]) <= 2);
+    const tokenCount = new Set(tokenColors.map((color) => hex(color))).size;
+
+    const used = new Map();
+    const record = (value, element) => {
+      const color = parseColor(value);
+      if (!color || color[3] <= 0) return;
+      const key = hex(color);
+      const entry = used.get(key);
+      if (entry) entry.count += 1;
+      else used.set(key, { color, count: 1, where: selector(element) });
+    };
+
+    const white = [255, 255, 255, 1];
+    const blend = (top, bottom) => [0, 1, 2]
+      .map((index) => top[index] * top[3] + bottom[index] * (1 - top[3]))
+      .concat(1);
+    const backgrounds = new Map();
+    // Composited background behind an element's text, or null when an image
+    // or gradient makes it unknowable from computed colors.
+    const backgroundOf = (element) => {
+      if (!element) return white;
+      if (backgrounds.has(element)) return backgrounds.get(element);
+      const style = getComputedStyle(element);
+      let result = null;
+      if (!style.backgroundImage || style.backgroundImage === 'none') {
+        const own = parseColor(style.backgroundColor);
+        if (own && own[3] >= 1) result = own;
+        else {
+          const below = backgroundOf(element.parentElement);
+          result = below && own && own[3] > 0 ? blend(own, below) : below;
+        }
+      }
+      backgrounds.set(element, result);
+      return result;
+    };
+    const channel = (value) => {
+      const unit = value / 255;
+      return unit <= 0.03928 ? unit / 12.92 : Math.pow((unit + 0.055) / 1.055, 2.4);
+    };
+    const luminance = (color) => 0.2126 * channel(color[0]) + 0.7152 * channel(color[1])
+      + 0.0722 * channel(color[2]);
+    const contrast = (left, right) => {
+      const a = luminance(left);
+      const b = luminance(right);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    };
+
+    const clips = new Map();
+    const clipOf = (element) => {
+      if (clips.has(element)) return clips.get(element);
+      const style = getComputedStyle(element);
+      let clip = null;
+      if (!(element instanceof SVGElement) && !/^(inline|contents)$/.test(style.display)
+        && (style.overflowX !== 'visible' || style.overflowY !== 'visible')) {
+        const rect = element.getBoundingClientRect();
+        const left = rect.left + element.clientLeft;
+        const top = rect.top + element.clientTop;
+        clip = { left, top, right: left + element.clientWidth, bottom: top + element.clientHeight };
+      }
+      clips.set(element, clip);
+      return clip;
+    };
+    const clipped = (rect, from) => {
+      let box = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+      for (let node = from; node && node !== document.body && node !== document.documentElement;
+        node = node.parentElement) {
+        const clip = clipOf(node);
+        if (!clip) continue;
+        box = {
+          left: Math.max(box.left, clip.left),
+          top: Math.max(box.top, clip.top),
+          right: Math.min(box.right, clip.right),
+          bottom: Math.min(box.bottom, clip.bottom),
+        };
+        if (box.right - box.left < 1 || box.bottom - box.top < 1) return null;
+      }
+      return box;
+    };
+
+    const ownText = (element) => Array.from(element.childNodes)
+      .some((node) => node.nodeType === 3 && /\\S/.test(node.nodeValue || ''));
+    const textRects = (element) => {
+      const rects = [];
+      for (const node of Array.from(element.childNodes)) {
+        if (node.nodeType !== 3 || !/\\S/.test(node.nodeValue || '')) continue;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const list = range.getClientRects();
+        for (let index = 0; index < list.length; index += 1) {
+          const rect = list[index];
+          if (rect.width >= 1 && rect.height >= 1) {
+            if (rects.length >= 24) { incomplete.add('text_rectangle_limit'); return rects; }
+            rects.push(rect);
+          }
+        }
+      }
+      return rects;
+    };
+    const shown = (element) => (typeof element.checkVisibility === 'function'
+      ? element.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+      : visible(element));
+    const sides = ['Top', 'Right', 'Bottom', 'Left'];
+    const controlSelector = 'button, input:not([type="hidden"]), select, textarea, a[href], [role="button"], [role="link"]';
+    const fieldSelector = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+      + ':not([type="range"]):not([type="color"]):not([type="file"]), textarea, select';
+
+    const fontSizes = new Set();
+    const textBoxes = [];
+    const controls = [];
+    const lowContrast = [];
+    const nodes = document.body?.querySelectorAll('*') || [];
+    if (nodes.length > ${HTML_PREVIEW_DESIGN_MAX_ELEMENTS}) incomplete.add('element_limit');
+    const elements = Array.from({ length: Math.min(nodes.length, ${HTML_PREVIEW_DESIGN_MAX_ELEMENTS}) },
+      (_, index) => nodes[index]);
+    for (const element of elements) {
+      if (element.hasAttribute('style')) scanDeclarations(element.style);
+      if (element instanceof SVGElement) {
+        collect(element.getAttribute('fill'), literalColors);
+        collect(element.getAttribute('stroke'), literalColors);
+      }
+      if (!shown(element)) continue;
+      const style = getComputedStyle(element);
+      record(style.backgroundColor, element);
+      for (const side of sides) {
+        const borderStyle = style['border' + side + 'Style'];
+        if (parseFloat(style['border' + side + 'Width']) > 0 && borderStyle !== 'none' && borderStyle !== 'hidden') {
+          record(style['border' + side + 'Color'], element);
+        }
+      }
+      if (element instanceof SVGElement && !(element instanceof SVGSVGElement)) {
+        if (!/^(none|url)/.test(style.fill)) record(style.fill, element);
+        if (!/^(none|url)/.test(style.stroke)) record(style.stroke, element);
+      }
+      const box = element.getBoundingClientRect();
+      const hasText = ownText(element);
+      const field = element.matches(fieldSelector);
+      if (element.matches(controlSelector) && controls.length < maxBoxes) {
+        // A transparent, empty overlay link paints nothing text could collide with.
+        const paints = hasText || field || Boolean(element.querySelector('svg, img'))
+          || (parseColor(style.backgroundColor) || [0, 0, 0, 0])[3] > 0
+          || sides.some((side) => parseFloat(style['border' + side + 'Width']) > 0);
+        const area = paints ? clipped(box, element.parentElement) : null;
+        if (area) controls.push({ element, area });
+      } else if (element.matches(controlSelector) && controls.length >= maxBoxes) {
+        incomplete.add('control_box_limit');
+      }
+      // A 1-2px box is visually hidden (sr-only) text: no size, color, or collision.
+      if ((!hasText && !field) || box.width <= 2 || box.height <= 2) continue;
+      const rects = hasText ? textRects(element) : [box];
+      if (!rects.length) continue;
+      const size = Math.round(parseFloat(style.fontSize) * 2) / 2;
+      if (size > 0) fontSizes.add(size);
+      record(style.color, element);
+      if (!hasText) continue;
+      if (textBoxes.length < maxBoxes) {
+        const lines = rects.map((rect) => clipped(rect, element)).filter(Boolean);
+        if (lines.length) {
+          textBoxes.push({
+            element,
+            lines,
+            bounds: {
+              left: Math.min(...lines.map((line) => line.left)),
+              top: Math.min(...lines.map((line) => line.top)),
+              right: Math.max(...lines.map((line) => line.right)),
+              bottom: Math.max(...lines.map((line) => line.bottom)),
+            },
+          });
+        }
+      } else {
+        incomplete.add('text_box_limit');
+      }
+      if (element.closest(':disabled, [aria-disabled="true"]')) continue;
+      const ink = parseColor(style.color);
+      const ground = backgroundOf(element);
+      if (!ink || ink[3] <= 0 || !ground) continue;
+      const text = ink[3] < 1 ? blend(ink, ground) : ink;
+      const ratio = contrast(text, ground);
+      const px = parseFloat(style.fontSize) || 16;
+      const weight = parseFloat(style.fontWeight) || 400;
+      const required = px >= 24 || (px >= 18.66 && weight >= 700) ? 3 : 4.5;
+      if (ratio + 0.005 < required) {
+        lowContrast.push({
+          selector: selector(element),
+          ratio: Math.floor(ratio * 100) / 100,
+          required,
+          color: hex(text),
+          background: hex(ground),
+          fontSize: px,
+        });
+      }
+    }
+
+    const overlaps = [];
+    const reported = new Set();
+    const ids = new Map();
+    const idOf = (element) => {
+      if (!ids.has(element)) ids.set(element, ids.size);
+      return ids.get(element);
+    };
+    const overlap = (left, right) => {
+      const width = Math.min(left.right, right.right) - Math.max(left.left, right.left);
+      const height = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top);
+      return width > 2 && height > 2 ? { width, height } : null;
+    };
+    // Tight line-height lets neighbouring glyph boxes touch; only a quarter of
+    // a line or more counts as a collision.
+    const collides = (line, other) => {
+      const hit = overlap(line, other);
+      return hit && hit.height > Math.min(line.bottom - line.top, other.bottom - other.top) * 0.25 ? hit : null;
+    };
+    const labelFor = (element) => {
+      const label = element.closest('label');
+      return label ? label.control : null;
+    };
+    const related = (left, right) => left === right || left.contains(right) || right.contains(left)
+      || labelFor(left) === right || labelFor(right) === left;
+    // One entry per colliding pair: text-on-text and text-on-control can both
+    // fire for the same two elements.
+    const note = (element, other, hit) => {
+      const key = [idOf(element), idOf(other)].sort((left, right) => left - right).join('|');
+      if (reported.has(key) || overlaps.length >= maxSamples) return;
+      reported.add(key);
+      overlaps.push({
+        selector: selector(element),
+        other: selector(other),
+        width: Math.round(hit.width),
+        height: Math.round(hit.height),
+      });
+    };
+    for (let index = 0; index < textBoxes.length && overlaps.length < maxSamples; index += 1) {
+      const current = textBoxes[index];
+      for (let next = index + 1; next < textBoxes.length; next += 1) {
+        const candidate = textBoxes[next];
+        if (!overlap(current.bounds, candidate.bounds) || related(current.element, candidate.element)) continue;
+        let hit = null;
+        for (const line of current.lines) {
+          for (const other of candidate.lines) {
+            hit = collides(line, other);
+            if (hit) break;
+          }
+          if (hit) break;
+        }
+        if (hit) note(current.element, candidate.element, hit);
+      }
+      for (const control of controls) {
+        if (!overlap(current.bounds, control.area) || related(current.element, control.element)) continue;
+        let hit = null;
+        for (const line of current.lines) {
+          hit = collides(line, control.area);
+          if (hit) break;
+        }
+        if (hit) note(current.element, control.element, hit);
+      }
+    }
+
+    const nonToken = Array.from(used.entries())
+      .filter(([, entry]) => near(literalColors, entry.color) && !near(tokenColors, entry.color))
+      .sort((left, right) => right[1].count - left[1].count);
+    return {
+      fontSizes: Array.from(fontSizes).sort((left, right) => right - left),
+      colorTokenCount: tokenCount,
+      nonTokenColorCount: nonToken.length,
+      nonTokenColors: nonToken.slice(0, maxSamples).map(([key, entry]) => key + ' (' + entry.where + ')'),
+      textOverlaps: overlaps,
+      lowContrastCount: lowContrast.length,
+      // Repeated rows of one component share a sample.
+      lowContrastText: lowContrast
+        .sort((left, right) => left.ratio - right.ratio)
+        .filter((item, index, list) => list.findIndex((other) => other.selector === item.selector
+          && other.color === item.color && other.background === item.background
+          && other.fontSize === item.fontSize) === index)
+        .slice(0, maxSamples),
+      ...(incomplete.size ? { incomplete: Array.from(incomplete) } : {}),
+    };
+  };
+  const safeDesignEvidence = () => {
+    try {
+      return designEvidence();
+    } catch (error) {
+      return {
+        fontSizes: [],
+        colorTokenCount: 0,
+        nonTokenColorCount: 0,
+        nonTokenColors: [],
+        textOverlaps: [],
+        lowContrastCount: 0,
+        lowContrastText: [],
+        error: String((error && error.message) || error).slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}),
+      };
+    }
+  };
+`;
+
+function evidenceScript(designAudit: boolean): string {
+  return `(() => {
+  ${INEFFECTIVE_TRANSFORMS_SCRIPT}
+  const viewportWidth = Math.max(1, document.documentElement.clientWidth || window.innerWidth || 1);
+  const viewportHeight = Math.max(1, document.documentElement.clientHeight || window.innerHeight || 1);
+  const visible = (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity || 1) > 0 && rect.width > 0.5 && rect.height > 0.5;
+  };
+  const selector = (element) => {
+    if (element.id) return '#' + CSS.escape(element.id);
+    const classes = Array.from(element.classList || []).slice(0, 2).map((value) => '.' + CSS.escape(value)).join('');
+    return String(element.tagName || 'element').toLowerCase() + classes;
+  };
+  ${designAudit ? DESIGN_EVIDENCE_SCRIPT : ''}
+  const issues = [];
+  for (const element of Array.from(document.body?.querySelectorAll('*') || [])) {
+    if (issues.length >= ${HTML_PREVIEW_MAX_DIAGNOSTICS} || !visible(element)) continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.left < -1) {
+      issues.push({ selector: selector(element), kind: 'left-overflow', pixels: Math.ceil(Math.abs(rect.left)) });
+    }
+    if (issues.length < ${HTML_PREVIEW_MAX_DIAGNOSTICS} && rect.right > viewportWidth + 1) {
+      issues.push({ selector: selector(element), kind: 'right-overflow', pixels: Math.ceil(rect.right - viewportWidth) });
+    }
+  }
+  const focusableSelector = [
+    'a[href]', 'button:not([disabled])', 'input:not([disabled])', 'select:not([disabled])',
+    'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])', '[contenteditable="true"]'
+  ].join(',');
+  const focusableCount = Array.from(document.querySelectorAll(focusableSelector)).filter(visible).length;
+  const bodyText = String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+  const images = Array.from(document.images || []);
+  const scrollWidth = Math.max(
+    document.documentElement.scrollWidth || 0,
+    document.body?.scrollWidth || 0,
+    viewportWidth
+  );
+  // Content the user cannot get to at all: the page is taller than the
+  // viewport, the window will not scroll, and no descendant offers a scroll of
+  // its own. Ordinary scrollable overflow is fine and reads as 0; this is the
+  // shape a short embed frame turns a full-viewport layout into.
+  const scrollHeight = Math.max(document.documentElement.scrollHeight || 0, document.body?.scrollHeight || 0);
+  let unreachableOverflowPx = 0;
+  if (scrollHeight > viewportHeight + 1) {
+    const startScroll = window.scrollY;
+    window.scrollTo(0, scrollHeight);
+    const windowReach = window.scrollY;
+    window.scrollTo(0, startScroll);
+    let descendantReach = 0;
+    for (const element of Array.from(document.body?.querySelectorAll('*') || [])) {
+      const overflowY = getComputedStyle(element).overflowY;
+      if (overflowY !== 'auto' && overflowY !== 'scroll') continue;
+      descendantReach = Math.max(descendantReach, element.scrollHeight - element.clientHeight);
+    }
+    unreachableOverflowPx = Math.max(
+      0,
+      Math.ceil(scrollHeight - viewportHeight - Math.max(windowReach, descendantReach)),
+    );
+  }
+  return {
+    readyState: String(document.readyState || ''),
+    title: String(document.title || '').slice(0, 200),
+    visibleTextChars: bodyText.length,
+    scrollWidth,
+    scrollHeight,
+    horizontalOverflowPx: Math.max(0, Math.ceil(scrollWidth - viewportWidth)),
+    unreachableOverflowPx,
+    focusableCount,
+    headingCount: document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,
+    missingAltCount: images.filter((img) => !img.hasAttribute('alt')).length,
+    failedImageCount: images.filter((img) => img.complete && img.naturalWidth === 0).length,
+    layoutIssues: issues,
+    ineffectiveTransforms: ineffectiveTransforms()${designAudit ? `,
+    design: safeDesignEvidence()` : ''}
+  };
+})()`;
+}
+
+const EVIDENCE_SCRIPT = evidenceScript(false);
+const DESIGN_AUDIT_EVIDENCE_SCRIPT = evidenceScript(true);
+
+const INTERACTION_SCRIPT = `(async () => {
+  ${INEFFECTIVE_TRANSFORMS_SCRIPT}
+  const visible = (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity || 1) > 0 && rect.width > 0.5 && rect.height > 0.5;
+  };
+  const label = (element) => String(
+    element.getAttribute?.('aria-label')
+    || element.getAttribute?.('download')
+    || element.textContent
+    || element.id
+    || element.tagName
+    || 'control'
+  ).replace(/\\s+/g, ' ').trim().slice(0, 120);
+  const temporalSamples = {
+    date: '2000-01-01', time: '12:00', month: '2000-01', week: '2000-W01',
+    'datetime-local': '2000-01-01T12:00'
+  };
+  const fillTemporalField = (field) => {
+    const sample = temporalSamples[field.type];
+    if (!sample) return false;
+    const original = field.value;
+    for (const candidate of [field.min, field.max, original, sample]) {
+      if (!candidate) continue;
+      field.value = candidate;
+      if (field.value && field.validity.valid) return true;
+    }
+    // Inconsistent constraints must still fail the form's validity check.
+    field.value = original;
+    return true;
+  };
+  // SVG role controls have no HTMLElement.click(), but receive DOM click
+  // events. Keep native activation for HTML controls (forms and downloads).
+  const activateControl = (control) => {
+    if (typeof control.click === 'function') control.click();
+    else control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  };
+  const failures = [];
+  const warnings = [];
+  const reportedTransforms = new Set();
+  const auditTransforms = () => {
+    for (const selector of ineffectiveTransforms()) {
+      if (reportedTransforms.has(selector) || reportedTransforms.size >= ${HTML_PREVIEW_MAX_DIAGNOSTICS}) continue;
+      reportedTransforms.add(selector);
+      failures.push('CSS transform does not apply to non-replaced inline box: ' + selector);
+    }
+  };
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const maxGenericControls = 5;
+  const maxStateControls = 8;
+  const maxFormStates = 5;
+  let controlsExercised = 0;
+  let stateChangesObserved = 0;
+  let artifactMessagesObserved = 0;
+  let stateControlsFound = 0;
+  let stateControlsExercised = 0;
+  let stateTransitionsObserved = 0;
+  window.addEventListener('message', (event) => {
+    if (event && event.data && event.data.__orkasArtifact === true) artifactMessagesObserved += 1;
+  });
+
+  const visibleState = () => JSON.stringify(
+    Array.from(document.body?.querySelectorAll('*') || [])
+      .filter((element) => visible(element) && !element.matches('textarea,select,option'))
+      // A dense graphic can precede the panel a control changes. Compare the
+      // whole visible state; only returned diagnostics should be truncated.
+      .map((element) => [
+        String(element.tagName || '').toLowerCase(),
+        String(element.id || ''),
+        String(element.className || '').slice(0, 120),
+        String(element.getAttribute?.('aria-expanded') || ''),
+        String(element.getAttribute?.('aria-pressed') || ''),
+        String(element.getAttribute?.('aria-selected') || ''),
+        element instanceof HTMLInputElement ? String(element.type || '') : '',
+        element instanceof HTMLInputElement ? String(element.checked) : '',
+        element instanceof HTMLImageElement ? String(element.currentSrc || element.src || '') : '',
+        element instanceof HTMLProgressElement ? String(element.value) : '',
+        String(element.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 180)
+      ])
+  );
+
+  const settleVisibleState = async (before, maxWaitMs = 1200, waitForFullWindow = false) => {
+    let latest = before;
+    let stableTicks = 0;
+    const attempts = Math.max(1, Math.ceil(maxWaitMs / 100));
+    for (let index = 0; index < attempts; index += 1) {
+      await sleep(100);
+      const next = visibleState();
+      if (next === latest) stableTicks += 1;
+      else {
+        latest = next;
+        stableTicks = 0;
+      }
+      if (!waitForFullWindow && latest !== before && stableTicks >= 1) break;
+    }
+    return latest;
+  };
+
+  const hashLinks = Array.from(document.querySelectorAll('a[href^="#"]')).filter(visible);
+  let hashLinksChecked = 0;
+  for (const link of hashLinks.slice(0, 20)) {
+    try {
+      const href = String(link.getAttribute('href') || '');
+      const target = href && href !== '#' ? document.querySelector(href) : null;
+      if (target) hashLinksChecked += 1;
+      else failures.push('missing hash target for ' + label(link));
+    } catch {
+      failures.push('invalid hash target for ' + label(link));
+    }
+  }
+
+  const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]')).filter(visible);
+  let mailtoLinksChecked = 0;
+  for (const link of mailtoLinks.slice(0, 10)) {
+    try {
+      const url = new URL(link.href);
+      if (url.protocol === 'mailto:' && url.pathname.includes('@')) mailtoLinksChecked += 1;
+      else failures.push('invalid mailto target for ' + label(link));
+    } catch {
+      failures.push('invalid mailto target for ' + label(link));
+    }
+  }
+
+  // Exercise each standalone field once before controls consume its value.
+  // Recheck after state changes for newly revealed fields, sharing one budget.
+  const exercisedFields = new WeakSet();
+  let fieldsExercised = 0;
+  const exerciseVisibleFields = async () => {
+    if (fieldsExercised >= maxGenericControls) return;
+    const fields = Array.from(document.querySelectorAll('input,textarea,select'))
+      .filter((field) => visible(field) && !field.disabled && !field.readOnly && !field.closest('form')
+        && !exercisedFields.has(field))
+      .slice(0, maxGenericControls - fieldsExercised);
+    for (const field of fields) {
+      exercisedFields.add(field);
+      fieldsExercised += 1;
+      try {
+        const before = visibleState();
+        if (field instanceof HTMLSelectElement) {
+          const alternatives = Array.from(field.options).filter((option) => !option.disabled);
+          const next = alternatives.find((option) => option.value !== field.value);
+          if (next) field.value = next.value;
+        } else if (field instanceof HTMLInputElement) {
+          const type = String(field.type || '').toLowerCase();
+          if (type === 'checkbox') field.checked = !field.checked;
+          else if (type === 'radio') field.checked = true;
+          else if (fillTemporalField(field)) { /* Preserve native formats and bounds. */ }
+          else if (type === 'number' || type === 'range') {
+            const current = Number(field.value || 0);
+            const step = Math.max(1, Number(field.step || 1) || 1);
+            field.value = String(current + step);
+          } else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
+            field.value = String(field.value || '') + ' preview';
+          }
+        } else if (field instanceof HTMLTextAreaElement) {
+          field.value = String(field.value || '') + ' preview';
+        }
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        controlsExercised += 1;
+        const after = await settleVisibleState(before, 500);
+        auditTransforms();
+        if (after !== before) stateChangesObserved += 1;
+        else warnings.push('standalone field produced no observable outcome: ' + label(field));
+      } catch (error) {
+        failures.push('control interaction failed for ' + label(field) + ': ' + String(error?.message || error));
+      }
+    }
+  };
+
+  await exerciseVisibleFields();
+
+  const explicitDownloads = Array.from(document.querySelectorAll('a[download]')).filter(visible);
+  const namedDownloadButtons = Array.from(document.querySelectorAll('button,[role="button"]'))
+    .filter((element) => visible(element) && /download|resume|cv|简历|下载/i.test(label(element)));
+  const downloadControls = [...explicitDownloads, ...namedDownloadButtons]
+    .filter((element, index, values) => values.indexOf(element) === index)
+    .slice(0, 10);
+  const downloadCandidates = downloadControls.map(label);
+  for (const control of downloadControls) {
+    try {
+      activateControl(control);
+      controlsExercised += 1;
+      await sleep(120);
+    } catch (error) {
+      failures.push('download action failed for ' + label(control) + ': ' + String(error?.message || error));
+    }
+  }
+
+  const seenFormStates = new Set();
+  const formIds = new WeakMap();
+  let nextFormId = 1;
+  const formIdentity = (form) => {
+    if (!formIds.has(form)) formIds.set(form, nextFormId++);
+    return formIds.get(form);
+  };
+  const formStateKey = (form) => JSON.stringify([
+    formIdentity(form),
+    String(form.id || ''),
+    String(form.getAttribute?.('name') || ''),
+    String(form.getAttribute?.('action') || ''),
+    Array.from(form.elements || [])
+      .filter((field) => visible(field) && !field.disabled)
+      .map((field) => [
+        String(field.tagName || '').toLowerCase(),
+        String(field.type || ''),
+        String(field.id || ''),
+        String(field.getAttribute?.('name') || ''),
+        String(field.getAttribute?.('aria-label') || '')
+      ])
+  ]);
+  let formsFound = 0;
+  let formsSubmitted = 0;
+  const exercisedStateControls = new WeakSet();
+  const exerciseVisibleForms = async () => {
+    const forms = Array.from(document.forms || []).filter(visible);
+    for (const form of forms) {
+      if (formsFound >= maxFormStates) break;
+      const hasPendingLocalControl = Array.from(form.querySelectorAll('button,[role="button"],[role="tab"]'))
+        .some((control) => {
+          const type = control instanceof HTMLButtonElement ? control.type
+            : String(control.getAttribute?.('type') || 'button').toLowerCase();
+          return visible(control)
+            && !control.disabled
+            && control.getAttribute?.('aria-disabled') !== 'true'
+            && !['submit', 'reset'].includes(type)
+            && !downloadControls.includes(control)
+            && !exercisedStateControls.has(control);
+        });
+      if (hasPendingLocalControl) continue;
+      const key = formStateKey(form);
+      if (seenFormStates.has(key)) continue;
+      seenFormStates.add(key);
+      formsFound += 1;
+      try {
+        for (const field of Array.from(form.elements || [])) {
+          if (!visible(field) || field.disabled || field.readOnly) continue;
+          const type = String(field.type || '').toLowerCase();
+          if (type === 'checkbox' || type === 'radio') {
+            if (field.required) field.checked = true;
+          } else if (field instanceof HTMLSelectElement) {
+            const option = Array.from(field.options).find((candidate) => !candidate.disabled && candidate.value);
+            if (option) field.value = option.value;
+          } else if (
+            field instanceof HTMLInputElement
+            || field instanceof HTMLTextAreaElement
+          ) {
+            if (field instanceof HTMLInputElement && fillTemporalField(field)) { /* Native temporal sample. */ }
+            else if (type === 'email') field.value = 'preview-check@example.invalid';
+            else if (type === 'url') field.value = 'https://example.invalid/';
+            else if (type === 'number') field.value = field.min || '1';
+            else if (type === 'password') field.value = 'Preview-Check-9!';
+            else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
+              const original = field.value;
+              for (const sample of [original, 'Preview interaction check', '1', '0']) {
+                if (!sample) continue;
+                field.value = sample;
+                if (field.validity.valid) break;
+              }
+            }
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+            field.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        if (!form.checkValidity()) {
+          failures.push('form remained invalid after safe sample fill: ' + label(form));
+          continue;
+        }
+        const before = visibleState();
+        const messagesBefore = artifactMessagesObserved;
+        form.requestSubmit();
+        formsSubmitted += 1;
+        controlsExercised += 1;
+        const after = await settleVisibleState(before, 1100, true);
+        auditTransforms();
+        if (after !== before || artifactMessagesObserved > messagesBefore) stateChangesObserved += 1;
+        else warnings.push('form submit produced no observable outcome: ' + label(form));
+      } catch (error) {
+        failures.push('form submit failed for ' + label(form) + ': ' + String(error?.message || error));
+      }
+    }
+  };
+
+  const stateControlQueue = [];
+  const seenStateControls = new WeakSet();
+  const enqueueVisibleStateControls = () => {
+    const candidates = Array.from(document.querySelectorAll('button,[role="button"],[role="tab"]'))
+      .filter((control) => (
+        visible(control)
+        && !control.disabled
+        && control.getAttribute?.('aria-disabled') !== 'true'
+        && !(
+          control.closest('form')
+          && ['submit', 'reset'].includes(control instanceof HTMLButtonElement ? control.type
+            : String(control.getAttribute?.('type') || 'button').toLowerCase())
+        )
+        && !downloadControls.includes(control)
+      ))
+      .sort((left, right) => Number(!left.closest('form')) - Number(!right.closest('form')));
+    for (const control of candidates) {
+      if (stateControlsFound >= maxStateControls || seenStateControls.has(control)) continue;
+      seenStateControls.add(control);
+      stateControlQueue.push(control);
+      stateControlsFound += 1;
+    }
+  };
+
+  enqueueVisibleStateControls();
+  await exerciseVisibleForms();
+  await exerciseVisibleFields();
+  enqueueVisibleStateControls();
+  for (let index = 0; index < stateControlQueue.length && index < maxStateControls; index += 1) {
+    const control = stateControlQueue[index];
+    if (!visible(control) || control.disabled || control.getAttribute?.('aria-disabled') === 'true') continue;
+    try {
+      const before = visibleState();
+      const messagesBefore = artifactMessagesObserved;
+      const alreadySelected = control.getAttribute?.('aria-selected') === 'true'
+        || (
+          control.hasAttribute?.('aria-current')
+          && control.getAttribute?.('aria-current') !== 'false'
+        );
+      activateControl(control);
+      exercisedStateControls.add(control);
+      controlsExercised += 1;
+      stateControlsExercised += 1;
+      const after = await settleVisibleState(before, 600);
+      auditTransforms();
+      if (after !== before || artifactMessagesObserved > messagesBefore) {
+        stateChangesObserved += 1;
+        stateTransitionsObserved += 1;
+      } else if (!alreadySelected) {
+        warnings.push('enabled control produced no observable outcome: ' + label(control));
+      }
+      enqueueVisibleStateControls();
+      await exerciseVisibleForms();
+      await exerciseVisibleFields();
+      enqueueVisibleStateControls();
+    } catch (error) {
+      failures.push('control interaction failed for ' + label(control) + ': ' + String(error?.message || error));
+    }
+  }
+
+  await exerciseVisibleFields();
+  await sleep(40);
+
+  return {
+    controlsExercised,
+    stateChangesObserved,
+    artifactMessagesObserved,
+    stateControlsFound,
+    stateControlsExercised,
+    stateTransitionsObserved,
+    downloadCandidates,
+    formsFound,
+    formsSubmitted,
+    hashLinksChecked,
+    mailtoLinksChecked,
+    failureCount: failures.length,
+    failures: failures
+      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_SAMPLES})
+      .map((failure) => String(failure || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS})),
+    warningCount: warnings.length,
+    warnings: warnings
+      .slice(0, ${HTML_PREVIEW_MAX_INTERACTION_SAMPLES})
+      .map((warning) => String(warning || '').replace(/\\s+/g, ' ').trim().slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}))
+  };
+})()`;
+
+const KEYBOARD_RESET_SCRIPT = `(() => {
+  const active = document.activeElement;
+  if (active && active instanceof HTMLElement) active.blur();
+  if (document.body) {
+    document.body.setAttribute('tabindex', '-1');
+    document.body.focus({ preventScroll: true });
+  }
+  return true;
+})()`;
+
+const KEYBOARD_ACTIVE_SCRIPT = `(() => {
+  const element = document.activeElement;
+  if (!element || element === document.body || element === document.documentElement) return null;
+  const style = getComputedStyle(element);
+  const rect = element.getBoundingClientRect();
+  const label = String(
+    element.getAttribute?.('aria-label')
+    || element.getAttribute?.('download')
+    || element.textContent
+    || element.getAttribute?.('name')
+    || element.id
+    || element.tagName
+    || 'control'
+  ).replace(/\\s+/g, ' ').trim().slice(0, 80);
+  const id = String(element.id || '');
+  const name = String(element.getAttribute?.('name') || '');
+  const href = String(element.getAttribute?.('href') || '');
+  const fingerprint = [
+    String(element.tagName || 'element').toLowerCase(),
+    id,
+    name,
+    href,
+    label
+  ].join('|').slice(0, 240);
+  const outlineWidth = Number.parseFloat(style.outlineWidth || '0') || 0;
+  const visibleFocusIndicator = element.matches(':focus-visible') && (
+    (style.outlineStyle !== 'none' && outlineWidth > 0)
+    || Boolean(style.boxShadow && style.boxShadow !== 'none')
+  );
+  return {
+    fingerprint,
+    label,
+    visible: style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity || 1) > 0 && rect.width > 0.5 && rect.height > 0.5,
+    visibleFocusIndicator
+  };
+})()`;
+
+async function auditKeyboardTraversal(
+  webContents: Pick<ElectronBrowserWindow['webContents'], 'executeJavaScript' | 'focus' | 'sendInputEvent'>,
+  focusableFound: number,
+): Promise<HtmlPreviewKeyboardEvidence> {
+  const failures: string[] = [];
+  const sequence: string[] = [];
+  const fingerprints = new Set<string>();
+  let tabStopsVisited = 0;
+  let visibleFocusIndicators = 0;
+  await webContents.executeJavaScript(KEYBOARD_RESET_SCRIPT, true);
+  webContents.focus();
+
+  const attempts = Math.min(Math.max(focusableFound + 1, 1), 25);
+  for (let index = 0; index < attempts; index += 1) {
+    webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' });
+    webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const active = await webContents.executeJavaScript(
+      KEYBOARD_ACTIVE_SCRIPT,
+      true,
+    ) as null | {
+      fingerprint: string;
+      label: string;
+      visible: boolean;
+      visibleFocusIndicator: boolean;
+    };
+    if (!active) continue;
+    if (!active.visible) {
+      failures.push(`Tab reached a non-visible control: ${boundedDiagnostic(active.label)}`);
+      continue;
+    }
+    tabStopsVisited += 1;
+    if (!fingerprints.has(active.fingerprint)) {
+      fingerprints.add(active.fingerprint);
+      if (sequence.length < HTML_PREVIEW_MAX_DIAGNOSTICS) {
+        sequence.push(boundedDiagnostic(active.label));
+      }
+      if (active.visibleFocusIndicator) visibleFocusIndicators += 1;
+    }
+    if (focusableFound > 0 && fingerprints.size >= focusableFound) break;
+  }
+
+  if (focusableFound > 0 && fingerprints.size === 0) {
+    failures.push('Tab key did not reach any visible focusable control');
+  }
+  if (fingerprints.size > 0 && visibleFocusIndicators === 0) {
+    failures.push('Tab traversal found no visible focus indicator');
+  }
+
+  return {
+    method: 'tab-key',
+    focusableFound,
+    tabStopsVisited,
+    uniqueTabStopsVisited: fingerprints.size,
+    visibleFocusIndicators,
+    sequence,
+    failures: failures.slice(0, HTML_PREVIEW_MAX_DIAGNOSTICS),
+  };
+}
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), HTML_PREVIEW_TIMEOUT_MS);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function boundedDiagnostic(value: unknown): string {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS);
+}
+
+/** Review prompts from one viewport's design audit. They name the element
+ *  and the measured value; none of them blocks the preview or its screenshots. */
+function designWarnings(view: HtmlPreviewViewportEvidence): string[] {
+  const design = view.design;
+  if (!design) return [];
+  if (design.error) return [`${view.name}: design audit did not run: ${boundedDiagnostic(design.error)}`];
+  const warnings: string[] = [];
+  if (design.incomplete?.length) {
+    warnings.push(boundedDiagnostic(`${view.name}: design audit coverage is partial: ${design.incomplete.join(', ')}`));
+  }
+  if (design.fontSizes.length > HTML_PREVIEW_FONT_SIZE_LIMIT) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.fontSizes.length} distinct font sizes on visible text `
+      + `(${design.fontSizes.join(', ')}px); a type scale needs ${HTML_PREVIEW_FONT_SIZE_LIMIT} or fewer`,
+    ));
+  }
+  if (design.nonTokenColorCount) {
+    const samples = design.nonTokenColors.join(', ');
+    warnings.push(boundedDiagnostic(design.colorTokenCount
+      ? `${view.name}: ${design.nonTokenColorCount} hard-coded color(s) match no color variable: ${samples}`
+      : `${view.name}: no color variables; ${design.nonTokenColorCount} hard-coded color(s): ${samples}`));
+  }
+  if (design.textOverlaps.length) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.textOverlaps.length} text overlap(s): `
+      + design.textOverlaps.map((item) => `${item.selector} × ${item.other}`).join(', '),
+    ));
+  }
+  if (design.lowContrastCount) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.lowContrastCount} text element(s) below WCAG AA contrast: `
+      + design.lowContrastText.map((item) => `${item.selector} ${item.ratio}:1 < ${item.required}:1`).join(', '),
+    ));
+  }
+  return warnings;
+}
+
+function blockedResourceLabel(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === 'file:') return 'file:outside-entry-directory';
+    if (url.protocol === 'chat-media:') return 'chat-media:outside-entry-directory';
+    if (url.protocol === 'http:' || url.protocol === 'https:') return `${url.protocol}//${url.host}`;
+    return url.protocol || 'unknown:';
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+function allowedPreviewRequest(raw: string, entryRootReal: string): boolean {
+  if (/^(?:https?|wss?|data|blob|about):/i.test(raw)) return true;
+  if (raw.startsWith('chat-media:')) {
+    const requested = chatMediaLocalPathFromUrl(raw);
+    return !!requested && isPathAllowed(requested, [entryRootReal]);
+  }
+  if (!raw.startsWith('file:')) return false;
+  try {
+    const requested = fs.realpathSync(fileURLToPath(raw));
+    return isPathAllowed(requested, [entryRootReal]);
+  } catch {
+    return false;
+  }
+}
+
+function registerNetworkIsolation(
+  ses: Session,
+  entryRootReal: string,
+  blocked: { count: number; samples: string[] },
+  sdkOrigin: { current?: string },
+  bridgeJavaScript?: string,
+): void {
+  const bridgeUrl = pathToFileURL(path.join(entryRootReal, '__orkas', 'bridge.js')).href;
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const raw = String(details.url || '');
+    if (bridgeJavaScript && raw === bridgeUrl) {
+      callback({ cancel: false });
+      return;
+    }
+    const allowed = sdkOrigin.current
+      ? /^(?:https?|wss?|data|blob|about):/i.test(raw) || raw.startsWith(sdkOrigin.current + '/')
+      : allowedPreviewRequest(raw, entryRootReal);
+    if (!allowed) {
+      blocked.count += 1;
+      const label = blockedResourceLabel(raw);
+      if (
+        blocked.samples.length < HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES
+        && !blocked.samples.includes(label)
+      ) {
+        blocked.samples.push(label);
+      }
+    }
+    callback({ cancel: !allowed });
+  });
+}
+
+/** Serve the reserved host bridge without copying or modifying an app bundle. */
+function registerArtifactPreviewProtocol(ses: Session, entryRootReal: string, bridgeJavaScript: string): void {
+  const bridgePath = path.join(entryRootReal, '__orkas', 'bridge.js');
+  ses.protocol.handle('file', (request) => {
+    try {
+      const requested = fileURLToPath(request.url);
+      if (requested === bridgePath) {
+        return new Response(bridgeJavaScript, { headers: { 'Content-Type': 'text/javascript; charset=utf-8' } });
+      }
+      if (!isPathAllowed(requested, [entryRootReal])) return new Response('', { status: 403 });
+      const st = fs.statSync(requested);
+      if (!st.isFile()) return new Response('', { status: 404 });
+      return serveFileRange(request, requested, artifactMimeFor(requested), st.size, st.mtimeMs);
+    } catch {
+      return new Response('', { status: 404 });
+    }
+  });
+}
+
+function previewFailureStatus(code: string | undefined): number {
+  if (code === 'bad_input') return 400;
+  if (code === 'forbidden') return 403;
+  if (code === 'too_large') return 413;
+  return 404;
+}
+
+/**
+ * Serve a plain HTML entry the way the chat file viewer does: through
+ * `chat-media://local`, with the viewer's CSP and iframe sandbox applied to the
+ * document and same-folder assets granted CORS. Storage and host access fail
+ * here exactly as they do for the user. Unlike the viewer, local files stay
+ * confined to the entry directory.
+ */
+function servePreviewRequest(request: Request, entryRootReal: string): Response {
+  const requested = chatMediaLocalPathFromUrl(request.url);
+  if (!requested) return new Response('bad request', { status: 400 });
+  if (!isPathAllowed(requested, [entryRootReal])) return new Response('outside the entry directory', { status: 403 });
+  const media = chatAttachments.resolveLocalMediaPath(requested);
+  if (media.ok) {
+    if (path.extname(media.absPath).toLowerCase() === '.svg') {
+      const svg = chatAttachments.materializeLocalDisplaySvg(media.absPath);
+      if (!svg.ok) return new Response('', { status: previewFailureStatus((svg as { code?: string }).code) });
+      return new Response(svg.body, { headers: { 'Content-Type': chatAttachments.localMediaMimeFor(media.absPath) } });
+    }
+    const st = fs.statSync(media.absPath);
+    return serveFileRange(request, media.absPath, chatAttachments.localMediaMimeFor(media.absPath), st.size, st.mtimeMs);
+  }
+  if ((media as { code?: string }).code !== 'bad_input') {
+    return new Response('', { status: previewFailureStatus((media as { code?: string }).code) });
+  }
+  const doc = chatAttachments.resolveLocalPreviewPath(requested);
+  if (doc.ok) {
+    const st = fs.statSync(doc.absPath);
+    const response = serveFileRange(request, doc.absPath, chatAttachments.localMediaMimeFor(doc.absPath), st.size, st.mtimeMs);
+    return doc.kind === 'html' ? withHtmlPreviewPolicy(response, { sandboxDocument: true }) : response;
+  }
+  if ((doc as { code?: string }).code !== 'bad_input') {
+    return new Response('', { status: previewFailureStatus((doc as { code?: string }).code) });
+  }
+  const asset = chatAttachments.resolveHtmlPreviewAssetWithinRoots(requested, [entryRootReal]);
+  if (!asset.ok) return new Response('', { status: previewFailureStatus((asset as { code?: string }).code) });
+  const st = fs.statSync(asset.absPath);
+  return withHtmlPreviewAssetPolicy(serveFileRange(
+    request, asset.absPath, chatAttachments.localPreviewAssetMimeFor(asset.absPath), st.size, st.mtimeMs,
+  ));
+}
+
+function registerLocalPreviewProtocol(ses: Session, entryRootReal: string): void {
+  ses.protocol.handle('chat-media', (request) => {
+    try {
+      return servePreviewRequest(request, entryRootReal);
+    } catch {
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
+function registerPermissionIsolation(ses: Session): void {
+  // Electron grants permission requests by default unless the application
+  // installs handlers. Previewed HTML is untrusted local content, so it must
+  // never reach clipboard, media, display-capture, filesystem, HID, serial,
+  // USB, geolocation, notification, or other host permission surfaces.
+  ses.setPermissionCheckHandler(() => false);
+  ses.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false);
+  });
+  ses.setDevicePermissionHandler(() => false);
+  ses.setDisplayMediaRequestHandler((_request, callback) => {
+    callback({});
+  });
+}
+
+async function clearPreviewSession(ses: Session): Promise<void> {
+  try { ses.webRequest.onBeforeRequest(null); } catch { /* best effort */ }
+  try { if (ses.protocol?.isProtocolHandled('chat-media')) ses.protocol.unhandle('chat-media'); } catch { /* best effort */ }
+  try { if (ses.protocol?.isProtocolHandled('file')) ses.protocol.unhandle('file'); } catch { /* best effort */ }
+  try { ses.removeAllListeners('will-download'); } catch { /* best effort */ }
+  try { ses.setPermissionCheckHandler(null); } catch { /* best effort */ }
+  try { ses.setPermissionRequestHandler(null); } catch { /* best effort */ }
+  try { ses.setDevicePermissionHandler(null); } catch { /* best effort */ }
+  try { ses.setDisplayMediaRequestHandler(null); } catch { /* best effort */ }
+  await Promise.allSettled([
+    ses.clearCache(),
+    ses.clearStorageData(),
+  ]);
+}
+
+function consoleErrorListener(errors: string[], warnings: string[]) {
+  return (...args: [unknown, unknown?, unknown?]) => {
+    const [event, levelOrDetails, message] = args;
+    // Modern Electron carries named levels on the event; the legacy numeric
+    // arguments use 2 for warning and 3 for error.
+    const candidate = event && typeof event === 'object' && 'level' in event ? event : levelOrDetails;
+    const details = candidate && typeof candidate === 'object'
+      ? candidate as { level?: unknown; message?: unknown }
+      : null;
+    const level = details?.level ?? levelOrDetails;
+    const value = details?.message ?? message;
+    const target = level === 'error' || level === 3 ? errors
+      : level === 'warning' || level === 2 ? warnings : null;
+    if (!target || target.length >= HTML_PREVIEW_MAX_DIAGNOSTICS) return;
+    const text = boundedDiagnostic(value);
+    if (text && !target.includes(text)) target.push(text);
+  };
+}
+
+async function renderViewport(
+  BrowserWindow: NonNullable<ElectronRuntime['BrowserWindow']>,
+  ses: Session,
+  entryUrl: string,
+  viewport: HtmlPreviewViewport,
+  auditKeyboard: boolean,
+  exerciseInteractions: boolean,
+  designAudit: boolean,
+  bundle: Bundle | null,
+  sdkOrigin: { current?: string },
+): Promise<{
+  evidence: HtmlPreviewViewportEvidence;
+  screenshot: Buffer;
+  consoleWarnings: string[];
+  sdk?: PreviewSdkEvidence;
+  interactions?: RenderInteractionEvidence;
+}> {
+  const consoleErrors: string[] = [];
+  const consoleWarnings: string[] = [];
+  const win = new BrowserWindow({
+    show: false,
+    width: viewport.width,
+    height: viewport.height,
+    useContentSize: true,
+    backgroundColor: '#ffffff',
+    webPreferences: hardenedWebPreferences({
+      session: ses,
+      backgroundThrottling: false,
+      ...(bundle ? { preload: previewPreload } : {}),
+    }),
+  });
+  const webContents = win.webContents;
+  webContents.setWindowOpenHandler?.(() => ({ action: 'deny' }));
+  webContents.on('will-navigate', (event: { preventDefault(): void }, targetUrl: string) => {
+    if (targetUrl !== entryUrl) event.preventDefault();
+  });
+  webContents.on('console-message', consoleErrorListener(consoleErrors, consoleWarnings));
+
+  let sdk: Awaited<ReturnType<typeof createPreviewSdk>> | undefined;
+  try {
+    if (bundle) { sdk = await createPreviewSdk(ses, webContents, bundle); sdkOrigin.current = sdk.origin; }
+    await withTimeout(
+      win.loadURL(sdk?.shellUrl ?? entryUrl),
+      `E_HTML_PREVIEW_LOAD_TIMEOUT: ${viewport.name} HTML did not finish loading`,
+    );
+    const inspected = sdk ? await withTimeout(sdk.attach(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK frame did not load') : webContents;
+    await withTimeout(
+      (async () => {
+        await inspected.executeJavaScript(READY_SCRIPT, true);
+        await sdk?.settle();
+        // Completed SDK calls can add fonts/images and change the layout.
+        if (sdk) await inspected.executeJavaScript(READY_SCRIPT, true);
+      })(),
+      `E_HTML_PREVIEW_READY_TIMEOUT: ${viewport.name} fonts or images did not settle`,
+    );
+    const page = await withTimeout(
+      inspected.executeJavaScript(
+        designAudit ? DESIGN_AUDIT_EVIDENCE_SCRIPT : EVIDENCE_SCRIPT,
+        true,
+      ) as Promise<PageEvidence>,
+      `E_HTML_PREVIEW_INSPECT_TIMEOUT: ${viewport.name} layout inspection timed out`,
+    );
+    const image = await withTimeout(
+      webContents.capturePage(),
+      `E_HTML_PREVIEW_CAPTURE_TIMEOUT: ${viewport.name} screenshot timed out`,
+    );
+    const interactions = auditKeyboard
+      ? await withTimeout(
+        (async () => {
+          const keyboard = await auditKeyboardTraversal({
+            executeJavaScript: (script, gesture) => inspected.executeJavaScript(script, gesture),
+            focus: () => webContents.focus(),
+            sendInputEvent: event => webContents.sendInputEvent(event),
+          }, page.focusableCount);
+          if (!exerciseInteractions) {
+            return {
+              performed: false,
+              ...emptyPageInteractionEvidence(),
+              keyboard,
+            };
+          }
+          const safeInteractions = await inspected.executeJavaScript(
+            INTERACTION_SCRIPT,
+            true,
+          ) as PageInteractionEvidence;
+          return { performed: true, ...safeInteractions, keyboard };
+        })(),
+        `E_HTML_PREVIEW_AUDIT_TIMEOUT: ${viewport.name} preview audit timed out`,
+      )
+      : undefined;
+    if (sdk) await withTimeout(sdk.settle(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK requests did not settle');
+    const size = image.getSize();
+    return {
+      evidence: {
+        name: viewport.name,
+        width: viewport.width,
+        height: viewport.height,
+        screenshotWidth: size.width,
+        screenshotHeight: size.height,
+        ...page,
+        consoleErrors,
+      },
+      screenshot: image.toPNG(),
+      consoleWarnings,
+      ...(sdk ? { sdk: sdk.evidence } : {}),
+      ...(interactions ? { interactions } : {}),
+    };
+  } finally {
+    try { win.destroy(); } catch { /* best effort */ }
+    await sdk?.dispose();
+    sdkOrigin.current = undefined;
+  }
+}
+
+/**
+ * Render one local HTML entry at one or more declared viewports using the
+ * packaged Electron runtime. Web resources are allowed; local files remain confined to the entry directory.
+ * With `fileViewer`, a plain page loads through `chat-media://local` with the
+ * file viewer's sandbox, so storage use and CORS gaps show up as they would for
+ * the user.
+ */
+export async function renderResponsiveHtmlPreview(
+  entryPath: string,
+  viewports: readonly HtmlPreviewViewport[],
+  deps: HtmlPreviewRuntimeDeps = {},
+  options: HtmlPreviewRenderOptions = {},
+): Promise<HtmlPreviewRenderResult> {
+  if (!viewports.length) throw new Error('E_HTML_PREVIEW_VIEWPORT_REQUIRED: at least one viewport is required');
+  const entryAbs = path.resolve(entryPath);
+  const entryReal = fs.realpathSync(entryAbs);
+  const entryRootReal = fs.realpathSync(path.dirname(entryReal));
+  const electron = await (deps.loadElectron?.() ?? import('electron') as Promise<ElectronRuntime>);
+  const BrowserWindow = electron.BrowserWindow;
+  const electronSession = electron.session;
+  if (!BrowserWindow || !electronSession) {
+    throw new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable');
+  }
+
+  const bundle = await previewBundle(entryReal);
+  const sdkOrigin: { current?: string } = {};
+  const blocked = { count: 0, samples: [] as string[] };
+  const partition = `html-preview-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const ses = electronSession.fromPartition(partition);
+  registerPermissionIsolation(ses);
+  try {
+    registerNetworkIsolation(ses, entryRootReal, blocked, sdkOrigin, options.bridgeJavaScript);
+    // SDK app bundles keep their own shell (see createPreviewSdk).
+    const fileViewer = !bundle && options.fileViewer === true;
+    if (fileViewer) registerLocalPreviewProtocol(ses, entryRootReal);
+    else if (!bundle && options.bridgeJavaScript) registerArtifactPreviewProtocol(ses, entryRootReal, options.bridgeJavaScript);
+    const downloads: HtmlPreviewDownloadEvidence[] = [];
+    const inlineDownloadMeasurements: Promise<void>[] = [];
+    ses.on('will-download', (event, item) => {
+      const rawUrl = String(item.getURL?.() || '');
+      const urlKind = rawUrl.startsWith('data:')
+        ? 'data'
+        : rawUrl.startsWith('blob:')
+          ? 'blob'
+          : rawUrl.startsWith('file:')
+            ? 'file'
+            : 'other';
+      if (downloads.length < HTML_PREVIEW_MAX_DIAGNOSTICS) {
+        const download: HtmlPreviewDownloadEvidence = {
+          filename: boundedDiagnostic(item.getFilename?.()),
+          mimeType: boundedDiagnostic(item.getMimeType?.()),
+          totalBytes: Math.max(0, Number(item.getTotalBytes?.()) || 0),
+          urlKind,
+        };
+        downloads.push(download);
+        // Electron can report an unknown zero length for data: downloads at
+        // will-download. Decode only bounded inline data, without network I/O
+        // or saving a file; empty or invalid payloads still fail the same check.
+        if (urlKind === 'data' && download.totalBytes === 0
+          && rawUrl.length <= HTML_PREVIEW_MAX_INLINE_DOWNLOAD_URL_CHARS) {
+          inlineDownloadMeasurements.push(
+            fetch(rawUrl, { signal: AbortSignal.timeout(1000) })
+              .then(response => response.arrayBuffer())
+              .then(bytes => { download.totalBytes = bytes.byteLength; })
+              .catch(() => { /* retain the unavailable length */ }),
+          );
+        }
+      }
+      event.preventDefault();
+    });
+    const entryUrl = fileViewer ? chatMediaLocalUrl(entryReal) : pathToFileURL(entryReal).toString();
+    const rendered: Array<{
+      evidence: HtmlPreviewViewportEvidence;
+      screenshot: Buffer;
+      consoleWarnings: string[];
+      sdk?: PreviewSdkEvidence;
+      interactions?: RenderInteractionEvidence;
+    }> = [];
+    const exerciseInteractions = options.interactions !== false;
+    const designAudit = options.designAudit !== false;
+    for (const [index, viewport] of viewports.entries()) {
+      rendered.push(await renderViewport(
+        BrowserWindow,
+        ses,
+        entryUrl,
+        viewport,
+        index === 0,
+        index === 0 && exerciseInteractions,
+        designAudit,
+        bundle,
+        sdkOrigin,
+      ));
+    }
+
+    await Promise.all(inlineDownloadMeasurements);
+    const blockers: string[] = [];
+    const warnings: string[] = [];
+    for (const item of rendered) {
+      const view = item.evidence;
+      warnings.push(...item.consoleWarnings.map(message => `${view.name}: ${message}`));
+      if (view.horizontalOverflowPx > 1) {
+        blockers.push(
+          `${view.name}: horizontal overflow is ${view.horizontalOverflowPx}px `
+          + `(scrollWidth ${view.scrollWidth}px > viewport ${view.width}px)`,
+        );
+      }
+      if (view.consoleErrors.length) {
+        blockers.push(`${view.name}: ${view.consoleErrors.length} console/runtime error(s)`);
+      }
+      for (const selector of view.ineffectiveTransforms || []) {
+        blockers.push(`${view.name}: CSS transform does not apply to non-replaced inline box: ${selector}`);
+      }
+      if (view.failedImageCount) {
+        blockers.push(`${view.name}: ${view.failedImageCount} image(s) failed to load`);
+      }
+      if (view.missingAltCount) {
+        warnings.push(`${view.name}: ${view.missingAltCount} image(s) are missing alt attributes`);
+      }
+      if (!view.focusableCount) {
+        warnings.push(`${view.name}: no keyboard-focusable control was detected`);
+      }
+      warnings.push(...designWarnings(view));
+    }
+    if (blocked.count) {
+      blockers.push(`${blocked.count} external or out-of-directory resource request(s) were blocked`);
+    }
+    const pageInteractions = rendered[0]?.interactions ?? {
+      performed: exerciseInteractions,
+      ...emptyPageInteractionEvidence(),
+      keyboard: {
+        method: 'tab-key' as const,
+        focusableFound: rendered[0]?.evidence.focusableCount ?? 0,
+        tabStopsVisited: 0,
+        uniqueTabStopsVisited: 0,
+        visibleFocusIndicators: 0,
+        sequence: [],
+        failures: [`${viewports[0].name} keyboard audit did not return evidence`],
+      },
+    };
+    if (pageInteractions.keyboard.failures.length) {
+      blockers.push(`${pageInteractions.keyboard.failures.length} keyboard traversal check(s) failed`);
+    }
+    const interactionFailureSamples = pageInteractions.failures
+      .slice(0, HTML_PREVIEW_MAX_INTERACTION_SAMPLES)
+      .map(boundedDiagnostic)
+      .filter(Boolean);
+    const interactionFailureCount = Math.max(
+      Number.isFinite(pageInteractions.failureCount)
+        ? Math.max(0, Math.floor(pageInteractions.failureCount))
+        : 0,
+      pageInteractions.failures.length,
+    );
+    const interactionWarningSamples = (pageInteractions.warnings ?? [])
+      .slice(0, HTML_PREVIEW_MAX_INTERACTION_SAMPLES).map(boundedDiagnostic).filter(Boolean);
+    const interactionWarningCount = Math.max(
+      Number.isFinite(pageInteractions.warningCount) ? Math.max(0, Math.floor(pageInteractions.warningCount!)) : 0,
+      (pageInteractions.warnings ?? []).length,
+    );
+    if (pageInteractions.performed && interactionWarningCount) {
+      warnings.unshift(`${interactionWarningCount} interaction check(s) were inconclusive: no observable change. `
+        + 'This does not establish a functional failure; details are in interactions.warnings.');
+    }
+    if (pageInteractions.performed && interactionFailureCount) {
+      const omittedFailureCount = Math.max(
+        0,
+        interactionFailureCount - interactionFailureSamples.length,
+      );
+      blockers.push(
+        `${interactionFailureCount} safe interaction check(s) failed`
+        + (interactionFailureSamples.length ? `: ${interactionFailureSamples.join(' | ')}` : '')
+        + (omittedFailureCount ? ` (${omittedFailureCount} more not shown)` : ''),
+      );
+    }
+    if (
+      pageInteractions.performed
+      &&
+      pageInteractions.downloadCandidates.length
+      && downloads.length < pageInteractions.downloadCandidates.length
+    ) {
+      blockers.push(
+        `${pageInteractions.downloadCandidates.length} download action(s) were exercised `
+        + `but only ${downloads.length} download(s) were observed`,
+      );
+    }
+    const incompleteDownloads = downloads.filter((download) => (
+      !download.filename
+      || !download.mimeType
+      || download.totalBytes <= 0
+    ));
+    if (incompleteDownloads.length) {
+      blockers.push(
+        `${incompleteDownloads.length} observed download(s) lacked a filename, MIME type, or non-empty payload`,
+      );
+    }
+
+    return {
+      evidence: {
+        ok: blockers.length === 0,
+        entryPath: entryAbs,
+        ...(rendered[0]?.sdk ? { sdk: rendered[0].sdk } : {}),
+        ...(rendered.some(item => item.sdk) ? { sdkByViewport: rendered.flatMap(item =>
+          item.sdk ? [{ ...item.sdk, viewport: item.evidence.name }] : []) } : {}),
+        blockedResourceCount: blocked.count,
+        blockedResourceSamples: blocked.samples,
+        blockers,
+        warnings,
+        viewports: rendered.map((item) => item.evidence),
+        screenshotCaptures: rendered.map((item) => ({
+          viewport: item.evidence.name,
+          width: item.evidence.screenshotWidth,
+          height: item.evidence.screenshotHeight,
+          captured: true as const,
+        })),
+        interactions: {
+          performed: pageInteractions.performed,
+          viewport: rendered[0]?.evidence.name ?? 'desktop',
+          ...pageInteractions,
+          failureCount: interactionFailureCount,
+          failures: interactionFailureSamples,
+          warningCount: interactionWarningCount,
+          warnings: interactionWarningSamples,
+          downloads,
+        },
+      },
+      screenshots: rendered.map((item) => item.screenshot),
+    };
+  } finally {
+    await clearPreviewSession(ses);
+  }
+}
+
+// `desktop` stays first: it is the interaction and screenshot viewport, and
+// moving it would change what every existing artifact contract observes. The
+// embed entry is the one that matters for whether the user can see the thing —
+// a chat frame is roughly a third the width and half the height of the desktop
+// window these artifacts were being validated against.
+const ARTIFACT_SMOKE_VIEWPORTS = [
+  { name: 'desktop' as const, width: 1280, height: 800 },
+  { name: 'embed' as const, width: ARTIFACT_FRAME.smokeWidth, height: ARTIFACT_FRAME.maxHeight },
+  { name: 'mobile' as const, width: 390, height: 844 },
+] as const;
+
+/** A few pixels of unreachable content is rounding, not a hidden control. */
+const ARTIFACT_EMBED_CLIP_TOLERANCE_PX = 8;
+
+/** Render an interactive chat artifact and require an operable control.
+ *  Bounded playback may not observe its effect; retain that uncertainty as a
+ *  warning. This wrapper runs before create_artifact exposes its card. */
+export async function renderInteractiveHtmlSmoke(
+  entryPath: string,
+  deps: HtmlPreviewRuntimeDeps = {},
+  options: { bridgeJavaScript?: string } = {},
+): Promise<HtmlPreviewRenderResult> {
+  let previewEntry = entryPath;
+  let previewRoot = '';
+  if (options.bridgeJavaScript) {
+    previewRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-artifact-smoke-'));
+    const sourceRoot = path.dirname(path.resolve(entryPath));
+    for (const name of fs.readdirSync(sourceRoot)) {
+      fs.cpSync(path.join(sourceRoot, name), path.join(previewRoot, name), { recursive: true });
+    }
+    const bridgePath = path.join(previewRoot, '__orkas', 'bridge.js');
+    fs.mkdirSync(path.dirname(bridgePath), { recursive: true });
+    fs.writeFileSync(bridgePath, options.bridgeJavaScript, 'utf8');
+    previewEntry = path.join(previewRoot, path.basename(entryPath));
+  }
+  let rendered: HtmlPreviewRenderResult;
+  try {
+    rendered = await renderResponsiveHtmlPreview(
+      previewEntry,
+      ARTIFACT_SMOKE_VIEWPORTS,
+      deps,
+      { interactions: true, designAudit: false },
+    );
+  } finally {
+    if (previewRoot) fs.rmSync(previewRoot, { recursive: true, force: true });
+  }
+  const interactions = rendered.evidence.interactions;
+  const blockers = [...rendered.evidence.blockers];
+  const warnings = [...rendered.evidence.warnings];
+  const embed = rendered.evidence.viewports.find((view) => view.name === 'embed');
+  if (embed) {
+    if (embed.unreachableOverflowPx > ARTIFACT_EMBED_CLIP_TOLERANCE_PX) {
+      blockers.push(
+        `embed: ${embed.unreachableOverflowPx}px of content sits below the ${embed.height}px chat frame `
+        + 'and nothing scrolls to reach it. Lay the app out at its content height; '
+        + 'a `100vh` / full-viewport shell collapses to whatever height the frame happens to have.',
+      );
+    } else if (embed.scrollHeight > embed.height + 1) {
+      warnings.push(
+        `embed: content is ${embed.scrollHeight}px tall, so the ${ARTIFACT_FRAME.maxHeight}px chat frame `
+        + 'will scroll — put the primary content and controls first.',
+      );
+    }
+  }
+  if ((interactions.controlsExercised ?? 0) <= 0) {
+    blockers.push('interactive artifact smoke found no operable control to exercise');
+  }
+  if (
+    (interactions.stateChangesObserved ?? 0) <= 0
+    && (interactions.artifactMessagesObserved ?? 0) <= 0
+    && interactions.downloads.length <= 0
+  ) {
+    warnings.unshift('interactive artifact smoke observed no visible state change, artifact submission, or download; functional behavior remains unverified');
+  }
+  return {
+    ...rendered,
+    evidence: {
+      ...rendered.evidence,
+      ok: blockers.length === 0,
+      blockers,
+      warnings,
+    },
+  };
+}

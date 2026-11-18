@@ -1,0 +1,976 @@
+#!/usr/bin/env node
+/**
+ * Orkas skill runner.
+ *
+ * Invoked by LLM bash tool as:
+ *   "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" <skill-id-or-name> <script-basename> [-- args...]
+ *
+ * Dispatches by file extension so the LLM uses one invocation form regardless
+ * of skill language:
+ *   .ts / .js        — require() with tsx/cjs hook, call default export as
+ *                       `async (args) => result`, JSON.stringify result to stdout.
+ *   .mjs             — native ESM with legacy CJS globals on the bundled Node;
+ *                       call the same default-function/JSON entry contract.
+ *   .py              — spawn shared data/venv package Python, else nearest
+ *                       package `.venv`, else `ORKAS_PYTHON`, else system
+ *                       Python (`python3`; Windows: `py -3` then `python`),
+ *                       inherit stdio, exit with child code.
+ *   .ps1             — spawn PowerShell (Windows-native script).
+ *   .cmd / .bat      — spawn `cmd.exe` (Windows-native batch script).
+ *   .sh              — spawn `bash` (Windows: Git Bash only; WSL is not
+ *                       auto-selected),
+ *   .rb              — spawn `ruby`, inherit stdio, exit with child's code.
+ *
+ * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
+ *   1. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
+ *   2. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
+ *   3. Current-agent private installed roots when ORKAS_AGENT_ID is set:
+ *      <uid>/local/marketplace/agents/<agent-id>/skills/<id>/scripts/<basename>.<ext>
+ *      <uid>/cloud/agents/<agent-id>/private_skills/<id>/scripts/<basename>.<ext>
+ *   4. External-package skill roots from <uid>/local/packages/_registry.json
+ *      (enabled packages only; `.` roots resolve against the packages dir)
+ *   5. Global roots: ~/.claude/skills, ~/.codex/skills (interop, read-only)
+ *   6. Same roots by SKILL.md frontmatter `name` when dir id != authored name
+ *   For each candidate dir we try extensions in platform-specific order.
+ *
+ * Dependency resolution for scripts living under an external package (or any
+ * skill dir that vendors its own deps): the NEAREST `node_modules` walking up
+ * from the skill dir is prepended to NODE_PATH ahead of PC/node_modules, and
+ * Python package deps prefer the shared machine-local data/venv interpreter
+ * keyed by package source+commit; legacy/vendored `.venv` dirs still work as
+ * fallback. The package tree itself is never modified.
+ *
+ * Env inputs:
+ *   ORKAS_PC_DIR          — points at PC root (or asar.unpacked equivalent).
+ *   ORKAS_UID             — active user id. When present, only that user's
+ *                           cloud / marketplace / package skill dirs are
+ *                           scanned.
+ *   ORKAS_AGENT_ID        — current acting agent id. When present, only this
+ *                           agent's private installed skill roots are scanned.
+ *   ORKAS_WORKSPACE_ROOT  — canonical workspace-data root (set by main process
+ *                           in install-data-root.ts). ORKAS_WS_ROOT is honoured
+ *                           as a back-compat alias. When neither is set the
+ *                           platform default ~/.orkas/data is used.
+ *   ORKAS_RUN_SKILL_DIR   — optional trusted caller allow-list override:
+ *                           resolve only inside this concrete skill dir.
+ *   ORKAS_GLOBAL_SKILL_ROOTS_ENABLED — `0` disables global Claude/Codex Skill
+ *                           roots for this user turn. Missing/default is on.
+ *   ORKAS_PYTHON          — optional bundled Python executable injected by
+ *                           the main process when resources/runtime is
+ *                           available.
+ *   ORKAS_VENV_ROOT       — optional shared venv root. Defaults to
+ *                           `<ORKAS_WORKSPACE_ROOT>/venv`.
+ *   ORKAS_NODE / ORKAS_BUNDLED_NODE — bundled stock Node executable used for
+ *                           JavaScript and TypeScript skill entrypoints.
+ *
+ * This file is CommonJS so it can be required directly without import-hook
+ * gymnastics. .ts skill scripts use ESM-style default export. Module scripts
+ * may return a top-level `{ ok: false }` result to report a semantic failure;
+ * the runner preserves that JSON on stdout and exits non-zero.
+ */
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawn, spawnSync } = require('node:child_process');
+
+const SCRIPT_EXTS = ['py', 'ts', 'mjs', 'js', 'ps1', 'cmd', 'bat', 'sh', 'rb'];
+const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function scriptExtsForPlatform(platform = process.platform) {
+  if (platform === 'win32') return SCRIPT_EXTS;
+  return ['py', 'ts', 'mjs', 'js', 'sh', 'rb', 'ps1'];
+}
+
+function die(exitCode, message, extra) {
+  const payload = { ok: false, error: message };
+  if (extra) Object.assign(payload, extra);
+  process.stderr.write(JSON.stringify(payload) + '\n');
+  process.exit(exitCode);
+}
+
+function parseArgs(argv) {
+  // argv[0]=node, argv[1]=run-skill.cjs, argv[2]=skill-id, argv[3]=script
+  const args = argv.slice(2);
+  if (args.length < 2) {
+    die(64, 'usage: run-skill.cjs <skill-id> <script-basename> [-- <script args>]');
+  }
+  const [skillId, scriptBase, ...rest] = args;
+  if (
+    !skillId
+    || skillId !== skillId.trim()
+    || skillId === '.'
+    || skillId === '..'
+    || skillId.includes('/')
+    || skillId.includes('\\')
+    || skillId.includes('\0')
+  ) {
+    die(64, 'skill id/name must be one non-path segment');
+  }
+  if (scriptBase.includes('/') || scriptBase.includes('\\') || scriptBase === '.' || scriptBase === '..') {
+    die(64, 'script basename must not contain path separators');
+  }
+  // Everything after `--` (or all of `rest`, whichever) is the script's args.
+  let scriptArgs;
+  const dashIdx = rest.indexOf('--');
+  scriptArgs = dashIdx === -1 ? rest : rest.slice(dashIdx + 1);
+  return { skillId, scriptBase, scriptArgs };
+}
+
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function workspaceRoot() {
+  return process.env.ORKAS_WORKSPACE_ROOT
+    || process.env.ORKAS_WS_ROOT
+    || path.join(require('os').homedir(), '.orkas', 'data');
+}
+
+function sharedVenvRoot() {
+  return process.env.ORKAS_VENV_ROOT || path.join(workspaceRoot(), 'venv');
+}
+
+function shortHash(input) {
+  return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0, 12);
+}
+
+function packageVenvKey(pkg) {
+  const rawName = (pkg && pkg.name) || 'package';
+  const name = PKG_NAME_RE.test(rawName) ? rawName : 'package';
+  const basis = [name, (pkg && pkg.repo_url) || '', (pkg && pkg.commit) || ''].join('\n');
+  return `${name}-${shortHash(basis)}`;
+}
+
+function pushUnique(arr, seen, value) {
+  const resolved = path.resolve(value);
+  if (seen.has(resolved)) return;
+  seen.add(resolved);
+  arr.push(value);
+}
+
+function safePathSegment(value) {
+  const text = String(value || '').trim();
+  if (!text || text === '.' || text === '..') return '';
+  if (text.includes('/') || text.includes('\\') || text.includes('\0') || text.includes('..')) return '';
+  return text;
+}
+
+function parseFrontmatterScalar(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (s[0] === '"') {
+    let out = '';
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '\\') {
+        const next = s[++i];
+        if (next === 'n') out += '\n';
+        else if (next === 'r') out += '\r';
+        else if (next === 't') out += '\t';
+        else if (next != null) out += next;
+        continue;
+      }
+      if (ch === '"') return out;
+      out += ch;
+    }
+    return s;
+  }
+  if (s[0] === "'") {
+    let out = '';
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "'" && s[i + 1] === "'") {
+        out += "'";
+        i++;
+        continue;
+      }
+      if (ch === "'") return out;
+      out += ch;
+    }
+    return s;
+  }
+  return s;
+}
+
+function readSkillDisplayName(skillDir) {
+  try {
+    const md = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+    if (!md.startsWith('---')) return '';
+    const end = md.indexOf('\n---', 3);
+    if (end === -1) return '';
+    const lines = md.slice(3, end).split('\n');
+    for (const line of lines) {
+      if (!line || !line.trim() || /^\s/.test(line)) continue;
+      const colonIdx = line.indexOf(':');
+      if (colonIdx <= 0) continue;
+      const key = line.slice(0, colonIdx).trim();
+      if (key !== 'name') continue;
+      return parseFrontmatterScalar(line.slice(colonIdx + 1));
+    }
+  } catch {
+    /* unreadable skill metadata is ignored; direct id lookup may still work */
+  }
+  return '';
+}
+
+function collectSkillDirs(skillRef) {
+  const forcedDir = process.env.ORKAS_RUN_SKILL_DIR;
+  if (forcedDir) {
+    const resolved = path.resolve(forcedDir);
+    if (!isDir(resolved)) {
+      die(66, 'allowed skill dir is not available', { dir: resolved });
+    }
+    return [resolved];
+  }
+
+  const wsRoot = workspaceRoot();
+  // Candidate skill dirs — mirror SkillRegistry's trusted + current-agent
+  // private resolution. Agent-private dirs are included only when ORKAS_UID
+  // scopes the user and ORKAS_AGENT_ID names the acting agent; otherwise
+  // commander/other agents cannot execute another agent's bundled skills.
+  //
+  // Per-user skills live under <ws>/<uid>/cloud/skills/<id> and
+  // <ws>/<uid>/local/marketplace/skills/<id>. uid can be numeric or a UUID,
+  // so we scan every subdirectory rather than regex-matching. Skip the deny-
+  // list approach (had to hand-maintain a list of `logs / config / ...`
+  // sibling names that would drift the moment a new top-level data dir gets
+  // added under PC/CLAUDE.md §4); instead, only KEEP an entry if it actually
+  // contains the skill under one of the two SkillRegistry-aware shapes. This
+  // is the strict invariant — a real uid dir always has one of those shapes
+  // when the skill is installed for that user; any sibling dir that doesn't
+  // is irrelevant by construction.
+  const roots = [];
+  const directDirs = [];
+  const directSeen = new Set();
+  function addRoot(root) {
+    if (isDir(root)) roots.push(root);
+  }
+  function addDirect(root) {
+    const candidate = path.join(root, skillRef);
+    if (isDir(candidate)) pushUnique(directDirs, directSeen, candidate);
+  }
+  // External-package skill roots come from the per-uid packages registry —
+  // registry-driven, not a blind scan, so disabled packages stay invisible.
+  // Schema contract: src/main/features/packages.ts.
+  function packageSkillRoots(uidDir) {
+    const packagesRoot = path.join(uidDir, 'local', 'packages');
+    const roots = [];
+    let registry;
+    try {
+      registry = JSON.parse(fs.readFileSync(path.join(packagesRoot, '_registry.json'), 'utf8'));
+    } catch { return roots; }
+    if (!registry || !Array.isArray(registry.packages)) return roots;
+    for (const pkg of registry.packages) {
+      if (!pkg || typeof pkg.name !== 'string' || pkg.enabled === false) continue;
+      if (/[\\/]|\.\./.test(pkg.name)) continue;
+      for (const rel of Array.isArray(pkg.skill_roots) ? pkg.skill_roots : []) {
+        if (typeof rel !== 'string' || path.isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) continue;
+        roots.push(rel === '.' ? packagesRoot : path.join(packagesRoot, pkg.name, rel));
+      }
+    }
+    return roots;
+  }
+
+  const envAgentId = safePathSegment(process.env.ORKAS_AGENT_ID);
+
+  function addUidDir(uidDir, includeAgentPrivate = false) {
+    const cloudRoot = path.join(uidDir, 'cloud', 'skills');
+    const marketplaceRoot = path.join(uidDir, 'local', 'marketplace', 'skills');
+    addRoot(marketplaceRoot);
+    addRoot(cloudRoot);
+    addDirect(marketplaceRoot);
+    addDirect(cloudRoot);
+    if (includeAgentPrivate && envAgentId) {
+      const marketplaceAgentSkillsRoot = path.join(uidDir, 'local', 'marketplace', 'agents', envAgentId, 'skills');
+      const customAgentPrivateSkillsRoot = path.join(uidDir, 'cloud', 'agents', envAgentId, 'private_skills');
+      addRoot(marketplaceAgentSkillsRoot);
+      addRoot(customAgentPrivateSkillsRoot);
+      addDirect(marketplaceAgentSkillsRoot);
+      addDirect(customAgentPrivateSkillsRoot);
+    }
+    for (const pkgRoot of packageSkillRoots(uidDir)) {
+      addRoot(pkgRoot);
+      addDirect(pkgRoot);
+    }
+  }
+
+  const envUid = (process.env.ORKAS_UID || '').trim();
+  if (envUid && !/[\\/]/.test(envUid) && envUid !== '.' && envUid !== '..') {
+    addUidDir(path.join(wsRoot, envUid), true);
+  } else {
+    try {
+      for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith('.')) continue;
+        addUidDir(path.join(wsRoot, entry.name));
+      }
+    } catch {
+      /* no data dir yet */
+    }
+  }
+  // Global roots last — lowest priority, mirroring SkillRegistry's open tier.
+  // The host injects the account preference on every turn; standalone callers
+  // retain the historical default-on behavior when the variable is absent.
+  if (process.env.ORKAS_GLOBAL_SKILL_ROOTS_ENABLED !== '0') {
+    for (const globalRoot of [
+      path.join(require('os').homedir(), '.claude', 'skills'),
+      path.join(require('os').homedir(), '.codex', 'skills'),
+    ]) {
+      addRoot(globalRoot);
+      addDirect(globalRoot);
+    }
+  }
+  if (directDirs.length) return directDirs;
+
+  const aliasDirs = [];
+  const aliasSeen = new Set();
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const dir = path.join(root, entry.name);
+      if (readSkillDisplayName(dir) === skillRef) {
+        pushUnique(aliasDirs, aliasSeen, dir);
+      }
+    }
+  }
+  return aliasDirs;
+}
+
+function locateSkillScript(skillId, scriptBase) {
+  const skillDirs = collectSkillDirs(skillId);
+  const scriptExts = scriptExtsForPlatform();
+  const candidates = [];
+  for (const dir of skillDirs) {
+    let realScriptsDir;
+    try {
+      realScriptsDir = fs.realpathSync(path.join(fs.realpathSync(dir), 'scripts'));
+      const expectedScriptsDir = path.join(fs.realpathSync(dir), 'scripts');
+      const lhs = process.platform === 'win32' ? realScriptsDir.toLowerCase() : realScriptsDir;
+      const rhs = process.platform === 'win32' ? expectedScriptsDir.toLowerCase() : expectedScriptsDir;
+      // A symlinked scripts/ directory can redirect execution outside the
+      // admitted Skill root. Treat it as unavailable rather than following it.
+      if (lhs !== rhs) continue;
+    } catch {
+      continue;
+    }
+    for (const ext of scriptExts) {
+      candidates.push(path.join(dir, 'scripts', `${scriptBase}.${ext}`));
+    }
+    for (const ext of scriptExts) {
+      const p = path.join(dir, 'scripts', `${scriptBase}.${ext}`);
+      try {
+        if (!fs.statSync(p).isFile()) continue;
+        const realCandidate = fs.realpathSync(p);
+        const relative = path.relative(realScriptsDir, realCandidate);
+        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+        return p;
+      } catch {
+        /* next */
+      }
+    }
+  }
+  die(66, `skill script not found: ${skillId}/${scriptBase}.{${scriptExts.join(',')}}`, {
+    searched: candidates.map((candidate) => `${skillId}/scripts/${path.basename(candidate)}`),
+    hint: 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
+  });
+}
+
+/**
+ * Walk up from `startDir` looking for `relProbe` (e.g. `node_modules` or a
+ * `.venv` interpreter), at most `maxLevels` levels — enough to climb from a
+ * nested skill dir (`<pkg>/skills/<id>`) to its package root without ever
+ * scanning past the data root into unrelated trees.
+ */
+function findUpwards(startDir, relProbe, maxLevels) {
+  let dir = path.resolve(startDir);
+  for (let i = 0; i <= maxLevels; i++) {
+    const candidate = path.join(dir, relProbe);
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch { /* keep climbing */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function existingFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function packageEntryForScript(scriptPath) {
+  const root = path.resolve(workspaceRoot());
+  const rel = path.relative(root, path.resolve(scriptPath));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const parts = rel.split(path.sep);
+  if (parts.length < 5 || parts[1] !== 'local' || parts[2] !== 'packages') return null;
+  const uid = parts[0];
+  const pkgName = parts[3];
+  if (!PKG_NAME_RE.test(pkgName)) return null;
+  let registry;
+  try {
+    registry = JSON.parse(fs.readFileSync(path.join(root, uid, 'local', 'packages', '_registry.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!registry || !Array.isArray(registry.packages)) return null;
+  const entry = registry.packages.find((pkg) =>
+    pkg && pkg.name === pkgName && pkg.enabled !== false);
+  if (!entry) return null;
+  return {
+    name: pkgName,
+    repo_url: typeof entry.repo_url === 'string' ? entry.repo_url : '',
+    commit: typeof entry.commit === 'string' ? entry.commit : '',
+  };
+}
+
+function sharedPackageVenvPython(scriptPath, isWin) {
+  const entry = packageEntryForScript(scriptPath);
+  if (!entry) return null;
+  const venv = path.join(sharedVenvRoot(), 'python', 'packages', packageVenvKey(entry), '.venv');
+  const python = isWin
+    ? path.join(venv, 'Scripts', 'python.exe')
+    : path.join(venv, 'bin', 'python');
+  return existingFile(python) ? python : null;
+}
+
+function findOnPath(names, env = process.env) {
+  const pathValue = env.PATH || env.Path || env.path || '';
+  const dirs = pathValue.split(path.delimiter).filter(Boolean);
+  const pathext = process.platform === 'win32'
+    ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((x) => x.trim()).filter(Boolean)
+    : [''];
+  for (const dir of dirs) {
+    for (const name of names) {
+      const variants = path.extname(name) ? [name] : pathext.map((ext) => `${name}${ext}`);
+      for (const variant of variants) {
+        const candidate = path.join(dir, variant);
+        if (existingFile(candidate)) return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function findGitBash() {
+  const envCandidates = [
+    process.env.ORKAS_GIT_BASH_PATH,
+    process.env.CLAUDE_CODE_GIT_BASH_PATH,
+  ].filter(Boolean);
+  for (const p of envCandidates) {
+    if (existingFile(p)) return p;
+  }
+
+  const pathCandidate = findOnPath(['bash.exe', 'bash']);
+  if (pathCandidate) return pathCandidate;
+
+  const roots = [
+    process.env.ProgramFiles,
+    process.env['ProgramFiles(x86)'],
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs'),
+  ].filter(Boolean);
+  for (const root of roots) {
+    for (const rel of [
+      path.join('Git', 'bin', 'bash.exe'),
+      path.join('Git', 'usr', 'bin', 'bash.exe'),
+    ]) {
+      const candidate = path.join(root, rel);
+      if (existingFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function findPowerShell() {
+  for (const p of [process.env.ORKAS_POWERSHELL_PATH, process.env.POWERSHELL_PATH].filter(Boolean)) {
+    if (existingFile(p)) return p;
+  }
+  return process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+}
+
+function commandFromEnv(value) {
+  if (!value) return null;
+  if (path.isAbsolute(value) || value.includes('/') || value.includes('\\')) {
+    return existingFile(value) ? value : null;
+  }
+  return value;
+}
+
+function findPython(isWin) {
+  const configured = commandFromEnv(process.env.ORKAS_PYTHON);
+  if (configured) return { cmd: configured, args: [] };
+
+  // Direct development runs use the same repository venv as
+  // scripts/run-python-tests.mjs. Packaged runs normally provide
+  // ORKAS_PYTHON, so this candidate is intentionally only a fallback.
+  const localVenvPython = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    'venv',
+    isWin ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'),
+  );
+  if (existingFile(localVenvPython)) return { cmd: localVenvPython, args: [] };
+
+  const candidates = isWin
+    ? [
+      { cmd: findOnPath(['py.exe', 'py']), args: ['-3'] },
+      { cmd: 'python', args: [] },
+    ]
+    : [
+      { cmd: 'python3', args: [] },
+      { cmd: 'python', args: [] },
+    ];
+  for (const candidate of candidates) {
+    if (!candidate.cmd) continue;
+    const probe = spawnSync(candidate.cmd, [...candidate.args, '--version'], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  die(76, 'Python 3 runtime is not available; set ORKAS_PYTHON to a working interpreter');
+}
+
+function findUv() {
+  const configured = commandFromEnv(process.env.ORKAS_UV);
+  if (configured) return configured;
+  return findOnPath(process.platform === 'win32' ? ['uv.exe', 'uv'] : ['uv']);
+}
+
+function skillVenvPython(venv, isWin) {
+  return isWin
+    ? path.join(venv, 'Scripts', 'python.exe')
+    : path.join(venv, 'bin', 'python');
+}
+
+function readSkillPythonRequirements(skillDir, scriptPath) {
+  const scriptBase = path.basename(scriptPath, path.extname(scriptPath));
+  const file = [
+    path.join(skillDir, `requirements.${scriptBase}.txt`),
+    path.join(skillDir, 'requirements.txt'),
+  ].find(existingFile);
+  if (!file) return null;
+  let content = '';
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    die(70, `failed to read skill Python requirements: ${err && err.message}`, { file });
+  }
+  const actionable = content
+    .split(/\r?\n/)
+    .some((line) => {
+      const trimmed = line.trim();
+      return !!trimmed && !trimmed.startsWith('#');
+    });
+  return actionable
+    ? { file, content, sha256: crypto.createHash('sha256').update(content).digest('hex') }
+    : null;
+}
+
+function runSkillDependencyCommand(cmd, args, options = {}) {
+  const result = spawnSync(cmd, args, {
+    cwd: options.cwd,
+    env: options.env || process.env,
+    stdio: 'inherit',
+    windowsHide: true,
+    timeout: options.timeout || 10 * 60 * 1000,
+  });
+  if (result.error) {
+    return { ok: false, error: result.error.message, status: result.status };
+  }
+  if (result.status !== 0) {
+    return { ok: false, error: `${options.label || cmd} exited ${result.status}`, status: result.status };
+  }
+  return { ok: true };
+}
+
+function pythonRuntimeFingerprint(basePython) {
+  const result = spawnSync(basePython.cmd, [...(basePython.args || []), '--version'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  if (result.error || result.status !== 0) return '';
+  return String(result.stdout || result.stderr || '').trim();
+}
+
+/**
+ * Standalone/custom skills can declare pinned Python packages in a skill-root
+ * `requirements.<script>.txt` (preferred) or `requirements.txt` (all Python
+ * scripts). Install them once into a workspace-local, content-addressed venv
+ * before the first matching script run. Never mutate the packaged
+ * ORKAS_PYTHON tree: app updates replace it and macOS code signing treats
+ * bundled resources as immutable.
+ */
+function ensureSkillPythonVenv(skillDir, scriptPath, skillId, basePython, isWin) {
+  const requirements = readSkillPythonRequirements(skillDir, scriptPath);
+  if (!requirements) return null;
+
+  const safeId = safePathSegment(skillId).slice(0, 48) || 'skill';
+  const identity = [
+    path.resolve(skillDir),
+    requirements.sha256,
+    basePython.cmd,
+    ...(basePython.args || []),
+    pythonRuntimeFingerprint(basePython),
+  ].join('\n');
+  const key = `${safeId}-${shortHash(identity)}`;
+  const skillsRoot = path.join(sharedVenvRoot(), 'python', 'skills');
+  const envRoot = path.join(skillsRoot, key);
+  const venv = path.join(envRoot, '.venv');
+  const python = skillVenvPython(venv, isWin);
+  const marker = path.join(envRoot, '.orkas-skill-requirements.json');
+
+  try {
+    const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    if (state
+        && state.schema === 1
+        && state.requirements_sha256 === requirements.sha256
+        && existingFile(python)) {
+      return python;
+    }
+  } catch {
+    /* missing/incomplete cache — install below */
+  }
+
+  fs.mkdirSync(skillsRoot, { recursive: true });
+  const tmpRoot = path.join(skillsRoot, `.${key}-${process.pid}-${Date.now()}`);
+  const tmpVenv = path.join(tmpRoot, '.venv');
+  const tmpPython = skillVenvPython(tmpVenv, isWin);
+  fs.mkdirSync(tmpRoot, { recursive: true });
+
+  const uv = findUv();
+  const installEnv = {
+    ...process.env,
+    UV_CACHE_DIR: process.env.UV_CACHE_DIR
+      || path.join(sharedVenvRoot(), 'python', 'cache'),
+  };
+  process.stderr.write(`[Orkas] Installing Python dependencies for skill ${skillId}...\n`);
+
+  let created;
+  if (uv && (!basePython.args || basePython.args.length === 0)) {
+    created = runSkillDependencyCommand(
+      uv,
+      ['venv', '--python', basePython.cmd, tmpVenv],
+      { cwd: skillDir, env: installEnv, label: 'uv venv' },
+    );
+  } else {
+    created = runSkillDependencyCommand(
+      basePython.cmd,
+      [...(basePython.args || []), '-m', 'venv', tmpVenv],
+      { cwd: skillDir, env: installEnv, label: 'python -m venv' },
+    );
+  }
+  if (!created.ok || !existingFile(tmpPython)) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    die(70, 'failed to create isolated skill Python environment', {
+      skillId,
+      requirements: requirements.file,
+      cause: created.error || 'venv Python missing after creation',
+    });
+  }
+
+  const installed = uv
+    ? runSkillDependencyCommand(
+      uv,
+      ['pip', 'install', '--python', tmpPython, '--requirements', requirements.file],
+      { cwd: skillDir, env: installEnv, label: 'uv pip install' },
+    )
+    : runSkillDependencyCommand(
+      tmpPython,
+      ['-m', 'pip', 'install', '--disable-pip-version-check', '--requirement', requirements.file],
+      { cwd: skillDir, env: installEnv, label: 'pip install' },
+    );
+  if (!installed.ok) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    die(70, 'failed to install skill Python dependencies', {
+      skillId,
+      requirements: requirements.file,
+      cause: installed.error,
+    });
+  }
+
+  fs.writeFileSync(
+    path.join(tmpRoot, '.orkas-skill-requirements.json'),
+    JSON.stringify({
+      schema: 1,
+      skill_id: skillId,
+      requirements_sha256: requirements.sha256,
+      installed_at: new Date().toISOString(),
+    }, null, 2),
+    'utf8',
+  );
+
+  try {
+    fs.renameSync(tmpRoot, envRoot);
+  } catch (err) {
+    // Another invocation may have completed the same content-addressed venv
+    // while this one installed. A complete winner is safe to reuse.
+    try {
+      const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      if (state.requirements_sha256 !== requirements.sha256 || !existingFile(python)) throw err;
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      return python;
+    } catch {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      die(70, 'failed to publish isolated skill Python environment', {
+        skillId,
+        requirements: requirements.file,
+        cause: err && err.message,
+      });
+    }
+  }
+  return python;
+}
+
+function registerTsxLoader() {
+  if (!process.env.ORKAS_PC_DIR) {
+    die(69, 'ORKAS_PC_DIR env not set — cannot locate tsx for .ts transpile');
+  }
+  // Resolve tsx from PC/node_modules explicitly (subprocess cwd may be
+  // anywhere). ORKAS_PC_DIR already points at asar.unpacked in packaged
+  // mode, so plain filesystem resolution works.
+  const tsxEntry = path.join(process.env.ORKAS_PC_DIR, 'node_modules', 'tsx', 'dist', 'cjs', 'index.cjs');
+  try {
+    require(tsxEntry);
+  } catch (e) {
+    die(70, `failed to load tsx/cjs from ${tsxEntry}: ${e && e.message}`);
+  }
+}
+
+function runViaSubprocess(scriptPath, scriptArgs, skillId) {
+  const ext = path.extname(scriptPath).slice(1).toLowerCase();
+  const skillDir = path.dirname(path.dirname(scriptPath));
+  const isWin = process.platform === 'win32';
+  // Pick command + args by extension. For Python on Windows we try `py -3`
+  // first (Python launcher, ships with the official installer) and fall back
+  // to `python` if missing — handled by trying spawn.
+  let cmd; let argv0Args = [];
+  if (ext === 'py') {
+    // External package skills prefer the shared data/venv interpreter keyed
+    // by package source+commit. Legacy/vendored skills can still supply a
+    // nearest `.venv` walking up from the skill dir.
+    const sharedPython = sharedPackageVenvPython(scriptPath, isWin);
+    const venvPython = findUpwards(
+      skillDir,
+      isWin ? path.join('.venv', 'Scripts', 'python.exe') : path.join('.venv', 'bin', 'python3'),
+      3,
+    );
+    if (sharedPython) {
+      cmd = sharedPython;
+    } else if (venvPython) {
+      cmd = venvPython;
+    } else {
+      const py = findPython(isWin);
+      const skillPython = ensureSkillPythonVenv(skillDir, scriptPath, skillId, py, isWin);
+      if (skillPython) {
+        cmd = skillPython;
+      } else {
+        cmd = py.cmd;
+        argv0Args = py.args;
+      }
+    }
+  } else if (ext === 'sh') {
+    if (isWin) {
+      cmd = findGitBash();
+      if (!cmd) {
+        die(
+          76,
+          'Git Bash is required to run .sh skill scripts on native Windows. Install Git for Windows, set ORKAS_GIT_BASH_PATH, or provide a .ps1/.cmd/.py/.js script for this skill.',
+          { scriptPath },
+        );
+      }
+    } else {
+      cmd = 'bash';
+    }
+  } else if (ext === 'ps1') {
+    cmd = findPowerShell();
+    argv0Args = [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+    ];
+  } else if (ext === 'cmd' || ext === 'bat') {
+    if (!isWin) die(75, `Windows batch script requires native Windows: ${scriptPath}`);
+    cmd = 'cmd.exe';
+    argv0Args = ['/d', '/s', '/c'];
+  } else if (ext === 'rb') {
+    cmd = 'ruby';
+  } else {
+    die(75, `unsupported subprocess extension: ${ext}`);
+  }
+  // Keep the caller's workspace cwd for relative input/output arguments.
+  // Bundled resources are addressed through ORKAS_SKILL_DIR, so changing cwd
+  // to the installation directory would make documented commands such as
+  // `--input caps_input.json --out caps_plan.json` miss conversation files.
+  trySpawn(cmd, [...argv0Args, scriptPath, ...scriptArgs], process.cwd(), skillDir, skillId, true);
+}
+
+function trySpawn(cmd, argv, executionCwd, skillDir, skillId, fatalOnEnoent = false) {
+  let child;
+  try {
+    child = spawn(cmd, argv, {
+      stdio: 'inherit',
+      env: { ...process.env, ORKAS_SKILL_ID: skillId, ORKAS_SKILL_DIR: skillDir },
+      cwd: executionCwd,
+      windowsHide: true,
+    });
+  } catch (e) {
+    if (fatalOnEnoent) die(76, `failed to spawn ${cmd}: ${e && e.message}`);
+    return { spawned: false };
+  }
+  child.on('error', (e) => {
+    if (e && e.code === 'ENOENT' && !fatalOnEnoent) return; // caller will retry
+    die(76, `failed to spawn ${cmd}: ${e && e.message}`, { cmd, argv });
+  });
+  // `close` follows `exit` after inherited stdio and OS process handles are
+  // released. Exiting the runner on `exit` left freshly executed .exe files
+  // and temporary skill directories briefly locked on Windows.
+  child.on('close', (code, signal) => {
+    if (signal) process.kill(process.pid, signal);
+    process.exit(code == null ? 1 : code);
+  });
+  return { spawned: true };
+}
+
+function writeAndFlush(stream, text) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => stream.removeListener('error', onError);
+    stream.once('error', onError);
+    try {
+      stream.write(text, (error) => {
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      });
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+async function runAsModule(scriptPath, scriptArgs, skillId) {
+  const nativeJsLoader = require('node:module')._extensions['.js'];
+  registerTsxLoader();
+
+  // Ensure skill scripts can resolve packages from PC/node_modules even when
+  // the script lives under data/<uid>/cloud/skills/... (outside PC). NODE_PATH
+  // is honoured by Node's module resolution at initial require; this helps any
+  // transitive resolver used by tsx + user code.
+  //
+  // External packages / vendored skills: the NEAREST node_modules walking up
+  // from the skill dir ranks FIRST so a package's own pinned deps beat
+  // same-name modules in PC/node_modules. PC/node_modules stays as fallback.
+  const skillDir = path.dirname(path.dirname(scriptPath));
+  const ownNodeModules = findUpwards(skillDir, 'node_modules', 3);
+  const pcNodeModules = path.join(process.env.ORKAS_PC_DIR, 'node_modules');
+  const nodePathParts = [];
+  if (ownNodeModules && path.resolve(ownNodeModules) !== path.resolve(pcNodeModules)) {
+    nodePathParts.push(ownNodeModules);
+  }
+  nodePathParts.push(pcNodeModules);
+  if (process.env.NODE_PATH) nodePathParts.push(process.env.NODE_PATH);
+  process.env.NODE_PATH = nodePathParts.join(path.delimiter);
+  require('node:module').Module._initPaths();
+
+  let mod;
+  try {
+    // Select before evaluation. Older standalone Nodes retain their existing
+    // CJS compatibility path; bundled Node supports synchronous ESM hooks.
+    const Module = require('node:module');
+    if (path.extname(scriptPath) === '.mjs' && typeof Module.registerHooks === 'function') {
+      const loader = require('./skill-esm-loader.cjs').registerSkillEsmLoader(
+        process.env.ORKAS_PC_DIR, nodePathParts.flatMap((part) => part.split(path.delimiter)).filter(Boolean), nativeJsLoader,
+      );
+      // An unresolved initialization promise alone does not keep a CJS
+      // launcher alive. Natural exit before import settles must not claim
+      // success when the default entry was never invoked.
+      process.exitCode = 71;
+      mod = loader.isCommonJs(scriptPath) ? require(scriptPath)
+        : await import(require('node:url').pathToFileURL(scriptPath).href);
+      process.exitCode = 0;
+    } else {
+      mod = require(scriptPath);
+    }
+  } catch (e) {
+    die(71, `failed to load skill script: ${e && (e.stack || e.message)}`, { scriptPath });
+  }
+
+  const fn = (mod && (mod.default || mod)) || null;
+  if (typeof fn !== 'function') {
+    die(72, 'skill script must export default async function(args): Promise<any>', { scriptPath });
+  }
+
+  let result;
+  try {
+    result = await fn({ args: scriptArgs, skillId, skillDir: path.dirname(path.dirname(scriptPath)) });
+  } catch (e) {
+    die(1, e && (e.stack || e.message), { scriptPath });
+  }
+
+  // If the script already printed structured output, respect that and skip
+  // appending a duplicate payload. Convention: non-undefined return => we
+  // JSON.stringify it to stdout (trailing newline). A top-level `ok: false`
+  // is the module contract for a semantic failure, so callers receive both
+  // the structured report and a failing process status.
+  const exitCode = (
+    result !== null
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && result.ok === false
+  ) ? 1 : 0;
+  try {
+    const serialized = result === undefined ? '' : `${JSON.stringify(result)}\n`;
+    // A module may have already filled stdout's pipe before returning. Queue
+    // one final write (empty when there is no return value) and wait for its
+    // callback so process.exit cannot discard the buffered tail.
+    await writeAndFlush(process.stdout, serialized);
+    await writeAndFlush(process.stderr, '');
+  } catch (e) {
+    die(73, `failed to serialize or flush result: ${e && e.message}`);
+  }
+  process.exit(exitCode);
+}
+
+async function main() {
+  const { skillId, scriptBase, scriptArgs } = parseArgs(process.argv);
+  const scriptPath = locateSkillScript(skillId, scriptBase);
+
+  const ext = path.extname(scriptPath).slice(1).toLowerCase();
+  if (ext === 'ts' || ext === 'mjs' || ext === 'js') {
+    await runAsModule(scriptPath, scriptArgs, skillId);
+  } else {
+    runViaSubprocess(scriptPath, scriptArgs, skillId);
+  }
+}
+
+main();

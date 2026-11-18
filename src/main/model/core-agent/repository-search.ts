@@ -1,0 +1,457 @@
+import { spawn } from 'node:child_process';
+import { fileSystemForPath } from '../../util/user-file-fs';
+import * as path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+
+export type RepositoryFileList = {
+  files: string[];
+  backend: 'rg' | 'walk';
+  capped: boolean;
+  interrupted?: boolean;
+  error?: string;
+};
+
+export type RepositoryGrepHit = {
+  path: string;
+  line: number;
+  column: number;
+  text: string;
+  before: Array<{ line: number; text: string }>;
+  after: Array<{ line: number; text: string }>;
+};
+
+export type RepositoryGrepResult = {
+  available: boolean;
+  hits: RepositoryGrepHit[];
+  scannedBackend: 'rg' | 'fallback';
+  capped: boolean;
+  error?: string;
+  interrupted?: boolean;
+};
+
+/** One deadline shared by all roots and search phases of a tool call. */
+export function createRepositorySearchBudget(signal?: AbortSignal, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref();
+  return {
+    signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    reason(): 'cancelled' | 'time_budget' | undefined {
+      if (signal?.aborted) return 'cancelled';
+      if (controller.signal.aborted || Date.now() >= deadline) {
+        controller.abort();
+        return 'time_budget';
+      }
+      return undefined;
+    },
+    dispose: () => clearTimeout(timer),
+  };
+}
+
+const COMMAND_OUTPUT_MAX_BYTES = 24 * 1024 * 1024;
+const DEFAULT_FALLBACK_EXCLUDES = [
+  'node_modules',
+  'vendor',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+  '.next',
+  '.nuxt',
+  '.cache',
+  'target',
+  '__pycache__',
+  '.venv',
+  '.git',
+];
+const DEFAULT_FALLBACK_FILE_GLOBS = ['*.min.js', '*.min.css', '*.map'];
+
+type CommandResult = {
+  ok: boolean;
+  code: number | null;
+  stderr: string;
+  unavailable: boolean;
+  capped: boolean;
+  interrupted?: boolean;
+};
+
+export async function listRepositoryFiles(
+  root: string,
+  maxFiles: number,
+  opts: { includeIgnored?: boolean; signal?: AbortSignal } = {},
+): Promise<RepositoryFileList> {
+  const files: string[] = [];
+  const result = await visitRepositoryFiles(root, (file) => {
+    files.push(file);
+    return files.length > maxFiles;
+  }, opts);
+  return { ...result, files: files.slice(0, maxFiles) };
+}
+
+/** Backpressured filename stream. The visitor returns true to stop early. */
+export async function visitRepositoryFiles(
+  root: string,
+  visit: (file: string) => boolean | Promise<boolean>,
+  opts: { includeIgnored?: boolean; signal?: AbortSignal } = {},
+): Promise<Omit<RepositoryFileList, 'files'>> {
+  const args = [
+    '--files',
+    '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
+    '--null',
+    '--glob',
+    '!.git/**',
+    ...(opts.includeIgnored ? ['--no-ignore'] : []),
+  ];
+  for (const dir of DEFAULT_FALLBACK_EXCLUDES) args.push('--glob', `!${dir}/**`);
+  for (const glob of DEFAULT_FALLBACK_FILE_GLOBS) args.push('--glob', `!${glob}`);
+  const result = await runStreamingRecords(
+    'rg',
+    args,
+    root,
+    '\0',
+    (record) => record ? visit(path.resolve(root, record)) : false,
+    opts.signal,
+  );
+  return {
+    backend: result.unavailable ? 'walk' : 'rg',
+    capped: result.capped,
+    ...(result.interrupted ? { interrupted: true } : {}),
+    ...(!result.ok && !result.unavailable && !result.interrupted && result.code !== 1
+      ? { error: result.stderr.trim() || `rg exited with code ${result.code ?? 'null'}` }
+      : {}),
+  };
+}
+
+export async function grepRepository(
+  root: string,
+  input: {
+    pattern: string;
+    regex: boolean;
+    caseSensitive: boolean;
+    contextLines: number;
+    filesOnly?: boolean;
+    maxResults: number;
+    includeGlobs: string[];
+    excludeGlobs: string[];
+    includeIgnored?: boolean;
+    signal?: AbortSignal;
+  },
+): Promise<RepositoryGrepResult> {
+  const args = [
+    '--json',
+    '--hidden',
+    // Plain workspaces must honor .gitignore just like Git checkouts and the fallback walker.
+    '--no-require-git',
+    '--line-number',
+    '--column',
+    '--color',
+    'never',
+    '--glob',
+    '!.git/**',
+    ...(input.regex ? [] : ['--fixed-strings']),
+    ...(input.caseSensitive ? [] : ['--ignore-case']),
+    ...(input.filesOnly ? ['--max-count', '1'] : []),
+    ...(input.contextLines > 0 ? ['--context', String(input.contextLines)] : []),
+    ...(input.includeIgnored ? ['--no-ignore'] : []),
+  ];
+  for (const glob of input.includeGlobs) args.push('--glob', glob);
+  for (const glob of input.excludeGlobs) args.push('--glob', `!${glob}`);
+  for (const dir of DEFAULT_FALLBACK_EXCLUDES) args.push('--glob', `!${dir}/**`);
+  for (const glob of DEFAULT_FALLBACK_FILE_GLOBS) args.push('--glob', `!${glob}`);
+  args.push('--regexp', input.pattern, '.');
+  const matches: Array<{ path: string; line: number; column: number; text: string }> = [];
+  const contextByPath = new Map<string, Map<number, string>>();
+  const result = await runStreamingRecords(
+    'rg',
+    args,
+    root,
+    '\n',
+    (rawLine) => {
+      if (!rawLine) return false;
+      let record: any;
+      try { record = JSON.parse(rawLine); } catch { return false; }
+      if (record?.type !== 'match' && record?.type !== 'context') return false;
+      const relativePath = record?.data?.path?.text;
+      const text = String(record?.data?.lines?.text ?? '').replace(/\r?\n$/, '').slice(0, 4_000);
+      const line = Number(record?.data?.line_number);
+      if (typeof relativePath !== 'string' || !Number.isFinite(line)) return false;
+      const absolutePath = path.resolve(root, relativePath);
+      if (record.type === 'context') {
+        let contexts = contextByPath.get(absolutePath);
+        if (!contexts) {
+          contexts = new Map();
+          contextByPath.set(absolutePath, contexts);
+        }
+        contexts.set(line, text);
+        return false;
+      }
+      const first = Array.isArray(record?.data?.submatches) ? record.data.submatches[0] : undefined;
+      matches.push({
+        path: absolutePath,
+        line,
+        column: Number.isFinite(first?.start) ? Number(first.start) + 1 : 1,
+        text,
+      });
+      return matches.length > input.maxResults;
+    },
+    input.signal,
+  );
+  if (result.unavailable) {
+    return { available: false, hits: [], scannedBackend: 'fallback', capped: false };
+  }
+  if (!result.ok && result.code !== 1 && !result.interrupted) {
+    return {
+      available: true,
+      hits: [],
+      scannedBackend: 'rg',
+      capped: false,
+      error: result.stderr.trim() || `rg exited with code ${result.code ?? 'null'}`,
+    };
+  }
+
+  const capped = result.capped || matches.length > input.maxResults;
+  const selected = matches.slice(0, input.maxResults);
+  return {
+    available: true,
+    scannedBackend: 'rg',
+    capped,
+    ...(result.interrupted ? { interrupted: true } : {}),
+    hits: selected.map((match) => {
+      const context = contextByPath.get(match.path);
+      const before: Array<{ line: number; text: string }> = [];
+      const after: Array<{ line: number; text: string }> = [];
+      for (let offset = input.contextLines; offset > 0; offset--) {
+        const line = match.line - offset;
+        const text = context?.get(line);
+        if (text !== undefined) before.push({ line, text: text.slice(0, 240) });
+      }
+      for (let offset = 1; offset <= input.contextLines; offset++) {
+        const line = match.line + offset;
+        const text = context?.get(line);
+        if (text !== undefined) after.push({ line, text: text.slice(0, 240) });
+      }
+      return { ...match, before, after };
+    }),
+  };
+}
+
+export function fallbackDirectoryExcluded(name: string): boolean {
+  return DEFAULT_FALLBACK_EXCLUDES.includes(name);
+}
+
+export function fallbackFileExcluded(name: string): boolean {
+  return name.endsWith('.min.js') || name.endsWith('.min.css') || name.endsWith('.map');
+}
+
+async function runStreamingRecords(
+  command: string,
+  args: string[],
+  cwd: string,
+  delimiter: '\0' | '\n',
+  onRecord: (record: string) => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<CommandResult> {
+  if (signal?.aborted) return { ok: false, code: null, stderr: '', unavailable: false, capped: false, interrupted: true };
+  const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let spawnError: NodeJS.ErrnoException | undefined;
+  const closed = new Promise<number | null>((resolve) => {
+    child.on('error', (error: NodeJS.ErrnoException) => { spawnError = error; });
+    child.once('close', resolve);
+  });
+  let stopped = false;
+  let outputExceeded = false;
+  let callbackError = false;
+  let stderrBytes = 0;
+  const stderrChunks: Buffer[] = [];
+  child.stderr.on('data', (data: Buffer) => {
+    const chunk = data.subarray(0, Math.max(0, COMMAND_OUTPUT_MAX_BYTES - stderrBytes));
+    if (chunk.length) { stderrChunks.push(chunk); stderrBytes += chunk.length; }
+  });
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const stop = () => {
+    try { child.kill('SIGTERM'); } catch { /* close owns terminal state */ }
+    if (!killTimer) {
+      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* exited */ } }, 250);
+      killTimer.unref();
+    }
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  const consume = async (): Promise<void> => {
+    let boundary = pending.indexOf(delimiter);
+    let offset = 0;
+    while (boundary >= 0 && !signal?.aborted) {
+      const record = pending.slice(offset, boundary).replace(/\r$/, '');
+      offset = boundary + delimiter.length;
+      const decision = onRecord(record);
+      if (typeof decision === 'boolean' ? decision : await decision) { stopped = true; break; }
+      boundary = pending.indexOf(delimiter, offset);
+    }
+    pending = pending.slice(offset);
+  };
+  try {
+    for await (const data of child.stdout) {
+      if (signal?.aborted) break;
+      pending += decoder.write(data as Buffer);
+      if (pending.length > COMMAND_OUTPUT_MAX_BYTES) { outputExceeded = true; break; }
+      await consume();
+      if (stopped || signal?.aborted) break;
+      // Let cancellation/deadline timers run even on a hot local pipe.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (!stopped && !outputExceeded && !signal?.aborted) {
+      pending += decoder.end();
+      if (pending) stopped = await onRecord(pending.replace(/\r$/, ''));
+    }
+  } catch {
+    callbackError = !signal?.aborted && !spawnError;
+  } finally {
+    if (stopped || outputExceeded || callbackError || signal?.aborted) stop();
+  }
+  const code = await closed;
+  if (killTimer) clearTimeout(killTimer);
+  signal?.removeEventListener('abort', stop);
+  return {
+    ok: (code === 0 || stopped) && !outputExceeded && !callbackError && !signal?.aborted && !spawnError,
+    code,
+    stderr: outputExceeded ? 'repository search output exceeded its bounded capture'
+      : callbackError ? 'repository search visitor failed'
+      : spawnError?.message ?? Buffer.concat(stderrChunks).toString('utf8'),
+    unavailable: spawnError?.code === 'ENOENT',
+    capped: stopped,
+    ...(signal?.aborted ? { interrupted: true } : {}),
+  };
+}
+
+// ── Ignore-file support for the walk fallback ────────────────────────────
+//
+// `rg --files` already honours ignore files, so the repository backend needs
+// nothing here. The walk fallback (no ripgrep on the machine) previously
+// filtered only by a hard-coded directory list, so on those machines
+// `search_files` returned build output, logs and local config that the project
+// had explicitly ignored — contradicting the tool's own contract and filling
+// the model's context with noise.
+//
+// This is the common subset of gitignore semantics, not the whole spec:
+// comments/blank lines, a trailing `/` for directory-only rules, a leading `/`
+// anchoring to the file's own directory, `!` negation, and `*` / `?` / `**`
+// globs. Nested `.gitignore` files apply to their own subtree, matching git's
+// scoping. Character classes, and the rarely-used escaping rules, are not
+// interpreted; an unsupported pattern simply fails to match rather than
+// throwing, so the walk degrades to "shows a bit more" and never to a crash.
+
+export type IgnoreRule = {
+  re: RegExp;
+  negate: boolean;
+  dirOnly: boolean;
+};
+
+export type IgnoreScope = {
+  /** Directory the rules were declared in; patterns resolve relative to it. */
+  dir: string;
+  rules: IgnoreRule[];
+};
+
+function globToRegExpSource(glob: string): string {
+  let out = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const ch = glob[i];
+    if (ch === '*') {
+      if (glob[i + 1] === '*') {
+        // `**` spans directory separators; `*` stops at one. A trailing `**`
+        // (`logs/**`) matches everything inside, at any depth, as in git.
+        i += 1;
+        if (i === glob.length - 1) { out += '.*'; continue; }
+        if (glob[i + 1] === '/') i += 1;
+        out += '(?:.*/)?';
+      } else {
+        out += '[^/]*';
+      }
+      continue;
+    }
+    if (ch === '?') { out += '[^/]'; continue; }
+    out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return out;
+}
+
+export function parseIgnoreRules(content: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = [];
+  for (const raw of String(content || '').split(/\r?\n/)) {
+    let line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const negate = line.startsWith('!');
+    if (negate) line = line.slice(1);
+    const dirOnly = line.endsWith('/');
+    if (dirOnly) line = line.slice(0, -1);
+    if (!line) continue;
+    // A pattern containing a slash anywhere (other than a trailing one) is
+    // anchored to the declaring directory; a bare name matches at any depth.
+    const anchored = line.startsWith('/') || line.slice(0, -1).includes('/');
+    if (line.startsWith('/')) line = line.slice(1);
+    if (!line) continue;
+    const body = globToRegExpSource(line);
+    const source = anchored ? `^${body}$` : `^(?:.*/)?${body}$`;
+    try { rules.push({ re: new RegExp(source), negate, dirOnly }); }
+    catch { /* unsupported pattern: skip rather than fail the whole walk */ }
+  }
+  return rules;
+}
+
+/** Read `<dir>/.gitignore`, returning null when absent or unreadable. */
+export function readIgnoreScope(dir: string): IgnoreScope | null {
+  let content: string;
+  try { content = fileSystemForPath(dir).readFileSync(path.join(dir, '.gitignore'), 'utf8'); }
+  catch { return null; }
+  const rules = parseIgnoreRules(content);
+  return rules.length ? { dir, rules } : null;
+}
+
+/** Last matching rule wins, exactly like git, so a later `!pattern` re-includes. */
+export function isIgnoredByScopes(
+  absPath: string,
+  isDir: boolean,
+  scopes: readonly IgnoreScope[],
+): boolean {
+  let ignored = false;
+  for (const scope of scopes) {
+    const rel = path.relative(scope.dir, absPath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    const posix = rel.split(path.sep).join('/');
+    ignored = applyIgnoreRules(ignored, posix, isDir, scope.rules);
+  }
+  return ignored;
+}
+
+function applyIgnoreRules(ignored: boolean, relative: string, isDir: boolean, rules: readonly IgnoreRule[]): boolean {
+  for (const rule of rules) {
+    if (rule.dirOnly && !isDir) continue;
+    if (rule.re.test(relative)) ignored = !rule.negate;
+  }
+  return ignored;
+}
+
+/** Prepare inherited ignore scopes once for direct opendir entries in this directory. */
+export function createDirectoryIgnoreMatcher(dir: string, scopes: readonly IgnoreScope[]): (name: string, isDir: boolean) => boolean {
+  const prepared = scopes.flatMap(scope => {
+    const relative = path.relative(scope.dir, dir);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return [];
+    const prefix = relative ? relative.split(path.sep).join('/') + '/' : '';
+    return [{ prefix, rules: scope.rules, fileRules: scope.rules.filter(rule => !rule.dirOnly) }];
+  });
+  const fileScopes = prepared.filter(scope => scope.fileRules.length > 0);
+  return (name, isDir) => {
+    let ignored = false;
+    for (const scope of isDir ? prepared : fileScopes) {
+      const relative = scope.prefix + name;
+      // Preserve the absolute-path helper's existing relative-path boundary.
+      if (relative.startsWith('..')) continue;
+      ignored = applyIgnoreRules(ignored, relative, isDir, isDir ? scope.rules : scope.fileRules);
+    }
+    return ignored;
+  };
+}

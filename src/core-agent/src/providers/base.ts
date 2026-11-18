@@ -1,0 +1,148 @@
+import type {
+  Model,
+  Api,
+  Context as PiContext,
+  AssistantMessage as PiAssistantMessage,
+  AssistantMessageEvent as PiStreamEvent,
+  Tool as PiTool,
+  StreamOptions as PiStreamOptions,
+  SimpleStreamOptions as PiSimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+
+// Re-export pi-ai types that consumers need
+export type { Model, PiContext, PiAssistantMessage, PiStreamEvent, PiTool };
+
+import type { Message, StreamEvent, StopReason, Usage } from "../shared/types.js";
+
+/** Tool definition for LLM function calling. */
+export type ToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  /** Optional grammar input; the JSON schema remains the portable contract. */
+  constrainedSampling?: Extract<NonNullable<PiTool["constrainedSampling"]>, { type: "grammar" }>;
+};
+
+/** Read-only, provider-owned candidate limits. The opaque key survives request
+ * cloning and distinguishes equal model names on different connections. */
+export type ProviderContextBudget = Readonly<{
+  key: string;
+  model: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+}>;
+
+/** Parameters for an LLM completion request. */
+export type CompletionParams = {
+  /** Request-local measurement from core preparation. `model` is the configured
+   * model preparation priced for; input references identify the unchanged
+   * request view. Transformed inputs and other candidates must estimate afresh.
+   * Cloneable bookkeeping, never sent to an API or persisted. */
+  requestTokenEstimate?: {
+    model: string;
+    messages: Message[];
+    systemPrompt?: string;
+    tools?: ToolDefinition[];
+    tokens: number;
+    source: "anchored" | "estimated";
+    budget?: ProviderContextBudget;
+  };
+  /** Best-effort metadata observer, including attempts recovered by wrappers. Never sent to the API. */
+  onRequestFailure?: (failure: import("./request-diagnostics.js").ProviderRequestFailure) => void;
+  model: string;
+  messages: Message[];
+  systemPrompt?: string;
+  tools?: ToolDefinition[];
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  stopSequences?: string[];
+  /** Abort signal for cancellation. */
+  signal?: AbortSignal;
+  /** Optional per-call first usable stream-event deadline. Rotating wrappers
+   * use this only before a candidate is committed; ordinary adapters ignore
+   * it and continue to honor `signal` for the whole request. */
+  firstEventTimeoutMs?: number;
+  /** Thinking/reasoning level.
+   *  - `"off"` opts out of configured effort and disables thinking where
+   *    supported. Models explicitly declaring off unsupported retain their
+   *    official default thinking rather than sending an invalid control.
+   *  - `undefined` falls back to the provider's `defaultReasoning`, when one
+   *    is configured; otherwise the request omits an explicit effort.
+   *  - `"minimal"`/`"low"`/`"medium"`/`"high"` map directly to pi-ai's
+   *    `ThinkingLevel` for the provider's reasoner channel. */
+  reasoning?: "off" | "minimal" | "low" | "medium" | "high";
+  /** Prompt-cache TTL policy forwarded to pi-ai. `"short"` (default in pi-ai)
+   * = Anthropic 5m / OpenAI default window; `"long"` = Anthropic 1h / OpenAI
+   * extended retention (24h on legacy models or 30m on explicit-cache models);
+   * `"none"` disables caching. Provider-specific translation happens inside
+   * pi-ai; providers without cache support ignore it. */
+  cacheRetention?: "none" | "short" | "long";
+  /** Conversation identifier forwarded to provider-specific cache metadata.
+   * The Codex SSE adapter separately scopes its HTTP cache-affinity header to
+   * the credential/endpoint/model; this id still owns its body cache key and
+   * request identity. Neither identifier guarantees a cache hit. */
+  sessionId?: string;
+  /** Opaque, in-memory identity of the active user turn. Transport adapters
+   * may associate private routing state with it; never serialize it into API
+   * payloads or persistence. Reuse for same-turn retries, not a new user turn. */
+  providerTurnContext?: object;
+  /** Host-private metadata for provider adapters. Generic providers must not
+   * forward this wholesale; adapters may pick specific fields for their own
+   * trusted endpoints. */
+  requestMetadata?: Record<string, unknown>;
+  /** Retry ownership across provider wrappers. Attempt zero is the first
+   * AgentRunner call for a model round; positive values mean AgentRunner is
+   * already recovering that call, so wrappers must not grant a fresh nested
+   * same-candidate retry budget. This is host-private and is never forwarded
+   * to provider APIs. */
+  retryContext?: {
+    agentAttempt: number;
+  };
+};
+
+/** Non-streaming completion result. */
+export type CompletionResult = {
+  content: Message["content"];
+  stopReason: StopReason;
+  /** Known output truncation with discarded tool proposals; not replay state. */
+  incompleteToolCall?: true;
+  usage: Usage;
+  model: string;
+};
+
+/**
+ * Abstract LLM provider interface.
+ *
+ * Now backed by @earendil-works/pi-ai for multi-provider support via OpenClaw's
+ * unified LLM communication layer.
+ */
+export interface LLMProvider {
+  readonly id: string;
+  readonly name: string;
+
+  /** Create a non-streaming completion. */
+  complete(params: CompletionParams): Promise<CompletionResult>;
+
+  /** Create a streaming completion. Yields StreamEvent items. */
+  stream(params: CompletionParams): AsyncIterable<StreamEvent>;
+
+  /** Test whether this provider's credentials are valid. */
+  validateAuth(): Promise<boolean>;
+
+  /** Optional, read-only: the configured model the next request will be
+   * offered to first. Preparation prices its context budget against this
+   * model's catalog window and labels its measurement with it. Absent means
+   * the last model the provider reported serving. */
+  contextBudgetModel?(): string | undefined;
+
+  /** Actual limits for the next candidate or the candidate that last served
+   * a call. Providers without this hook retain catalog-based accounting. */
+  contextBudget?(phase?: "next" | "served"): ProviderContextBudget | undefined;
+}
+
+/** Provider factory function. */
+export type ProviderFactory = (config: {
+  apiKey?: string;
+  baseUrl?: string;
+}) => LLMProvider;

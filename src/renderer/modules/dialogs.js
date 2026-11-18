@@ -1,0 +1,620 @@
+// ─── Custom dialogs (replace native confirm/alert) ──────────────────────
+// Native `confirm()` / `alert()` render OS-locale buttons ("OK"/"Cancel").
+// These helpers give us a localized cancel / confirm pair every time
+// and match the rest of the modal UI. Both return a Promise — callers
+// must `await`.
+
+// Pre-boot, `t()` may not yet have tables loaded — fall back to a
+// Chinese source string so the dialog never renders blank if triggered
+// early. (The fallback string itself is intentionally left as Chinese
+// to match the historical default; the i18n key takes over once tables
+// load.)
+function _dialogLabel(key, zhFallback) {
+  try { const v = t(key); return v === key ? zhFallback : v; } catch (_) { return zhFallback; }
+}
+
+// Task-scoped global dialogs must identify their own request, never the active view.
+// Resolve only a missing title, using the existing targeted conversation read.
+function _uiDialogConversationTitle(info) {
+  if (info.usage_scope === true) return '';
+  const direct = String(info.conversation_title || '').trim();
+  if (direct) return direct;
+  const cid = String(info.cid || '');
+  const conversation = cid && typeof conversations !== 'undefined' && Array.isArray(conversations)
+    ? conversations.find(item => item && item.conversation_id === cid) : null;
+  return String(conversation && conversation.title || '').trim();
+}
+
+function _uiDialogContextText(info) {
+  if (!info) return '';
+  const task = info.usage_scope === true
+    ? t('dialog.context.application')
+    : info.cid || info.conversation_title
+      ? t('agents.cli_permission_task', { title: _uiDialogConversationTitle(info) || t('chat.reference_unknown_task') })
+      : t('dialog.context.background');
+  const actor = String(info.agent_name || info.agentName || info.agent_id || info.agentId || '').trim();
+  return [task, actor ? t('dialog.context.requester', { name: actor }) : ''].filter(Boolean).join('\n');
+}
+
+function _uiDialogContextHtml(info) {
+  return info ? `<div class="ui-dialog-context">${escapeHtml(_uiDialogContextText(info)).replace(/\n/g, '<br />')}</div>` : '';
+}
+
+function _uiBindDialogContext(overlay, info) {
+  if (!info) return () => {};
+  let disposed = false;
+  let resolved = { ...info };
+  const render = () => {
+    if (disposed) return;
+    const element = overlay.querySelector('.ui-dialog-context');
+    if (element) element.textContent = _uiDialogContextText(resolved);
+  };
+  window.addEventListener('i18n-change', render);
+  if (info.cid && info.usage_scope !== true && !_uiDialogConversationTitle(info)) {
+    Promise.resolve().then(() => {
+      if (disposed) return null;
+      return window.orkas.invoke('conversations.get', { cid: info.cid });
+    }).then(result => {
+      if (disposed || !result || !result.conversation) return;
+      const conversation = result.conversation;
+      if (conversation.conversation_id !== info.cid) return;
+      resolved = { ...info, conversation_title: conversation.title };
+      render();
+    }).catch(() => { /* Keep the explicit unknown-task label; never substitute the active task. */ });
+  }
+  return () => {
+    disposed = true;
+    window.removeEventListener('i18n-change', render);
+  };
+}
+
+let _uiDialogSeq = 0;
+
+function _uiNextDialogId() {
+  return `ui-dialog-${++_uiDialogSeq}`;
+}
+
+function _uiIsTopDialogOverlay(overlay) {
+  const open = document.querySelectorAll('.ui-dialog-overlay.open');
+  return open.length === 0 || open[open.length - 1] === overlay;
+}
+
+function _uiTrapDialogTab(overlay, e) {
+  if (e.key !== 'Tab') return false;
+  const focusable = Array.from(overlay.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]',
+  )).filter((element) => element.offsetParent !== null);
+  if (!focusable.length) {
+    e.preventDefault();
+    return true;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+function _uiRestoreDialogFocus(previousFocus, options) {
+  if (
+    previousFocus
+    && typeof previousFocus.focus === 'function'
+    && document.body.contains(previousFocus)
+  ) {
+    previousFocus.focus(options);
+    // Resource-card actions are revealed by :focus-within. Re-enter the
+    // focusable card before restoring an action that is hidden at rest.
+    if (document.activeElement !== previousFocus && !previousFocus.disabled && !previousFocus.hidden) {
+      const parent = previousFocus.parentElement?.closest('[tabindex]');
+      if (parent && parent.tabIndex >= 0) {
+        parent.focus(options);
+        previousFocus.focus(options);
+      }
+    }
+  }
+}
+
+function _uiKeepDialogFocus(overlay, preferredFocus) {
+  const onFocusIn = (event) => {
+    if (!_uiIsTopDialogOverlay(overlay) || overlay.contains(event.target)) return;
+    if (preferredFocus && typeof preferredFocus.focus === 'function') preferredFocus.focus();
+  };
+  document.addEventListener('focusin', onFocusIn, true);
+  return () => document.removeEventListener('focusin', onFocusIn, true);
+}
+
+function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, signal, onConfirm }) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const messageId = `${dialogId}-message`;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
+    const okText = escapeHtml(okLabel || _dialogLabel('common.confirm', 'Confirm'));
+    overlay.innerHTML = `
+      <div class="modal ui-dialog modal-standard" role="${showCancel ? 'dialog' : 'alertdialog'}" aria-modal="true" aria-labelledby="${messageId}">
+        ${_uiDialogContextHtml(context)}
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        <div class="modal-actions">
+          ${showCancel ? `<button class="btn" data-act="cancel">${cancelText}</button>` : ''}
+          <button class="btn btn-primary" data-act="ok">${okText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const releaseContext = _uiBindDialogContext(overlay, context);
+
+    const okBtn = overlay.querySelector('[data-act="ok"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, okBtn);
+    let finished = false;
+    let busy = false;
+    const onKey = (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing should commit
+      // the IME candidate, not auto-confirm the dialog.
+      if (e.isComposing || e.keyCode === 229) return;
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (busy) { if (e.key === 'Escape' || e.key === 'Enter') e.preventDefault(); return; }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      } else if (e.key === 'Enter') {
+        // Preserve native button activation: Enter on Cancel must cancel,
+        // while Enter on OK must confirm. Only a non-interactive target uses
+        // the dialog's default action.
+        const interactive = e.target && typeof e.target.closest === 'function'
+          ? e.target.closest('button, input, textarea, select, a[href]')
+          : null;
+        if (interactive) return;
+        e.preventDefault();
+        confirm();
+      }
+    };
+    const finish = (val) => {
+      if (finished) return;
+      finished = true;
+      document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
+      releaseContext();
+      if (signal) signal.removeEventListener('abort', onAbort);
+      overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
+      resolve(val);
+    };
+    const onAbort = () => finish(false);
+    const confirm = async () => {
+      if (finished || busy) return;
+      if (typeof onConfirm !== 'function') { finish(true); return; }
+      busy = true;
+      okBtn.disabled = true;
+      okBtn.classList.add('is-loading');
+      okBtn.setAttribute('aria-busy', 'true');
+      if (cancelBtn) cancelBtn.disabled = true;
+      try {
+        // The action owns failure feedback; false keeps the dialog retryable.
+        if (await onConfirm() !== false) finish(true);
+      } catch (_) { /* Restore the action after an unexpected rejection. */ }
+      finally {
+        busy = false;
+        okBtn.disabled = false;
+        okBtn.classList.remove('is-loading');
+        okBtn.removeAttribute('aria-busy');
+        if (cancelBtn) cancelBtn.disabled = false;
+        if (!finished) okBtn.focus();
+      }
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    okBtn.addEventListener('click', confirm);
+    if (cancelBtn) cancelBtn.addEventListener('click', () => { if (!busy) finish(false); });
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) okBtn.focus();
+    }, 0);
+  });
+}
+
+// Backwards-compatible: `uiConfirm("message")` keeps the original
+// "Confirm" / "Cancel" pair. Pass `{message, okLabel?, cancelLabel?}` when
+// the action wants a more specific verb (e.g. "Open Folder" for the
+// preview-fallback dialog) — avoids forking a near-duplicate confirm
+// helper per CLAUDE.md §"Reuse UI components".
+// Optional onConfirm keeps the action loading until it resolves; return false
+// after showing failure feedback to leave the dialog available for retry.
+function uiConfirm(arg) {
+  if (arg && typeof arg === 'object') {
+    return _uiShowDialog({
+      message: arg.message,
+      context: arg.context,
+      showCancel: true,
+      okLabel: arg.okLabel,
+      cancelLabel: arg.cancelLabel,
+      signal: arg.signal,
+      onConfirm: arg.onConfirm,
+    });
+  }
+  return _uiShowDialog({ message: arg, showCancel: true });
+}
+
+function uiAlert(message) {
+  return _uiShowDialog({ message, showCancel: false }).then(() => {});
+}
+
+let _uiToastHost = null;
+let _uiToastSeq = 0;
+
+function _uiEnsureToastHost() {
+  if (_uiToastHost && document.body.contains(_uiToastHost)) return _uiToastHost;
+  _uiToastHost = document.createElement('div');
+  _uiToastHost.className = 'ui-toast-host';
+  _uiToastHost.setAttribute('aria-live', 'polite');
+  _uiToastHost.setAttribute('aria-atomic', 'false');
+  document.body.appendChild(_uiToastHost);
+  return _uiToastHost;
+}
+
+function uiToast(message, opts) {
+  const text = String(message || '').trim();
+  if (!text) return null;
+  const host = _uiEnsureToastHost();
+  const toast = document.createElement('div');
+  const rawVariant = opts && opts.variant ? String(opts.variant) : 'info';
+  const variant = ['info', 'success', 'warning', 'error'].includes(rawVariant) ? rawVariant : 'info';
+  const timeout = Math.max(1200, Math.min(10000, Number(opts && opts.timeoutMs) || 3200));
+  const id = `ui-toast-${++_uiToastSeq}`;
+  toast.className = `ui-toast is-${variant}`;
+  toast.id = id;
+  toast.setAttribute('role', variant === 'error' ? 'alert' : 'status');
+  toast.innerHTML = `
+    <div class="ui-toast-bar" aria-hidden="true"></div>
+    <div class="ui-toast-message">${escapeHtml(text)}</div>
+  `;
+  host.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('is-visible'));
+
+  let done = false;
+  const close = () => {
+    if (done) return;
+    done = true;
+    toast.classList.remove('is-visible');
+    toast.classList.add('is-leaving');
+    setTimeout(() => {
+      toast.remove();
+      if (host.childElementCount === 0) host.remove();
+    }, 180);
+  };
+  toast.addEventListener('click', close);
+  setTimeout(close, timeout);
+  return { id, close };
+}
+
+// Danger-styled confirm: title + multi-line message + custom danger button
+// label. The primary button uses .btn-danger (red) so the user sees the
+// destructive action signed by the action wording itself. Used by the
+// project delete flow ("delete project + N conversations") — generic enough
+// to adopt for other irreversible actions later.
+//
+// With onConfirm, keep the dialog busy until the action resolves; rejection
+// displays the caller's localized errorMessage and permits an explicit retry.
+// Returns true after confirmation/action success, false on cancel / Esc.
+function uiConfirmDanger({ title, message, dangerLabel, cancelLabel, onConfirm, errorMessage } = {}) {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const titleId = `${dialogId}-title`;
+    const messageId = `${dialogId}-message`;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title" id="${titleId}">${escapeHtml(String(title))}</div>` : '';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
+    const dangerText = escapeHtml(dangerLabel || _dialogLabel('common.confirm', 'Confirm'));
+    overlay.innerHTML = `
+      <div class="modal ui-dialog ui-dialog-danger modal-standard" role="alertdialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
+        ${titleHtml}
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        <div class="ui-dialog-error" role="alert" hidden></div>
+        <div class="modal-actions">
+          <button class="btn" data-act="cancel">${cancelText}</button>
+          <button class="btn btn-danger" data-act="ok">${dangerText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const okBtn = overlay.querySelector('[data-act="ok"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const errorEl = overlay.querySelector('.ui-dialog-error');
+    let busy = false;
+    overlay.tabIndex = -1;
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, {
+      focus: () => (busy ? overlay : cancelBtn).focus(),
+    });
+    let finished = false;
+    const onKey = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      }
+      // Enter does NOT auto-fire danger — the user must explicitly click
+      // the red button. Reduces accidental confirmation on irreversible
+      // actions. (Standard uiConfirm keeps Enter-to-confirm.)
+    };
+    const finish = (val) => {
+      if (finished || busy) return;
+      finished = true;
+      document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
+      overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
+      resolve(val);
+    };
+    const setBusy = (value) => {
+      busy = value;
+      okBtn.disabled = value;
+      cancelBtn.disabled = value;
+      okBtn.classList.toggle('is-loading', value);
+      okBtn.setAttribute('aria-busy', String(value));
+      okBtn.textContent = value ? _dialogLabel('common.processing', 'Processing…')
+        : dangerLabel || _dialogLabel('common.confirm', 'Confirm');
+      if (value) overlay.focus();
+    };
+    okBtn.addEventListener('click', async () => {
+      if (finished || busy) return;
+      if (typeof onConfirm !== 'function') { finish(true); return; }
+      setBusy(true);
+      errorEl.hidden = true;
+      try {
+        await onConfirm();
+        setBusy(false);
+        finish(true);
+      } catch (_) {
+        errorEl.textContent = errorMessage || _dialogLabel('chat.retry_btn', 'Retry');
+        errorEl.hidden = false;
+      } finally {
+        if (!finished) {
+          setBusy(false);
+          okBtn.focus();
+        }
+      }
+    });
+    cancelBtn.addEventListener('click', () => finish(false));
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) cancelBtn.focus();
+    }, 0);  // focus cancel by default — safer
+  });
+}
+
+// Multi-button choice dialog. The user picks one of `choices[]` (each
+// gets its own button); the resolved value is the chosen `id`, or `null`
+// on cancel / Esc. Used when an action has two valid
+// follow-up paths (e.g. close-sync with / without cloud purge) — a plain
+// uiConfirm would force the user to imagine the alternative.
+//
+// `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
+// 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
+// or more neutral/contextual choices on the left edge of the actions row.
+/** `choiceLayout: 'group'` lays the choices out as a wrapping group above the
+ * action row, the way the native-question card in the composer dock renders
+ * its options. Prose labels (a CLI question's options) need it: the action
+ * row is one non-wrapping line, so more than a few of them collapse to their
+ * min-width and the labels wrap into unreadable columns. The default keeps
+ * short confirm choices beside cancel on the action row. */
+function uiChoice({ title, message, context, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false, choiceLayout = 'actions', onChoice, errorMessage } = {}) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve(null);
+      return;
+    }
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const titleId = `${dialogId}-title`;
+    const messageId = `${dialogId}-message`;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title" id="${titleId}">${escapeHtml(String(title))}</div>` : '';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
+    const renderChoice = (c, extraClass = '') => {
+      const cls = c.style === 'danger' ? 'btn btn-danger'
+        : c.style === '' ? 'btn'
+        : 'btn btn-primary';
+      const className = `${cls}${extraClass ? ` ${extraClass}` : ''}`;
+      return `<button class="${className}" data-act="choice" data-id="${escapeHtml(String(c.id))}">${escapeHtml(String(c.label || c.id))}</button>`;
+    };
+    const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
+    const choiceHtml = choices.map((c) => renderChoice(c)).join('');
+    const groupedChoices = choiceLayout === 'group';
+    const choiceGroupHtml = groupedChoices
+      ? `<div class="ui-dialog-choices" role="group" aria-labelledby="${messageId}">${choiceHtml}</div>`
+      : '';
+    const selectedIds = new Set();
+    overlay.innerHTML = `
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
+        ${titleHtml}
+        ${_uiDialogContextHtml(context)}
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        ${choiceGroupHtml}
+        <div class="ui-dialog-error" role="alert" hidden></div>
+        <div class="modal-actions">
+          ${leadingChoiceHtml}
+          <button class="btn" data-act="cancel">${cancelText}</button>
+          ${groupedChoices ? '' : choiceHtml}
+          ${multiple ? `<button class="btn btn-primary" data-act="confirm" disabled>${escapeHtml(_dialogLabel('common.confirm', 'Confirm'))}</button>` : ''}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const releaseContext = _uiBindDialogContext(overlay, context);
+
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, cancelBtn);
+    let finished = false;
+    let saving = false;
+    const onKey = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (!saving) finish(null);
+      }
+      // No Enter-to-confirm — caller must pick a choice explicitly.
+    };
+    const finish = (val) => {
+      if (finished) return;
+      finished = true;
+      document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
+      releaseContext();
+      if (signal) signal.removeEventListener('abort', onAbort);
+      overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
+      resolve(val);
+    };
+    const onAbort = () => finish(null);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
+      if (multiple) {
+        btn.setAttribute('aria-pressed', 'false');
+        btn.classList.remove('btn-primary');
+      }
+      btn.addEventListener('click', async () => {
+        if (saving) return;
+        if (!multiple) {
+          const id = btn.dataset.id || null;
+          if (onChoice) {
+            saving = true;
+            const buttons = overlay.querySelectorAll('button');
+            buttons.forEach(button => { button.disabled = true; });
+            let error;
+            overlay.querySelector('.ui-dialog-error').hidden = true;
+            try { error = await onChoice(id); }
+            catch { error = errorMessage || _dialogLabel('chat.retry_btn', 'Retry'); }
+            finally { saving = false; buttons.forEach(button => { button.disabled = false; }); }
+            if (finished) return;
+            if (error) {
+              const status = overlay.querySelector('.ui-dialog-error');
+              status.textContent = error;
+              status.hidden = false;
+              cancelBtn.focus();
+              return;
+            }
+          }
+          finish(id); return;
+        }
+        const id = btn.dataset.id;
+        if (selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        btn.setAttribute('aria-pressed', String(selectedIds.has(id)));
+        btn.classList.toggle('btn-primary', selectedIds.has(id));
+        overlay.querySelector('[data-act="confirm"]').disabled = selectedIds.size === 0;
+      });
+    });
+    if (multiple) overlay.querySelector('[data-act="confirm"]').addEventListener('click', () => finish([...selectedIds]));
+    cancelBtn.addEventListener('click', () => { if (!saving) finish(null); });
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) cancelBtn.focus();
+    }, 0);
+  });
+}
+
+// Text-input prompt with cancel / confirm buttons. Returns the entered string, or
+// null on cancel. Mirrors native `prompt()` semantics.
+function uiPrompt(message, defaultValue = '', options = {}) {
+  const context = options && options.context;
+  return new Promise((resolve) => {
+    const signal = options && options.signal;
+    if (signal && signal.aborted) {
+      resolve(null);
+      return;
+    }
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const messageId = `${dialogId}-message`;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(_dialogLabel('common.cancel', 'Cancel'));
+    const okText = escapeHtml(_dialogLabel('common.confirm', 'Confirm'));
+    overlay.innerHTML = `
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${messageId}">
+        ${_uiDialogContextHtml(context)}
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
+        <div class="form-row" style="margin-top:12px;margin-bottom:0">
+          <input type="${options && options.secret ? 'password' : 'text'}" class="ui-dialog-input" aria-labelledby="${messageId}" />
+        </div>
+        <div class="modal-actions">
+          <button class="btn" data-act="cancel">${cancelText}</button>
+          <button class="btn btn-primary" data-act="ok">${okText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const releaseContext = _uiBindDialogContext(overlay, context);
+
+    const input = overlay.querySelector('.ui-dialog-input');
+    input.value = defaultValue;
+    if (options && options.nameLimit && typeof window.bindNameLimitControl === 'function') {
+      window.bindNameLimitControl(input);
+    }
+    const okBtn = overlay.querySelector('[data-act="ok"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, input);
+    let finished = false;
+    const onKey = (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing in the prompt
+      // input belongs to the IME, not to the dialog confirm action.
+      if (e.isComposing || e.keyCode === 229) return;
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(null);
+      } else if (e.key === 'Enter' && e.target === input) {
+        e.preventDefault();
+        finish(input.value);
+      }
+    };
+    const finish = (val) => {
+      if (finished) return;
+      finished = true;
+      document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
+      releaseContext();
+      if (signal) signal.removeEventListener('abort', onAbort);
+      overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
+      resolve(val);
+    };
+    const onAbort = () => finish(null);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    okBtn.addEventListener('click', () => finish(input.value));
+    cancelBtn.addEventListener('click', () => finish(null));
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (!_uiIsTopDialogOverlay(overlay) || !document.body.contains(overlay)) return;
+      input.focus();
+      input.select();
+    }, 0);
+  });
+}

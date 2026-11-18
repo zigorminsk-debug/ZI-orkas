@@ -1,0 +1,2537 @@
+/**
+ * Auto tasks — sidebar "Automation" tab feature.
+ *
+ * Each task is a self-contained directory at either
+ *   `<uid>/cloud/auto_tasks/<task_id>/` (global) or
+ *   `<uid>/cloud/projects/<pid>/auto_tasks/<task_id>/` (project-scoped),
+ * holding `config.json` (spec) + `attachments/<filename>` (per-task files
+ * pre-staged by the user). Each task owns its config, attachments and handoff
+ * files; deletion removes that complete directory.
+ *
+ * Fire path: every run goes to the task's run conversation — the one the
+ * task was created from, else the one its first run opened. A conversation
+ * that is gone or in another scope is replaced by a new
+ * `chats.createConversation({projectId})`. Attachments are copied into the
+ * conversation's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
+ * attachments})`. Same single-dispatch bus entry as a manual send (per
+ * PC/CLAUDE.md §5); a message to a busy conversation queues behind its work.
+ *
+ * Schedule shapes (Schedule union):
+ *   - one_time: { at: ISO datetime }       fires once; after fire enabled=false
+ *   - hourly:   { interval_hours }         every x hours from create / last run
+ *   - daily:    { hour, minute }
+ *   - weekly:   { weekday | weekdays[], hour, minute }; workdays = Monday–Friday
+ *   - monthly:  { day | days[], hour, minute }      day=31 → last day of shorter months
+ *
+ * Scheduler: per-task timers started by `startScheduler()` after
+ * `activateUser()`. After system wake or startup, the most recent boundary
+ * missed while the computer slept or Orkas was closed is caught up once if it
+ * is at most `CATCH_UP_WINDOW_MS` old. Older misses, and misses noticed by an
+ * account switch or sync, do NOT back-fire.
+ *
+ * Fire-time seed text composition mirrors the commander composer:
+ *   - new UI tasks render ordered `message_parts` into localized inline text;
+ *   - legacy tasks wrap clean `content` with their single skill / connector;
+ *   - agent recipients prepend the Agent's current `@<name> ` after either
+ *     path, resolving the stable stored id at fire time so renames stay valid.
+ *
+ * Content is stored clean (no renderer token metadata). `message_parts` is
+ * plain JSON so multiple resource chips retain their original positions.
+ */
+
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import {
+  userCloudRoot,
+  userLocalRoot,
+  projectMetaFile,
+} from '../paths';
+import {
+  autoTaskLocationForTask,
+  chatAttachmentDirForConversation,
+  findAutoTaskLocation,
+  globalAutoTaskLocation,
+  listAutoTaskLocations,
+} from '../util/project-layout';
+import { readJson, writeJson, nowIso, safeId } from '../storage';
+import { FileSnapshotCache, mapFileSnapshots } from '../util/file-snapshot';
+import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from '../util/log-redact';
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
+import { sha256OfFileStream } from '../util/sha256';
+import { copyLocalFileAtomic } from '../util/file-import';
+import { isPathAllowed } from '../util/path-sandbox';
+import { t as translate } from '../i18n';
+import {
+  getCurrentDevice as getLegacyDeviceFingerprint,
+  getLegacyDeviceIds,
+  type DeviceFingerprint,
+} from '../util/device';
+import { limitNameDisplayText } from '../util/name-limit';
+import { getDeviceId as getPersistentDeviceId } from './machine_device_id';
+import { getActiveUserId, hasActiveUser } from './users';
+import { registerUserSwitchHook } from './user-switch-hooks';
+import * as agents from './agents';
+import * as chats from './chats';
+import { isAgentEnabled } from './component_enabled';
+import * as groupChat from './group_chat';
+
+const log = createLogger('auto-tasks');
+
+const SCHEMA_VERSION = 2;
+const MAX_CONTENT_LEN = 8000;
+const MAX_MESSAGE_PARTS = 256;
+const HOUR_MS = 60 * 60 * 1000;
+const MAX_INTERVAL_HOURS = 24 * 365 * 100;
+// Per-user task cap — every tick scans + reads each task's config.json, so a
+// runaway count can't be allowed to push a tick past TICK_MS.
+const MAX_TASKS_PER_USER = 200;
+const AUTO_TASK_CLAIMS_DIR = 'auto_task_claims';
+const LEGACY_MAC_DEVICE_ID_RE = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
+const MAX_LEGACY_CLAIMS_TO_CHECK = 32;
+
+/** Stable automation identity plus a user-facing hostname. The id comes from
+ * machine-global `device.json`, so NIC, VPN, private-MAC, and reboot changes
+ * cannot move tasks away from this installation. */
+export function getCurrentDevice(): DeviceFingerprint {
+  return {
+    id: getPersistentDeviceId(),
+    name: getLegacyDeviceFingerprint().name,
+  };
+}
+
+export type ScheduleOneTime = { type: 'one_time'; at: string };
+export type ScheduleHourly  = { type: 'hourly'; interval_hours: number };
+export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
+export type ScheduleWeekly = { type: 'weekly'; hour: number; minute: number } & (
+  | { weekday: number | 'workdays'; weekdays?: never }
+  | { weekdays: number[]; weekday?: never }
+);
+export type ScheduleMonthly = { type: 'monthly'; hour: number; minute: number } & (
+  | { day: number; days?: never }
+  | { days: number[]; day?: never }
+);
+export type Schedule = ScheduleOneTime | ScheduleHourly | ScheduleDaily | ScheduleWeekly | ScheduleMonthly;
+
+export type TaskEndCondition =
+  | { type: 'date'; date: string }
+  | { type: 'count'; max_runs: number };
+
+export type TaskRecipient =
+  | { kind: 'commander' }
+  | { kind: 'agent'; id: string; name: string };
+
+export type TaskSkillRef = { id: string; name: string };
+export type TaskConnectorRef = { id: string; name: string };
+export type TaskMessagePart =
+  | { type: 'text'; text: string }
+  | { type: 'use'; kind: 'skill' | 'connector'; id: string; name: string };
+
+export interface AutoTask {
+  id: string;
+  enabled: boolean;
+  title?: string;
+  content: string;                       // clean text, NO @ tokens
+  recipient?: TaskRecipient;
+  /** Ordered composer content for tasks created by inline-chip aware clients.
+   *  Legacy `skill` / `connector` remain as first-ref fallbacks for old clients. */
+  message_parts?: TaskMessagePart[];
+  skill?: TaskSkillRef;
+  connector?: TaskConnectorRef;
+  project_id?: string;
+  schedule: Schedule;
+  /** Persisted cadence anchor used when an existing task switches to an
+   *  hourly schedule before its first scheduled run. */
+  schedule_anchor_at?: string;
+  /** Optional recurring-task cutoff. Date is interpreted in the assigned
+   *  device's local timezone and includes the selected calendar day. */
+  end_condition?: TaskEndCondition;
+  /** Number of scheduled occurrences already claimed. Manual runs do not
+   *  advance this counter. Kept separate from execution conversations so
+   *  retention and deleted chats cannot change scheduling state. */
+  scheduled_run_count?: number;
+  attachments?: string[];                // file names under <task_dir>/attachments/
+  /** Device the task is bound to — only this machine fires the schedule.
+   *  The local installation can still read and edit the config.
+   *  `device_id` is the persistent installation id from machine-global
+   *  `device.json`; legacy releases stored a NIC MAC and migrate it only with
+   *  local ownership evidence. `device_name` is display-only. */
+  device_id?: string;
+  device_name?: string;
+  created_at: string;
+  updated_at: string;
+  last_run_at?: string;
+  /** Conversation every run is sent to: the one the task was created from,
+   *  else the one its first run opened. Absent on tasks saved before it
+   *  existed, which continue in `last_run.cid`. Host bookkeeping, not shown
+   *  to the model. */
+  conversation_id?: string;
+  /** Runs started (scheduled and manual) since this field existed. */
+  run_count?: number;
+  /** The most recent run and the one before it. A run stays `running` until
+   *  its own conversation reports a terminal; a restart can leave it there. */
+  last_run?: AutoTaskRun;
+  previous_run?: AutoTaskRun;
+}
+
+/** Terminal of one run as the group-chat bus reports it, plus `running`
+ *  before that and `unknown` for a terminal the bus could not classify. */
+export type AutoRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'stopped' | 'waiting_input' | 'unknown';
+
+export interface AutoTaskRun {
+  cid: string;
+  started_at: string;
+  ended_at?: string;
+  status: AutoRunStatus;
+}
+
+function genTaskId(): string { return 'at_' + crypto.randomBytes(4).toString('hex'); }
+
+/** Renderer-side helper: pre-allocate a task id so attachments can upload
+ *  into its dir before the user hits "create". The id is also adopted by
+ *  `createTask` when submitted. */
+export function allocateDraftTaskId(): string { return genTaskId(); }
+
+// ── Validation ────────────────────────────────────────────────────────────
+
+const _VALID_TASK_ID_RE = /^at_[0-9a-f]{8}$/;
+function _isValidTaskId(id: unknown): id is string {
+  return typeof id === 'string' && _VALID_TASK_ID_RE.test(id);
+}
+
+function _isHM(h: unknown, m: unknown): boolean {
+  return Number.isInteger(h) && (h as number) >= 0 && (h as number) <= 23
+    && Number.isInteger(m) && (m as number) >= 0 && (m as number) <= 59;
+}
+
+function _isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function _isValidLocalDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const parsed = new Date(year, month - 1, day);
+  return parsed.getFullYear() === year
+    && parsed.getMonth() === month - 1
+    && parsed.getDate() === day;
+}
+
+function _isValidEndCondition(value: unknown): value is TaskEndCondition {
+  if (!value || typeof value !== 'object') return false;
+  const condition = value as any;
+  if (condition.type === 'date') return _isValidLocalDate(condition.date);
+  if (condition.type === 'count') return _isPositiveSafeInteger(condition.max_runs);
+  return false;
+}
+
+function _isValidSchedule(s: any): s is Schedule {
+  if (!s || typeof s !== 'object') return false;
+  if (s.type === 'one_time') {
+    if (typeof s.at !== 'string' || !s.at) return false;
+    const d = new Date(s.at);
+    return !Number.isNaN(d.getTime());
+  }
+  if (s.type === 'hourly') {
+    return _isPositiveSafeInteger(s.interval_hours)
+      && s.interval_hours <= MAX_INTERVAL_HOURS;
+  }
+  if (s.type === 'daily') return _isHM(s.hour, s.minute);
+  if (s.type === 'weekly' || s.type === 'monthly') {
+    const weekly = s.type === 'weekly';
+    const scalar = weekly ? s.weekday : s.day;
+    const values = weekly ? s.weekdays : s.days;
+    const min = weekly ? 0 : 1;
+    const max = weekly ? 6 : 31;
+    if (!_isHM(s.hour, s.minute)) return false;
+    if (values !== undefined) {
+      return scalar === undefined && Array.isArray(values) && values.length > 0
+        && values.length <= (weekly ? 7 : 31)
+        && new Set(values).size === values.length
+        && values.every(value => Number.isInteger(value) && value >= min && value <= max);
+    }
+    return (weekly && scalar === 'workdays')
+      || (Number.isInteger(scalar) && scalar >= min && scalar <= max);
+  }
+  return false;
+}
+
+/** Expand saved selectors without changing their single/multiple editor mode. */
+function _calendarSelection(s: ScheduleWeekly | ScheduleMonthly): number[] {
+  const values = s.type === 'weekly'
+    ? (s.weekdays || (s.weekday === 'workdays' ? [1, 2, 3, 4, 5] : [s.weekday]))
+    : (s.days || [s.day]);
+  return [...values].sort((a, b) => a - b);
+}
+
+function _schedulesEqual(a: Schedule, b: Schedule): boolean {
+  if (a.type === 'one_time') {
+    return b.type === 'one_time'
+      && new Date(a.at).getTime() === new Date(b.at).getTime();
+  }
+  if (a.type === 'daily') {
+    return b.type === 'daily' && a.hour === b.hour && a.minute === b.minute;
+  }
+  if (a.type === 'hourly') {
+    return b.type === 'hourly' && a.interval_hours === b.interval_hours;
+  }
+  return a.type === b.type
+    && a.hour === (b as ScheduleWeekly | ScheduleMonthly).hour
+    && a.minute === (b as ScheduleWeekly | ScheduleMonthly).minute
+    && JSON.stringify(_calendarSelection(a)) === JSON.stringify(_calendarSelection(b as ScheduleWeekly | ScheduleMonthly));
+}
+
+function _endConditionsEqual(
+  a: TaskEndCondition | undefined,
+  b: TaskEndCondition | undefined,
+): boolean {
+  if (!a || !b) return a === b;
+  if (a.type === 'date') return b.type === 'date' && a.date === b.date;
+  return b.type === 'count' && a.max_runs === b.max_runs;
+}
+
+function _isValidRecipient(r: any): r is TaskRecipient {
+  if (!r || typeof r !== 'object') return false;
+  if (r.kind === 'commander') return true;
+  // Agent recipients carry both id (storage / cross-device) and name
+  // (the bus router matches `@<name>`, not `@<id>`).
+  if (r.kind === 'agent' && typeof r.id === 'string' && r.id
+      && typeof r.name === 'string' && r.name) return true;
+  return false;
+}
+
+function _isValidRef(r: any): r is { id: string; name: string } {
+  return !!r && typeof r === 'object'
+    && typeof r.id === 'string' && r.id
+    && typeof r.name === 'string' && r.name;
+}
+
+function _normaliseMessageParts(value: unknown): TaskMessagePart[] | null {
+  if (!Array.isArray(value) || !value.length || value.length > MAX_MESSAGE_PARTS) return null;
+  const out: TaskMessagePart[] = [];
+  let textLength = 0;
+  let hasUse = false;
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') return null;
+    if ((raw as any).type === 'text') {
+      const text = (raw as any).text;
+      if (typeof text !== 'string' || !text.length) return null;
+      textLength += text.length;
+      if (textLength > MAX_CONTENT_LEN) return null;
+      out.push({ type: 'text', text });
+      continue;
+    }
+    if ((raw as any).type !== 'use') return null;
+    const kind = (raw as any).kind;
+    if (kind !== 'skill' && kind !== 'connector') return null;
+    if (!_isValidRef(raw)) return null;
+    out.push({ type: 'use', kind, id: (raw as any).id, name: (raw as any).name });
+    hasUse = true;
+  }
+  return hasUse ? out : null;
+}
+
+function _contentFromMessageParts(parts: TaskMessagePart[]): string {
+  return parts
+    .filter((part): part is Extract<TaskMessagePart, { type: 'text' }> => part.type === 'text')
+    .map((part) => part.text)
+    .join('')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+function _isValidTaskShape(t: any): t is AutoTask {
+  if (!t || typeof t !== 'object') return false;
+  if (!_isValidTaskId(t.id)) return false;
+  if (typeof t.content !== 'string') return false;
+  if (typeof t.enabled !== 'boolean') return false;
+  if (!_isValidSchedule(t.schedule)) return false;
+  if (t.schedule_anchor_at !== undefined) {
+    if (typeof t.schedule_anchor_at !== 'string'
+        || Number.isNaN(new Date(t.schedule_anchor_at).getTime())) return false;
+  }
+  if (t.end_condition !== undefined && !_isValidEndCondition(t.end_condition)) return false;
+  if (t.scheduled_run_count !== undefined
+      && (!Number.isSafeInteger(t.scheduled_run_count) || t.scheduled_run_count < 0)) return false;
+  if (t.message_parts !== undefined && !_normaliseMessageParts(t.message_parts)) return false;
+  if (t.attachments !== undefined) {
+    if (!Array.isArray(t.attachments)) return false;
+    if (t.attachments.some((n: any) => typeof n !== 'string' || !n)) return false;
+  }
+  return true;
+}
+
+// ── File IO (serialised per uid) ──────────────────────────────────────────
+
+const _tails = new Map<string, Promise<unknown>>();
+let _markRanFailureForTest: Error | null = null;
+
+export function _setMarkRanFailureForTest(error: Error | null): void {
+  _markRanFailureForTest = error;
+}
+
+function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
+  const prev = _tails.get(uid) || Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  _tails.set(uid, next);
+  return next;
+}
+
+async function _readOne(
+  uid: string, taskId: string,
+  loc = findAutoTaskLocation(uid, taskId),
+  strict = false,
+): Promise<AutoTask | null> {
+  const cfg = loc?.configFile || globalAutoTaskLocation(uid, taskId).configFile;
+  if (!strict && !fs.existsSync(cfg)) return null;
+  try {
+    const raw: any = await readJson(cfg, { strict });
+    if (strict && !_isValidTaskShape(raw)) throw new Error('Invalid automation configuration');
+    if (!raw || typeof raw !== 'object') return null;
+    if (!_isValidTaskShape(raw)) return null;
+    _dropMalformedRunFacts(raw as unknown as Record<string, unknown>);
+    if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
+    return raw;
+  } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    if (strict) return null;
+    log.warn(`read failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
+    return null;
+  }
+}
+
+// Merge into an unpublished directory. A different-byte collision must not
+// choose a winner: both originals remain intact until the caller resolves it.
+async function _copyTaskEntry(source: string, target: string): Promise<void> {
+  const sourceStat = fs.lstatSync(source);
+  const targetStat = fs.existsSync(target) ? fs.lstatSync(target) : null;
+  if (sourceStat.isDirectory()) {
+    if (targetStat && !targetStat.isDirectory()) throw new Error('Task file conflict');
+    fs.mkdirSync(target, { recursive: true });
+    for (const name of fs.readdirSync(source)) {
+      await _copyTaskEntry(path.join(source, name), path.join(target, name));
+    }
+  } else if (sourceStat.isFile()) {
+    if (targetStat) {
+      if (!targetStat.isFile() || sourceStat.size !== targetStat.size
+        || await sha256OfFileStream(source) !== await sha256OfFileStream(target)) {
+        throw new Error('Task file conflict');
+      }
+    } else {
+      fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+    }
+  } else {
+    throw new Error('Unsupported task file type');
+  }
+}
+
+async function _writeOne(uid: string, task: AutoTask): Promise<void> {
+  const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
+  const existing = findAutoTaskLocation(uid, task.id);
+  const globalDraft = globalAutoTaskLocation(uid, task.id);
+  // Attachments may be uploaded before config.json exists. Such drafts live
+  // in the global task directory because project membership is only known on
+  // submit; adopt that config-less directory when creating a project task.
+  const prev = existing || (
+    loc.projectId
+    && loc.dir !== globalDraft.dir
+    && fs.existsSync(globalDraft.dir)
+    ? globalDraft
+    : null
+  );
+  if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
+    const retired = path.join(path.dirname(prev.dir), `.${task.id}.moved-${crypto.randomUUID()}`);
+    await replaceDirectoryAtomically(loc.dir, async (staged) => {
+      if (fs.existsSync(loc.dir)) fs.cpSync(loc.dir, staged, { recursive: true });
+      for (const name of fs.readdirSync(prev.dir)) {
+        if (name !== 'config.json') await _copyTaskEntry(path.join(prev.dir, name), path.join(staged, name));
+      }
+      await writeJson(path.join(staged, 'config.json'), task);
+    }, async () => {
+      // Same-parent rename removes the old runnable config in one operation.
+      // If it fails, the directory replacement restores the original target.
+      fs.renameSync(prev.dir, retired);
+    }, {
+      onCleanupError: (err) => log.warn('task migration backup cleanup failed', logErrorSummary(err)),
+    });
+    try { fs.rmSync(retired, { recursive: true, force: true }); }
+    catch (err) { log.warn('task migration source cleanup failed', logErrorSummary(err)); }
+    return;
+  }
+  fs.mkdirSync(loc.dir, { recursive: true });
+  await writeJson(loc.configFile, task);
+}
+
+function _hasMatchingLocalLegacyClaim(uid: string, task: AutoTask): boolean {
+  const assignedId = String(task.device_id || '').toLowerCase();
+  if (!LEGACY_MAC_DEVICE_ID_RE.test(assignedId)) return false;
+  const dir = path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, task.id);
+  if (!fs.existsSync(dir)) return false;
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir)
+      .filter((name) => name.endsWith('.json'))
+      .sort((a, b) => b.localeCompare(a))
+      .slice(0, MAX_LEGACY_CLAIMS_TO_CHECK);
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (raw?.task_id === task.id
+          && String(raw?.device_id || '').toLowerCase() === assignedId) return true;
+    } catch {
+      // Ignore malformed local claim evidence. It must never transfer a task.
+    }
+  }
+  return false;
+}
+
+async function _migrateLegacyDeviceBindingIfOwned(
+  uid: string,
+  task: AutoTask,
+): Promise<AutoTask> {
+  const assignedId = String(task.device_id || '').toLowerCase();
+  const current = getCurrentDevice();
+  if (!assignedId || !current.id || task.device_id === current.id
+      || !LEGACY_MAC_DEVICE_ID_RE.test(assignedId)) return task;
+  const currentLegacyIds = new Set(getLegacyDeviceIds().map((id) => id.toLowerCase()));
+  const locallyOwned = currentLegacyIds.has(assignedId)
+    || _hasMatchingLocalLegacyClaim(uid, task);
+  if (!locallyOwned) return task;
+  const migrated: AutoTask = {
+    ...task,
+    device_id: current.id,
+    device_name: current.name,
+    updated_at: nowIso(),
+  };
+  await _writeOne(uid, migrated);
+  log.info('legacy auto-task device binding migrated to persistent installation id');
+  return migrated;
+}
+
+async function _migrateLegacyDeviceBindingsIfOwned(
+  uid: string,
+  tasks: AutoTask[],
+): Promise<AutoTask[]> {
+  const out: AutoTask[] = [];
+  for (const task of tasks) out.push(await _migrateLegacyDeviceBindingIfOwned(uid, task));
+  return out;
+}
+
+async function _readAll(uid: string, strict = false): Promise<AutoTask[]> {
+  const out: AutoTask[] = [];
+  for (const loc of listAutoTaskLocations(uid, strict)) {
+    if (!_isValidTaskId(loc.taskId)) continue;
+    // Discovery already resolved scope and duplicate precedence. Re-scanning
+    // all directories per item makes a list quadratic in filesystem work.
+    const task = await _readOne(uid, loc.taskId, loc, strict);
+    if (task) out.push(task);
+  }
+  // Newest-first by created_at — a brand-new task lands at the top so the
+  // user sees what they just created without scrolling. Stable across
+  // ticks because created_at is immutable (unlike last_run_at, which
+  // would scramble the list every fire).
+  out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  return out;
+}
+
+/** Lifecycle read uses the scheduler's device migration/ownership contract, not armed timers. */
+export async function hasEnabledLocalAutomations(uid: string): Promise<boolean> {
+  return _runExclusive(uid, async () => {
+    const all = await _migrateLegacyDeviceBindingsIfOwned(uid, await _readAll(uid, true));
+    const device = getCurrentDevice().id;
+    return all.some(task => task.enabled && (!task.device_id || task.device_id === device));
+  });
+}
+
+// ── Public CRUD ───────────────────────────────────────────────────────────
+
+export type TaskDraft = {
+  schedule: Schedule;
+  end_condition?: TaskEndCondition | null;
+  content: string;
+  title?: string;
+  enabled?: boolean;
+  recipient?: TaskRecipient;
+  message_parts?: TaskMessagePart[] | null;
+  skill?: TaskSkillRef;
+  connector?: TaskConnectorRef;
+  project_id?: string | null;
+  attachments?: string[];
+  // Caller-supplied id (renderer pre-allocates so attachments can upload
+  // before submit). The pre-allocated id IS also the on-disk dir name.
+  id?: string;
+};
+
+export type TaskUpdatePatch = Partial<TaskDraft> & {
+  /** Semantic update-only flag. Device identifiers always come from main so
+   *  renderer callers cannot bind a task to an arbitrary machine. */
+  run_on_current_device?: boolean;
+};
+
+export type TaskError =
+  | 'invalid_schedule'
+  | 'invalid_end_condition'
+  | 'invalid_content'
+  | 'invalid_recipient'
+  | 'invalid_message_parts'
+  | 'invalid_skill'
+  | 'invalid_connector'
+  | 'invalid_project'
+  | 'invalid_id'
+  | 'not_found'
+  | 'too_many_tasks';
+
+type NormalisedFields = Omit<
+  AutoTask,
+  'id' | 'created_at' | 'updated_at' | 'last_run_at' | 'schedule_anchor_at' | 'scheduled_run_count'
+>;
+
+function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } | { ok: false; error: TaskError } {
+  if (!_isValidSchedule(d.schedule)) return { ok: false, error: 'invalid_schedule' };
+  let endCondition: TaskEndCondition | undefined;
+  if (d.end_condition !== undefined && d.end_condition !== null) {
+    if (!_isValidEndCondition(d.end_condition)) return { ok: false, error: 'invalid_end_condition' };
+    // A one-time task already has a single terminal instant; silently omit a
+    // recurring-only cutoff when a caller changes an existing task to once.
+    if (d.schedule.type !== 'one_time') {
+      endCondition = d.end_condition.type === 'date'
+        ? { type: 'date', date: d.end_condition.date }
+        : { type: 'count', max_runs: d.end_condition.max_runs };
+    }
+  }
+  let messageParts: TaskMessagePart[] | undefined;
+  if (d.message_parts !== undefined && d.message_parts !== null) {
+    const normalised = _normaliseMessageParts(d.message_parts);
+    if (!normalised) return { ok: false, error: 'invalid_message_parts' };
+    messageParts = normalised;
+  }
+  let content = messageParts
+    ? _contentFromMessageParts(messageParts)
+    : (typeof d.content === 'string' ? d.content.trim() : '');
+  if (!content) return { ok: false, error: 'invalid_content' };
+  if (content.length > MAX_CONTENT_LEN) content = content.slice(0, MAX_CONTENT_LEN);
+  let title = typeof d.title === 'string' ? d.title.trim() : '';
+  title = limitNameDisplayText(title);
+  const enabled = d.enabled === false ? false : true;
+  let recipient: TaskRecipient | undefined;
+  if (d.recipient !== undefined) {
+    if (!_isValidRecipient(d.recipient)) return { ok: false, error: 'invalid_recipient' };
+    recipient = d.recipient;
+  }
+  let skill: TaskSkillRef | undefined;
+  if (d.skill !== undefined && d.skill !== null) {
+    if (!_isValidRef(d.skill)) return { ok: false, error: 'invalid_skill' };
+    skill = { id: d.skill.id, name: d.skill.name };
+  }
+  let connector: TaskConnectorRef | undefined;
+  if (d.connector !== undefined && d.connector !== null) {
+    if (!_isValidRef(d.connector)) return { ok: false, error: 'invalid_connector' };
+    connector = { id: d.connector.id, name: d.connector.name };
+  }
+  const projectId = typeof d.project_id === 'string' && d.project_id ? d.project_id : undefined;
+  if (projectId && !safeId(projectId)) return { ok: false, error: 'invalid_project' };
+  const attachments = Array.isArray(d.attachments)
+    ? d.attachments.filter((n) => typeof n === 'string' && n.length > 0)
+    : undefined;
+  return {
+    ok: true,
+    fields: {
+      enabled,
+      content,
+      schedule: d.schedule,
+      ...(endCondition ? { end_condition: endCondition } : {}),
+      ...(messageParts ? { message_parts: messageParts } : {}),
+      ...(title ? { title } : {}),
+      ...(recipient ? { recipient } : {}),
+      ...(skill ? { skill } : {}),
+      ...(connector ? { connector } : {}),
+      ...(projectId ? { project_id: projectId } : {}),
+      ...(attachments && attachments.length ? { attachments } : {}),
+    },
+  };
+}
+
+async function _validateProjectScope(
+  uid: string,
+  fields: NormalisedFields,
+): Promise<'invalid_project' | 'invalid_recipient' | null> {
+  const projectId = fields.project_id;
+  const recipient = fields.recipient;
+  if (!projectId) return null;
+  // A syntactically safe id is not proof that the project exists. In
+  // particular, a model-supplied mutation can name a hallucinated
+  // but path-safe id. Reject it before _writeOne creates a project-shaped
+  // orphan directory that no real Project view can surface.
+  if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
+  if (!recipient || recipient.kind !== 'agent') return null;
+  // Match the project picker and execution scope, including member-private
+  // choices and shared packages that do not live in bindings.json.
+  const projects = await import('./projects');
+  const bindings = await projects.getBindings(uid, projectId);
+  return bindings.agents.includes(recipient.id) ? null : 'invalid_recipient';
+}
+
+export async function listTasks(uid: string, opts?: { projectId?: string | null }): Promise<AutoTask[]> {
+  return _runExclusive(uid, async () => {
+    const all = await _migrateLegacyDeviceBindingsIfOwned(uid, await _readAll(uid));
+    if (!opts) return all;
+    if (opts.projectId === null) return all.filter((t) => !t.project_id);
+    if (typeof opts.projectId === 'string' && opts.projectId) {
+      const pid = opts.projectId;
+      return all.filter((t) => t.project_id === pid);
+    }
+    return all;
+  });
+}
+
+type TaskSearchRow = Pick<AutoTask, 'id' | 'title' | 'content' | 'enabled' | 'project_id'>;
+const _searchSnapshots = new FileSnapshotCache<TaskSearchRow>(
+  row => 256 + 2 * ((row.title?.length || 0) + row.content.length),
+);
+
+/** Read-only search projections do not need scheduler device migration or
+ * run/attachment metadata. Validate sources on every query, with bounded I/O. */
+export async function listTaskSearchRows(uid: string): Promise<TaskSearchRow[]> {
+  return _runExclusive(uid, async () => {
+    const rows = await mapFileSnapshots(listAutoTaskLocations(uid).filter(loc => _isValidTaskId(loc.taskId)), loc => (
+      _searchSnapshots.read(loc.configFile, async () => {
+        const task = await _readOne(uid, loc.taskId, loc);
+        return task ? { id: task.id, title: task.title, content: task.content,
+          enabled: task.enabled, project_id: task.project_id } : null;
+      })
+    ));
+    return rows.filter((row): row is TaskSearchRow => row !== null);
+  });
+}
+
+export async function getTask(uid: string, taskId: string): Promise<AutoTask | null> {
+  if (!_isValidTaskId(taskId)) return null;
+  return _runExclusive(uid, async () => {
+    const task = await _readOne(uid, taskId);
+    return task ? _migrateLegacyDeviceBindingIfOwned(uid, task) : null;
+  });
+}
+
+export async function createTask(
+  uid: string, draft: TaskDraft,
+  /** The conversation where the task was requested becomes its run conversation. */
+  provenance: { conversationId?: string } = {},
+): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
+  const norm = _normaliseDraft(draft);
+  if (!norm.ok) return { ok: false, error: (norm as { error: TaskError }).error };
+  const desiredId = draft.id !== undefined
+    ? (_isValidTaskId(draft.id) ? draft.id : null)
+    : genTaskId();
+  if (desiredId === null) return { ok: false, error: 'invalid_id' };
+  return _runExclusive(uid, async () => {
+    const all = await _readAll(uid);
+    if (all.length >= MAX_TASKS_PER_USER) {
+      log.warn(`task create rejected uid=${maskId(uid)} reason=too_many_tasks count=${all.length} cap=${MAX_TASKS_PER_USER}`);
+      return { ok: false as const, error: 'too_many_tasks' as const };
+    }
+    if (all.some((t) => t.id === desiredId)) {
+      log.warn(`task create id collision uid=${maskId(uid)} id=${desiredId}`);
+      return { ok: false as const, error: 'too_many_tasks' as const };
+    }
+    const scopeError = await _validateProjectScope(uid, norm.fields);
+    if (scopeError) return { ok: false as const, error: scopeError };
+    const now = nowIso();
+    const device = getCurrentDevice();
+    const task: AutoTask = {
+      id: desiredId,
+      ...norm.fields,
+      ...(norm.fields.end_condition?.type === 'count' ? { scheduled_run_count: 0 } : {}),
+      ...(device.id ? { device_id: device.id } : {}),
+      device_name: device.name,
+      created_at: now,
+      updated_at: now,
+      ...(provenance.conversationId && safeId(provenance.conversationId)
+        ? { conversation_id: provenance.conversationId } : {}),
+    };
+    await _writeOne(uid, task);
+    log.info(`task created uid=${maskId(uid)} id=${task.id} type=${task.schedule.type} project=${task.project_id || '-'} attachments=${(task.attachments || []).length}`);
+    _scheduleTask(uid, task);
+    return { ok: true as const, task };
+  });
+}
+
+export async function updateTask(
+  uid: string, taskId: string, patch: TaskUpdatePatch,
+  expectedProjectId?: string | null,
+): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
+  if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  return _runExclusive(uid, async () => {
+    const stored = await _readOne(uid, taskId);
+    if (!stored) return { ok: false as const, error: 'not_found' as const };
+    if (expectedProjectId !== undefined && ((stored.project_id ?? null) !== expectedProjectId || (patch.project_id !== undefined && patch.project_id !== expectedProjectId))) return { ok: false as const, error: 'not_found' as const };
+    const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
+    const priorDueAtMs = _timers.get(taskId)?.dueAtMs;
+    const legacyMessageChanged = patch.content !== undefined
+      || patch.skill !== undefined
+      || patch.connector !== undefined;
+    const messageParts = patch.message_parts === null
+      ? undefined
+      : (patch.message_parts !== undefined
+          ? patch.message_parts
+          : (legacyMessageChanged ? undefined : cur.message_parts));
+    const merged: TaskDraft = {
+      schedule: patch.schedule ? patch.schedule : cur.schedule,
+      end_condition: patch.end_condition === null
+        ? undefined
+        : (patch.end_condition !== undefined ? patch.end_condition : cur.end_condition),
+      content: typeof patch.content === 'string' ? patch.content : cur.content,
+      title: typeof patch.title === 'string' ? patch.title : cur.title,
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
+      recipient: patch.recipient !== undefined ? patch.recipient : cur.recipient,
+      message_parts: messageParts,
+      // Explicit `null` in the patch clears the field; `undefined` keeps
+      // the current value. Mirrors the chip close-button on the renderer.
+      skill: patch.skill === null ? undefined : (patch.skill !== undefined ? patch.skill : cur.skill),
+      connector: patch.connector === null ? undefined : (patch.connector !== undefined ? patch.connector : cur.connector),
+      project_id: patch.project_id === null
+        ? undefined
+        : (typeof patch.project_id === 'string' ? patch.project_id : cur.project_id),
+      attachments: patch.attachments !== undefined ? patch.attachments : cur.attachments,
+    };
+    const norm = _normaliseDraft(merged);
+    if (!norm.ok) return { ok: false as const, error: (norm as { error: TaskError }).error };
+    const scopeError = await _validateProjectScope(uid, norm.fields);
+    if (scopeError) return { ok: false as const, error: scopeError };
+    const updatedAt = nowIso();
+    const updatedAtDate = new Date(updatedAt);
+    const scheduleChanged = patch.schedule !== undefined
+      && !_schedulesEqual(cur.schedule, norm.fields.schedule);
+    const endConditionChanged = !_endConditionsEqual(cur.end_condition, norm.fields.end_condition);
+    const next: AutoTask = {
+      ...cur,
+      ...norm.fields,
+      updated_at: updatedAt,
+    };
+    if (next.schedule.type === 'hourly') {
+      if (scheduleChanged) next.schedule_anchor_at = updatedAtDate.toISOString();
+    } else {
+      delete next.schedule_anchor_at;
+    }
+    if (norm.fields.end_condition?.type === 'count') {
+      next.scheduled_run_count = cur.end_condition?.type === 'count'
+        ? (Number.isSafeInteger(cur.scheduled_run_count) ? cur.scheduled_run_count as number : 0)
+        : 0;
+    } else {
+      delete next.scheduled_run_count;
+    }
+    if (patch.run_on_current_device === true) {
+      const device = getCurrentDevice();
+      if (device.id) {
+        next.device_id = device.id;
+        next.device_name = device.name;
+      } else {
+        log.warn(`task device rebind skipped uid=${maskId(uid)} id=${taskId} reason=missing_device_id`);
+      }
+    }
+    // Strip optional fields when they normalised away.
+    if (!norm.fields.title) delete next.title;
+    if (!norm.fields.recipient) delete next.recipient;
+    if (!norm.fields.message_parts) delete next.message_parts;
+    if (!norm.fields.skill) delete next.skill;
+    if (!norm.fields.connector) delete next.connector;
+    if (!norm.fields.project_id) delete next.project_id;
+    if (!norm.fields.attachments) delete next.attachments;
+    if (!norm.fields.end_condition) delete next.end_condition;
+    await _writeOne(uid, next);
+    log.info(`task updated uid=${maskId(uid)} id=${taskId}`);
+    // A changed schedule starts at its next valid boundary. Preserve an
+    // immediate occurrence only when the unchanged schedule already had that
+    // boundary armed; all other edits reuse the restore/sync no-backfill rule.
+    const preserveArmedDueBoundary = !scheduleChanged
+      && !endConditionChanged
+      && priorDueAtMs !== undefined
+      && priorDueAtMs <= updatedAtDate.getTime();
+    const scheduleBaseline = preserveArmedDueBoundary
+      ? undefined
+      : (scheduleChanged && next.schedule.type === 'hourly'
+          ? updatedAtDate
+          : _baselineWithoutBackfill(next, updatedAtDate));
+    _scheduleTask(uid, next, scheduleBaseline);
+    return { ok: true as const, task: next };
+  });
+}
+
+export async function deleteTask(uid: string, taskId: string, expectedProjectId?: string | null): Promise<{ ok: boolean }> {
+  if (!_isValidTaskId(taskId)) return { ok: false };
+  return _runExclusive(uid, async () => {
+    if (expectedProjectId !== undefined && ((await _readOne(uid, taskId))?.project_id ?? null) !== expectedProjectId) return { ok: false };
+    const loc = findAutoTaskLocation(uid, taskId);
+    if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
+    try {
+      fs.rmSync(loc.dir, { recursive: true, force: true });
+      _removeFireBoundaryClaimDir(uid, taskId);
+      log.info(`task deleted uid=${maskId(uid)} id=${taskId}`);
+      _onTaskMutated(uid, null, taskId);
+      return { ok: true };
+    } catch (err) {
+      log.warn(`task delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
+      return { ok: false };
+    }
+  });
+}
+
+export async function setTaskEnabled(
+  uid: string, taskId: string, enabled: boolean,
+  expectedProjectId?: string | null,
+): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
+  if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  return _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (expectedProjectId !== undefined && (cur?.project_id ?? null) !== expectedProjectId) return { ok: false as const, error: 'not_found' as const };
+    if (!cur) return { ok: false as const, error: 'not_found' as const };
+    const next: AutoTask = { ...cur, enabled: !!enabled, updated_at: nowIso() };
+    await _writeOne(uid, next);
+    _scheduleTask(uid, next);
+    return { ok: true as const, task: next };
+  });
+}
+
+// ── Automation mutations ─────────────────────────────────────────────────
+//
+// One applier for every writer: the `auto_tasks` tool and the renderer share
+// these CRUD functions, so validation, project scoping and attachment staging
+// cannot drift between them. The model never writes `config.json`.
+//
+// Retired 2026-09-13 (review P3-2): the commander used to emit an
+// `<auto-task>` structural block that the bus parsed out of its final reply.
+// The tool owns automations now — `chat_commander.md` may not even mention the
+// old protocol and the automation benchmark scores an emitted container as a
+// wrong answer — so the parser is gone rather than left as a write path that
+// fires on markup the model could quote from an untrusted page.
+
+export type AutoTaskMutationAction = 'create' | 'update' | 'delete' | 'enable' | 'disable';
+
+export interface AutoTaskMutation {
+  action?: AutoTaskMutationAction;
+  taskId?: string;
+  updates: Partial<TaskDraft>;
+}
+
+export interface AutoTaskMutationResult {
+  ok: boolean;
+  kind?: 'created' | 'updated' | 'deleted' | 'enabled' | 'disabled';
+  task?: AutoTask;
+  taskId?: string;
+  title?: string;
+  error?: string;
+}
+
+export interface AutoTaskMutationOptions {
+  /** Conversation whose current message attachments should be copied into the
+   *  task's attachment directory when the mutation names attachments. */
+  sourceAttachmentCid?: string;
+  /** Host-bound scope: null is global, undefined preserves Commander selection. */
+  projectId?: string | null;
+  /** Conversation the mutation was made in. A created task runs there;
+   *  an update leaves the run conversation unchanged. */
+  conversationId?: string;
+}
+
+function _autoTaskResultTitle(task: AutoTask | null | undefined, fallbackId: string): string {
+  const title = String(task?.title || '').trim();
+  if (title) return title;
+  const content = String(task?.content || '').trim();
+  if (content) return content.slice(0, 40);
+  return fallbackId;
+}
+
+export async function applyAutoTaskMutation(
+  uid: string,
+  mutation: AutoTaskMutation,
+  opts: AutoTaskMutationOptions = {},
+): Promise<AutoTaskMutationResult> {
+  const action = mutation.action || (mutation.taskId ? 'update' : 'create');
+  const taskId = mutation.taskId || '';
+  try {
+    if (opts.projectId !== undefined) {
+      if (mutation.updates.project_id !== undefined && mutation.updates.project_id !== opts.projectId) return { ok: false, error: 'project_scope_mismatch' };
+      if (taskId && ((await getTask(uid, taskId))?.project_id ?? null) !== opts.projectId) return { ok: false, error: 'not_found' };
+    }
+    if (action === 'create') {
+      const result = await createTask(
+        uid,
+        { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft,
+        {
+          ...(opts.conversationId ? { conversationId: opts.conversationId } : {}),
+        },
+      );
+      if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+      await _stageMutationAttachments(uid, result.task.id, mutation, opts);
+      return {
+        ok: true,
+        kind: 'created',
+        task: result.task,
+        taskId: result.task.id,
+        title: _autoTaskResultTitle(result.task, result.task.id),
+      };
+    }
+    if (!taskId) return { ok: false, error: 'task_id_required' };
+    if (action === 'delete') {
+      const before = await getTask(uid, taskId);
+      const result = await deleteTask(uid, taskId, opts.projectId);
+      if (!result.ok) return { ok: false, error: 'not_found' };
+      return {
+        ok: true,
+        kind: 'deleted',
+        taskId,
+        title: _autoTaskResultTitle(before, taskId),
+      };
+    }
+    if (action === 'enable' || action === 'disable') {
+      const result = await setTaskEnabled(uid, taskId, action === 'enable', opts.projectId);
+      if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+      return {
+        ok: true,
+        kind: action === 'enable' ? 'enabled' : 'disabled',
+        task: result.task,
+        taskId,
+        title: _autoTaskResultTitle(result.task, taskId),
+      };
+    }
+    if (!Object.keys(mutation.updates).length) return { ok: false, error: 'empty_update' };
+    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId);
+    if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+    await _stageMutationAttachments(uid, taskId, mutation, opts);
+    return {
+      ok: true,
+      kind: 'updated',
+      task: result.task,
+      taskId,
+      title: _autoTaskResultTitle(result.task, taskId),
+    };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || String(err) };
+  }
+}
+
+async function _stageMutationAttachments(
+  uid: string,
+  taskId: string,
+  mutation: AutoTaskMutation,
+  opts: AutoTaskMutationOptions,
+): Promise<void> {
+  if (!_isValidTaskId(taskId)) return;
+  const names = Array.isArray(mutation.updates.attachments)
+    ? mutation.updates.attachments.map((name) => _sanitiseFilename(name)).filter((name) => !!name)
+    : [];
+  if (!names.length || !opts.sourceAttachmentCid) return;
+  const srcDir = chatAttachmentDirForConversation(uid, opts.sourceAttachmentCid);
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const destDir = loc.attachmentsDir;
+  if (!fs.existsSync(srcDir)) return;
+  try { fs.mkdirSync(destDir, { recursive: true }); } catch { return; }
+  for (const name of names) {
+    const src = path.join(srcDir, name);
+    if (!fs.existsSync(src)) continue;
+    try {
+      fs.copyFileSync(src, path.join(destDir, name));
+    } catch (err) {
+      log.warn(`attachment stage failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
+    }
+  }
+}
+
+async function _markRan(
+  uid: string, taskId: string, at: Date, expectedBoundary: Date,
+  catchUp: boolean, schedulerEpoch?: number,
+): Promise<AutoTask | null> {
+  if (!_isValidTaskId(taskId)) return null;
+  if (_markRanFailureForTest) throw _markRanFailureForTest;
+  return _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    // CRUD can commit while the timer's initial read is in flight. Admission
+    // and its persisted stamp share the mutation lock, so a stale snapshot
+    // cannot run a deleted/disabled/rescheduled task or use superseded content.
+    if (!cur || !cur.enabled || _schedulerSuspended
+        || !schedulerEpochIsCurrent(schedulerEpoch)
+        || (cur.device_id && cur.device_id !== getCurrentDevice().id)) return null;
+    const boundary = catchUp
+      ? _catchUpBoundary(cur, at)
+      : _dueBoundary(cur, at, _scheduleBaseline(cur));
+    if (!boundary || boundary.getTime() !== expectedBoundary.getTime()) return null;
+    const next: AutoTask = {
+      ...cur,
+      last_run_at: at.toISOString(),
+      ...(cur.end_condition?.type === 'count'
+        ? { scheduled_run_count: _scheduledRunCount(cur) + 1 }
+        : {}),
+      ...(cur.schedule.type === 'one_time' ? { enabled: false } : {}),
+    };
+    await _writeOne(uid, next);
+    return cur;
+  });
+}
+
+// ── Run facts and handoff ────────────────────────────────────────────────
+//
+// Runs continue in one conversation, but its history can be compacted or the
+// conversation replaced, so a run is also told about the runs before it. The
+// task record keeps a run count and the last two runs, and each task owns one
+// `handoff/` directory a run may read and write for the next one. The turn
+// guidance reads both; nothing else in the task directory is writable from a
+// run.
+
+export const AUTO_TASK_HANDOFF_NOTE = 'note.md';
+const RUN_STATUSES: ReadonlySet<string> = new Set<AutoRunStatus>([
+  'running', 'completed', 'failed', 'cancelled', 'stopped', 'waiting_input', 'unknown',
+]);
+
+function _isValidRun(run: unknown): run is AutoTaskRun {
+  if (!run || typeof run !== 'object') return false;
+  const r = run as Record<string, unknown>;
+  const isDate = (value: unknown) => typeof value === 'string' && !Number.isNaN(new Date(value).getTime());
+  return typeof r.cid === 'string' && safeId(r.cid)
+    && isDate(r.started_at)
+    && typeof r.status === 'string' && RUN_STATUSES.has(r.status)
+    && (r.ended_at === undefined || isDate(r.ended_at));
+}
+
+/** Run facts are additive: a malformed value is dropped instead of making
+ *  the task unreadable. */
+function _dropMalformedRunFacts(raw: Record<string, unknown>): void {
+  if (raw.run_count !== undefined
+      && !(Number.isSafeInteger(raw.run_count) && (raw.run_count as number) >= 0)) delete raw.run_count;
+  for (const key of ['last_run', 'previous_run'] as const) {
+    if (raw[key] !== undefined && !_isValidRun(raw[key])) delete raw[key];
+  }
+  if (raw.conversation_id !== undefined
+      && !(typeof raw.conversation_id === 'string' && safeId(raw.conversation_id))) delete raw.conversation_id;
+}
+
+// Runs in progress, by account and conversation. A conversation the run did
+// not create is an automation run only while this lasts; after a restart the
+// run is gone and the conversation is ordinary chat again. Pinned on
+// globalThis like the bus registries, so every loaded copy of this module
+// sees the same runs.
+const _ACTIVE_RUNS_KEY = Symbol.for('orkas.auto_tasks.active_runs');
+type ActiveRun = { taskId: string; startedAt: string };
+const _activeRuns: Map<string, ActiveRun> = ((globalThis as Record<symbol, unknown>)[_ACTIVE_RUNS_KEY] as Map<string, ActiveRun>)
+  || ((globalThis as Record<symbol, unknown>)[_ACTIVE_RUNS_KEY] = new Map<string, ActiveRun>());
+
+function _activeRunKey(uid: string, cid: string): string { return `${uid}\u0000${cid}`; }
+
+function _endActiveRun(uid: string, cid: string, taskId: string, startedAt: string): void {
+  const key = _activeRunKey(uid, cid);
+  const active = _activeRuns.get(key);
+  if (active?.taskId === taskId && active.startedAt === startedAt) _activeRuns.delete(key);
+}
+
+/** The task whose run is in progress in this conversation, or ''. */
+export function activeRunTaskId(uid: string, cid: string): string {
+  return _activeRuns.get(_activeRunKey(uid, cid))?.taskId || '';
+}
+
+/** The handoff note a run reads first and rewrites before it ends. */
+export function handoffNotePath(uid: string, task: Pick<AutoTask, 'id' | 'project_id'>): string {
+  return path.join(autoTaskLocationForTask(uid, task.id, task.project_id).handoffDir, AUTO_TASK_HANDOFF_NOTE);
+}
+
+/** Count the run and remember its conversation, which later runs continue
+ *  in. The run before it moves to `previous_run` so the new run can be told
+ *  how that one ended. */
+export async function recordRunStart(uid: string, taskId: string, cid: string, startedAt: string): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur) return;
+    const next: AutoTask = {
+      ...cur,
+      conversation_id: cid,
+      run_count: (cur.run_count || 0) + 1,
+      ...(cur.last_run ? { previous_run: cur.last_run } : {}),
+      last_run: { cid, started_at: startedAt, status: 'running' },
+    };
+    await _writeOne(uid, next);
+    _activeRuns.set(_activeRunKey(uid, cid), { taskId, startedAt });
+  });
+}
+
+/** Close the run on record with the terminal of its own run. A terminal for
+ *  another conversation, or for a run no longer on record (`startedAt`
+ *  names which run ended; runs share a conversation), is ignored. Canonical handoff files stay under their task owner. */
+export async function recordRunTerminal(
+  uid: string, taskId: string, cid: string, status: AutoRunStatus, endedAt: string, startedAt?: string,
+): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur?.last_run || cur.last_run.cid !== cid) return;
+    if (startedAt !== undefined && cur.last_run.started_at !== startedAt) return;
+    await _writeOne(uid, { ...cur, last_run: { ...cur.last_run, status, ended_at: endedAt } });
+    _endActiveRun(uid, cid, taskId, cur.last_run.started_at);
+  });
+}
+
+/** Let the run's conversation write the task's handoff directory, besides
+ *  whatever it could already write. The rest of the task directory stays
+ *  behind the automation tool. */
+async function _grantHandoffRoot(uid: string, task: AutoTask, cid: string): Promise<void> {
+  const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
+  try {
+    fs.mkdirSync(loc.handoffDir, { recursive: true });
+    const state = await import('./group_chat/state');
+    await state.addToolExtraRoots(uid, cid, [loc.handoffDir]);
+  } catch (err) {
+    log.warn(`handoff root grant failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
+  }
+}
+
+/** Observe from before dispatch and close the run with the terminal of the
+ *  bus run its message belongs to — named at admission, since the message
+ *  may join a run already in progress there. The terminal is persisted only
+ *  after the run's start is durable: a fast run can finish before send
+ *  returns. */
+function _watchRunTerminal(uid: string, taskId: string, cid: string): {
+  join(runId: string): void; joined(): boolean; admit(startedAt: string): void; cancel(): void;
+} {
+  const subscribe = (groupChat as { subscribeTaskTerminals?: typeof import('./group_chat/bus').subscribeTaskTerminals })
+    .subscribeTaskTerminals;
+  if (typeof subscribe !== 'function') return { join() {}, joined: () => true, admit() {}, cancel() {} };
+  let runId = '';
+  let startedAt = '';
+  let pending: (() => void) | undefined;
+  const unsubscribe = subscribe((event) => {
+    if (!runId || event.run_id !== runId || event.user_id !== uid || event.conversation_id !== cid) return;
+    unsubscribe();
+    const status = RUN_STATUSES.has(event.status) ? event.status as AutoRunStatus : 'unknown';
+    const finish = () => {
+      // Actual run ownership ends even if its task was deleted or terminal
+      // persistence fails. A late terminal must not clear a newer run.
+      _endActiveRun(uid, cid, taskId, startedAt);
+      recordRunTerminal(uid, taskId, cid, status, new Date(event.finished_at_ms).toISOString(), startedAt)
+        .catch((err) => log.warn(`run terminal record failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)));
+    };
+    if (startedAt) finish();
+    else pending = finish;
+  });
+  return {
+    join(id) { runId = id; },
+    joined: () => !!runId,
+    admit(at) {
+      startedAt = at;
+      const finish = pending;
+      pending = undefined;
+      finish?.();
+    },
+    cancel() {
+      unsubscribe();
+      pending = undefined;
+      _endActiveRun(uid, cid, taskId, startedAt);
+    },
+  };
+}
+
+// ── Attachment management ────────────────────────────────────────────────
+
+export async function listAttachments(uid: string, taskId: string): Promise<string[]> {
+  if (!_isValidTaskId(taskId)) return [];
+  const dir = (findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId)).attachmentsDir;
+  if (!fs.existsSync(dir)) return [];
+  try {
+    return fs.readdirSync(dir).filter((n) => {
+      if (n.startsWith('.')) return false;
+      try { return fs.statSync(path.join(dir, n)).isFile(); }
+      catch { return false; }
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function uploadAttachment(
+  uid: string, taskId: string, name: string, buf: Buffer,
+): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+  if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_task_id' };
+  const safe = _sanitiseFilename(name);
+  if (!safe) return { ok: false, error: 'invalid_name' };
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const dir = loc.attachmentsDir;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, safe), buf);
+    log.info(`attachment uploaded uid=${maskId(uid)} id=${taskId} bytes=${buf.length}`);
+    return { ok: true, name: safe };
+  } catch (err) {
+    log.warn(`attachment upload failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+export async function deleteAttachment(uid: string, taskId: string, name: string): Promise<{ ok: boolean }> {
+  if (!_isValidTaskId(taskId)) return { ok: false };
+  const safe = _sanitiseFilename(name);
+  if (!safe) return { ok: false };
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const target = path.join(loc.attachmentsDir, safe);
+  try {
+    if (fs.existsSync(target)) fs.unlinkSync(target);
+    return { ok: true };
+  } catch (err) {
+    log.warn(`attachment delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
+    return { ok: false };
+  }
+}
+
+function _sanitiseFilename(name: string): string {
+  if (typeof name !== 'string') return '';
+  // Attachment names can cross OS boundaries through IPC and cloud-synced
+  // task configs. Treat both separator styles as directory boundaries before
+  // taking the basename so the persisted name is host-independent.
+  const normalized = name.replace(/\\/g, '/');
+  const base = path.posix.basename(normalized).trim();
+  if (!base || base === '.' || base === '..') return '';
+  if (base.startsWith('.')) return '';
+  return base.length > 200 ? base.slice(0, 200) : base;
+}
+
+// ── Due-time computation ────────────────────────────────────────────────
+
+function _scheduledRunCount(task: AutoTask): number {
+  return Number.isSafeInteger(task.scheduled_run_count) && (task.scheduled_run_count as number) >= 0
+    ? task.scheduled_run_count as number
+    : 0;
+}
+
+function _localDateKey(value: Date): string {
+  const year = String(value.getFullYear()).padStart(4, '0');
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function _endAllowsAt(task: AutoTask, at: Date): boolean {
+  if (task.schedule.type === 'one_time') return true;
+  const condition = task.end_condition;
+  if (!condition) return true;
+  if (condition.type === 'date') return _localDateKey(at) <= condition.date;
+  return _scheduledRunCount(task) < condition.max_runs;
+}
+
+function _validTaskCreatedAt(task: AutoTask): Date | null {
+  const created = new Date(task.created_at);
+  return Number.isNaN(created.getTime()) ? null : created;
+}
+
+function _hourlyBaseline(task: AutoTask, supplied: Date | null): Date | null {
+  if (supplied) return supplied;
+  if (task.schedule_anchor_at) {
+    const anchor = new Date(task.schedule_anchor_at);
+    if (!Number.isNaN(anchor.getTime())) return anchor;
+  }
+  return _validTaskCreatedAt(task);
+}
+
+/** True iff the task should fire at `now` given its last run. */
+export function isDue(task: AutoTask, now: Date, lastRun: Date | null): boolean {
+  return _dueBoundary(task, now, lastRun) !== null;
+}
+
+function _dueBoundary(task: AutoTask, now: Date, lastRun: Date | null): Date | null {
+  if (!task.enabled || !_endAllowsAt(task, now)) return null;
+  const sched = task.schedule;
+  if (sched.type === 'one_time') {
+    if (lastRun) return null; // one_time fires at most once
+    const at = new Date(sched.at);
+    if (Number.isNaN(at.getTime())) return null;
+    return now.getTime() >= at.getTime() ? at : null;
+  }
+  if (sched.type === 'hourly') {
+    const baseline = _hourlyBaseline(task, lastRun);
+    if (!baseline) return null;
+    const boundary = new Date(baseline.getTime() + sched.interval_hours * HOUR_MS);
+    if (Number.isNaN(boundary.getTime())) return null;
+    return now.getTime() >= boundary.getTime() ? boundary : null;
+  }
+  if (sched.type === 'daily') {
+    return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
+  }
+  if (sched.type === 'weekly') {
+    if (!_calendarSelection(sched).includes(now.getDay())) return null;
+    return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
+  }
+  if (sched.type === 'monthly') {
+    const todayDom = now.getDate();
+    const lastDom = _lastDayOfMonth(now);
+    if (!_calendarSelection(sched).some(day => Math.min(day, lastDom) === todayDom)) return null;
+    return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
+  }
+  return null;
+}
+
+function _crossedTodayBoundary(now: Date, lastRun: Date | null, hour: number, minute: number): Date | null {
+  const boundary = new Date(now);
+  boundary.setHours(hour, minute, 0, 0);
+  if (now.getTime() < boundary.getTime()) return null;
+  if (!lastRun) return boundary;
+  return lastRun.getTime() < boundary.getTime() ? boundary : null;
+}
+
+function _lastDayOfMonth(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+
+/** Most recent scheduled occurrence at or before `now`, ignoring runs. Unlike
+ *  `_dueBoundary`, calendar schedules look back across midnight and month
+ *  ends, so a 23:00 occurrence missed overnight is still found in the morning. */
+function _latestOccurrenceAtOrBefore(task: AutoTask, now: Date): Date | null {
+  const sched = task.schedule;
+  if (sched.type === 'one_time') {
+    const at = new Date(sched.at);
+    if (Number.isNaN(at.getTime())) return null;
+    return at.getTime() <= now.getTime() ? at : null;
+  }
+  if (sched.type === 'hourly') {
+    const baseline = _hourlyBaseline(task, _scheduleBaseline(task));
+    if (!baseline) return null;
+    const intervalMs = sched.interval_hours * HOUR_MS;
+    const elapsed = now.getTime() - baseline.getTime();
+    if (!(intervalMs > 0) || elapsed < intervalMs) return null;
+    const boundary = new Date(baseline.getTime() + Math.floor(elapsed / intervalMs) * intervalMs);
+    return Number.isNaN(boundary.getTime()) ? null : boundary;
+  }
+  if (sched.type === 'daily') {
+    const boundary = new Date(now);
+    boundary.setHours(sched.hour, sched.minute, 0, 0);
+    if (boundary.getTime() > now.getTime()) {
+      boundary.setDate(boundary.getDate() - 1);
+      boundary.setHours(sched.hour, sched.minute, 0, 0);
+    }
+    return boundary;
+  }
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => {
+      if (sched.type === 'weekly') {
+        const boundary = new Date(now);
+        boundary.setDate(boundary.getDate() - ((now.getDay() - day + 7) % 7));
+        boundary.setHours(sched.hour, sched.minute, 0, 0);
+        if (boundary.getTime() > now.getTime()) {
+          boundary.setDate(boundary.getDate() - 7);
+          boundary.setHours(sched.hour, sched.minute, 0, 0);
+        }
+        return boundary;
+      }
+      const inMonth = (month: number): Date => {
+        const first = new Date(now.getFullYear(), month, 1);
+        return new Date(first.getFullYear(), first.getMonth(), Math.min(day, _lastDayOfMonth(first)), sched.hour, sched.minute, 0, 0);
+      };
+      const boundary = inMonth(now.getMonth());
+      return boundary.getTime() <= now.getTime() ? boundary : inMonth(now.getMonth() - 1);
+    });
+    return new Date(Math.max(...candidates.map(date => date.getTime())));
+  }
+  return null;
+}
+
+/** The occurrence a wake or startup should run late, if any: the most recent
+ *  boundary at most `CATCH_UP_WINDOW_MS` old that falls after the last run,
+ *  creation, and latest edit, is still allowed by the end condition, and
+ *  belongs to this device. An edit or re-enable never scheduled the earlier
+ *  boundary, so a restart must not resurrect it. */
+function _catchUpBoundary(task: AutoTask, now: Date): Date | null {
+  if (!task.enabled) return null;
+  if (task.device_id && task.device_id !== getCurrentDevice().id) return null;
+  if (task.schedule.type === 'one_time' && task.last_run_at) return null;
+  const boundary = _latestOccurrenceAtOrBefore(task, now);
+  if (!boundary) return null;
+  if (now.getTime() - boundary.getTime() > CATCH_UP_WINDOW_MS) return null;
+  for (const covered of [task.last_run_at, task.schedule_anchor_at, task.created_at, task.updated_at]) {
+    const coveredMs = covered ? new Date(covered).getTime() : NaN;
+    if (!Number.isNaN(coveredMs) && coveredMs >= boundary.getTime()) return null;
+  }
+  return _endAllowsAt(task, boundary) ? boundary : null;
+}
+
+export function catchUpBoundaryForTest(task: AutoTask, now: Date): Date | null {
+  return _catchUpBoundary(task, now);
+}
+
+function _claimFile(uid: string, taskId: string, boundary: Date): string {
+  return path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, taskId, `${boundary.getTime()}.json`);
+}
+
+function _tryClaimFireBoundary(uid: string, task: AutoTask, boundary: Date, now: Date): boolean {
+  const file = _claimFile(uid, task.id, boundary);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      task_id: task.id,
+      boundary_at: boundary.toISOString(),
+      claimed_at: now.toISOString(),
+      pid: process.pid,
+      device_id: getCurrentDevice().id || '',
+      device_name: getCurrentDevice().name || '',
+    }, null, 2), { encoding: 'utf8', flag: 'wx' });
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return false;
+    // If the local claim directory is temporarily unavailable, keep the task
+    // available rather than silently dropping the scheduled run. Normal data
+    // roots are writable; this branch is defensive for odd filesystem states.
+    log.warn(`fire claim unavailable uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+    return true;
+  }
+}
+
+function _releaseFireBoundaryClaim(uid: string, task: AutoTask, boundary: Date): void {
+  const file = _claimFile(uid, task.id, boundary);
+  try {
+    fs.unlinkSync(file);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    log.warn(`fire claim release failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+  }
+}
+
+// Claims older than this can never be contended again: the filename IS the
+// fire-boundary timestamp, `_dueBoundary` only ever proposes one schedule
+// boundary (or a one_time's fixed instant already durably covered by lastRun once
+// `_markRan` commits), and the claim's only job is same-device double-fire
+// protection across the minutes around a fire. Success paths deliberately keep
+// the file (release would reopen the window), so without pruning a daily task
+// left one small JSON per day forever — and `deleteTask` never touched the dir.
+const CLAIM_PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function _pruneFireBoundaryClaims(uid: string): void {
+  const root = path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR);
+  let taskDirs: fs.Dirent[];
+  try { taskDirs = fs.readdirSync(root, { withFileTypes: true }); }
+  catch { return; }
+  const cutoff = Date.now() - CLAIM_PRUNE_AGE_MS;
+  for (const d of taskDirs) {
+    if (!d.isDirectory()) continue;
+    const dir = path.join(root, d.name);
+    let files: string[];
+    try { files = fs.readdirSync(dir); } catch { continue; }
+    let kept = 0;
+    for (const f of files) {
+      const boundaryMs = Number(f.endsWith('.json') ? f.slice(0, -'.json'.length) : NaN);
+      if (Number.isFinite(boundaryMs) && boundaryMs < cutoff) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch { kept += 1; }
+      } else {
+        kept += 1;
+      }
+    }
+    if (kept === 0) {
+      try { fs.rmdirSync(dir); } catch { /* non-empty or gone — fine */ }
+    }
+  }
+}
+
+function _removeFireBoundaryClaimDir(uid: string, taskId: string): void {
+  try { fs.rmSync(path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, taskId), { recursive: true, force: true }); }
+  catch (err) { log.warn(`claim dir cleanup failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)); }
+}
+
+/** Test seam (same convention as armedDueAtForTest). */
+export function pruneFireBoundaryClaimsForTest(uid: string): void {
+  _pruneFireBoundaryClaims(uid);
+}
+
+// ── Dispatch ────────────────────────────────────────────────────────────
+
+function _formatSeedPrefix(
+  key: string,
+  vars: Record<string, string>,
+  fallback: string,
+): string {
+  const translated = translate(key, vars);
+  return translated === key ? fallback : translated;
+}
+
+function _messagePartsSeedText(parts: TaskMessagePart[]): string {
+  return parts.map((part) => {
+    if (part.type === 'text') return part.text;
+    if (part.kind === 'connector') {
+      return _formatSeedPrefix(
+        'connectors.inline_text',
+        { connector: part.name },
+        `${part.name} connector`,
+      );
+    }
+    return _formatSeedPrefix(
+      'skills.inline_text',
+      { skill: part.name },
+      `${part.name} skill`,
+    );
+  }).join('').trim();
+}
+
+/** Compose the seed message dispatched on fire. Mirrors the commander
+ *  composer's chip → text chain (transformWithChatUse + applyRecipientPrefix). */
+function _buildSeedText(task: AutoTask): string {
+  const messageParts = task.message_parts
+    ? _normaliseMessageParts(task.message_parts)
+    : null;
+  let text = messageParts
+    ? _messagePartsSeedText(messageParts)
+    : (task.content || '').trim();
+  if (!messageParts) {
+    if (task.skill && task.skill.name) {
+      const name = task.skill.name;
+      text = _formatSeedPrefix(
+        'skills.use_prefix',
+        { skill: name, content: text },
+        `Use ${name} skill: ${text}`,
+      );
+    }
+    if (task.connector && task.connector.name) {
+      const name = task.connector.name;
+      text = _formatSeedPrefix(
+        'connectors.use_prefix',
+        { connector: name, content: text },
+        `Use ${name} connector: ${text}`,
+      );
+    }
+  }
+  if (task.recipient && task.recipient.kind === 'agent' && task.recipient.name) {
+    text = `@${task.recipient.name} ${text}`;
+  }
+  return text;
+}
+
+export function _buildSeedTextForTest(task: AutoTask): string {
+  return _buildSeedText(task);
+}
+
+/** Hand the fired conversation a window so its task browser has an owner.
+ *
+ *  Imported lazily for the same reason the browser tool does it: `web_assist`
+ *  pulls in window machinery that a headless automation run should not load
+ *  until something actually needs it. A failure here is not fatal — the fire
+ *  still runs, it just cannot drive a page. */
+async function _bindTaskBrowserWindow(uid: string, cid: string, taskId: string): Promise<void> {
+  try {
+    const webAssist = await import('./web_assist');
+    if (!webAssist.bindHostStartedWebAssistConversation(uid, cid)) {
+      log.info(`fire browser unbound (no window) uid=${maskId(uid)} id=${taskId} cid=${maskId(cid)}`);
+    }
+  } catch (e) {
+    log.warn(`fire browser bind failed uid=${maskId(uid)} id=${taskId} cid=${maskId(cid)}`, logErrorSummary(e));
+  }
+}
+
+/** Seed text plus the actor the run is for: the task's Agent while it
+ *  exists and is enabled, otherwise Commander, as an unresolved `@name`
+ *  falls back to Commander in routing. */
+async function _buildFireSeed(uid: string, task: AutoTask): Promise<{ text: string; recipientId: string }> {
+  const { COMMANDER_ID } = await import('./group_chat/state');
+  const recipient = task.recipient;
+  if (!recipient || recipient.kind !== 'agent') return { text: _buildSeedText(task), recipientId: COMMANDER_ID };
+  try {
+    const current = await agents.getAgent(recipient.id);
+    const recipientId = current && isAgentEnabled(uid, current.agent_id) ? current.agent_id : COMMANDER_ID;
+    const currentName = current?.name?.trim();
+    if (currentName && currentName !== recipient.name) {
+      return {
+        text: _buildSeedText({ ...task, recipient: { ...recipient, name: currentName } }),
+        recipientId,
+      };
+    }
+    return { text: _buildSeedText(task), recipientId };
+  } catch (err) {
+    log.warn(`fire recipient lookup failed id=${task.id} agent=${recipient.id}`, logErrorSummary(err));
+  }
+  return { text: _buildSeedText(task), recipientId: COMMANDER_ID };
+}
+
+/** The conversation this run continues in: the task's run conversation, or
+ *  for a task saved before that existed, its latest run's. It must still
+ *  exist and share the task's scope; otherwise the run opens a new one. */
+async function _runConversation(uid: string, task: AutoTask): Promise<string> {
+  const cid = task.conversation_id || task.last_run?.cid || '';
+  if (!cid) return '';
+  try {
+    const conv = await chats.getConversationMetadata(uid, cid);
+    if (conv && (conv.project_id || '') === (task.project_id || '')) return cid;
+  } catch (err) {
+    log.warn(`fire conversation lookup failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+  }
+  return '';
+}
+
+function _buildFireTitle(task: AutoTask, catchUp = false): string {
+  // No glyph prefix — the renderer reads `conv.origin_auto_task_id` and
+  // renders the clock UI icon next to the title (same icon as the sidebar
+  // "Automation" tab).
+  const firstLine = task.content.split(/\r?\n/)[0] || '';
+  const title = task.title && task.title.trim()
+    ? task.title.trim()
+    : (firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine);
+  // A late run is labeled so it is not mistaken for an on-time occurrence.
+  return catchUp
+    ? _formatSeedPrefix('auto_tasks.catch_up_title', { title }, `${title} (catch-up)`)
+    : title;
+}
+
+type FireTaskResult =
+  | { ok: true; cid: string }
+  | { ok: false; error: 'conv_create_failed' | 'send_not_ok' | 'send_threw' };
+
+export type AutoFireSource = 'scheduled' | 'manual';
+export type AutoFireErrorCode =
+  | 'conv_create_failed'
+  | 'send_not_ok'
+  | 'send_threw'
+  | 'invalid_id'
+  | 'not_found'
+  | 'mark_ran_failed';
+
+async function _fireTask(
+  uid: string,
+  task: AutoTask,
+  source: AutoFireSource,
+  catchUp = false,
+): Promise<FireTaskResult> {
+  const startedAt = Date.now();
+  const title = _buildFireTitle(task, catchUp);
+  const catchUpMark = catchUp ? { catch_up: true as const } : {};
+  let cid = '';
+  const emitFailure = (errorCode: AutoFireErrorCode): void => {
+    _emitFire({
+      type: 'fire_failed',
+      source,
+      ...catchUpMark,
+      user_id: uid,
+      task_id: task.id,
+      ...(cid ? { cid } : {}),
+      error_code: errorCode,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
+  };
+  cid = await _runConversation(uid, task);
+  const reused = !!cid;
+  if (!reused) {
+    try {
+      const conv = await chats.createConversation(uid, {
+        kind: 'normal',
+        title,
+        ...(task.project_id ? { projectId: task.project_id } : {}),
+        originAutoTaskId: task.id,
+      });
+      cid = conv.conversation_id;
+    } catch (err) {
+      log.error(`fire conv-create failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+      emitFailure('conv_create_failed');
+      return { ok: false, error: 'conv_create_failed' };
+    }
+  }
+  // The run may keep files for the next run in the task's handoff directory;
+  // grant it before the first turn so the turn's tools can already write there.
+  await _grantHandoffRoot(uid, task, cid);
+  // Copy attachments into the conversation's chat_attachments dir BEFORE
+  // dispatch. The originals stay under the task's attachments/ so recurring
+  // schedules re-use them next fire.
+  const attachmentNames = await _copyAttachmentsForFire(uid, task, cid);
+  const seed = await _buildFireSeed(uid, task);
+  // Only a conversation opened for this run is removed when the run cannot
+  // be sent; a conversation runs continue in is never deleted.
+  const rollbackEmptyConv = async (reason: string): Promise<void> => {
+    if (reused) return;
+    try { await chats.deleteConversation(uid, cid, task.project_id || null); }
+    catch (e) { log.warn(`fire rollback failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} reason=${reason}`, logErrorSummary(e)); }
+  };
+  // A conversation that no renderer send has bound to a window cannot use the
+  // task browser, so an automation that reads a page has no way to run at all.
+  // Binding stays out of the foreground: this fire must not take over the view.
+  await _bindTaskBrowserWindow(uid, cid, task.id);
+  const terminal = _watchRunTerminal(uid, task.id, cid);
+  let preparingRun: Promise<void> | undefined;
+  const prepareRun = (run?: { runId: string }): Promise<void> => preparingRun ||= (async () => {
+    // The accepted send prepares its facts before recipient work is queued:
+    // native and CLI context assembly can both run before send() returns.
+    if (run?.runId) terminal.join(run.runId);
+    const runStartedAt = new Date(startedAt).toISOString();
+    try {
+      await recordRunStart(uid, task.id, cid, runStartedAt);
+      terminal.admit(runStartedAt);
+    } catch (err) {
+      terminal.cancel();
+      log.warn(`run start record failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+    }
+  })();
+  try {
+    const res = await groupChat.send({
+      userId: uid, cid, text: seed.text,
+      notificationKind: 'automation',
+      beforeDispatch: prepareRun,
+      // A conversation the run did not just open has its own reply target;
+      // the run still goes to the task's recipient and leaves that target.
+      ...(reused ? { forceTo: [seed.recipientId] } : {}),
+      ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
+    });
+    if (!res.ok) {
+      terminal.cancel();
+      log.warn(`fire send failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(res.error || 'unknown'));
+      await rollbackEmptyConv('send_not_ok');
+      emitFailure('send_not_ok');
+      return { ok: false, error: 'send_not_ok' };
+    }
+    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} reused=${reused ? 1 : 0} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
+    // A successful send without recipient dispatch still counts as before.
+    // The shared promise prevents recording an ordinary dispatch twice.
+    await prepareRun();
+    // Without dispatch no bus run was named, so no terminal can close it.
+    if (!terminal.joined()) terminal.cancel();
+    _emitFire({
+      type: 'conv_created',
+      source,
+      ...catchUpMark,
+      user_id: uid,
+      cid,
+      task_id: task.id,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
+    return { ok: true, cid };
+  } catch (err) {
+    terminal.cancel();
+    log.error(`fire send threw uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
+    await rollbackEmptyConv('send_threw');
+    emitFailure('send_threw');
+    return { ok: false, error: 'send_threw' };
+  }
+}
+
+/** Explicit user-triggered execution. This intentionally bypasses schedule
+ *  eligibility, device binding, boundary claims, and `_markRan`: a manual run
+ *  creates execution history but must not move or disable the scheduled run. */
+export async function runTaskNow(
+  uid: string,
+  taskId: string,
+): Promise<FireTaskResult | { ok: false; error: 'invalid_id' | 'not_found' }> {
+  const startedAt = Date.now();
+  const emitPreflightFailure = (errorCode: 'invalid_id' | 'not_found'): void => {
+    _emitFire({
+      type: 'fire_failed',
+      source: 'manual',
+      user_id: uid,
+      task_id: taskId,
+      error_code: errorCode,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
+  };
+  if (!_isValidTaskId(taskId)) {
+    emitPreflightFailure('invalid_id');
+    return { ok: false, error: 'invalid_id' };
+  }
+  const task = await getTask(uid, taskId);
+  if (!task) {
+    emitPreflightFailure('not_found');
+    return { ok: false, error: 'not_found' };
+  }
+  return _fireTask(uid, task, 'manual');
+}
+
+async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string): Promise<string[]> {
+  const want = Array.isArray(task.attachments) ? task.attachments.filter((n) => typeof n === 'string' && n) : [];
+  if (!want.length) return [];
+  if (!_isValidTaskId(task.id)) return [];
+  const srcDir = autoTaskLocationForTask(uid, task.id, task.project_id).attachmentsDir;
+  if (!fs.existsSync(srcDir)) return [];
+  const destDir = chatAttachmentDirForConversation(uid, cid, task.project_id);
+  if (!isPathAllowed(destDir, [userCloudRoot(uid)])) {
+    log.warn(`attachment destination out of scope uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`);
+    return [];
+  }
+  try { fs.mkdirSync(destDir, { recursive: true }); } catch (_) { /* ignore */ }
+  const copied: string[] = [];
+  for (const name of want) {
+    const safe = _sanitiseFilename(name);
+    if (!safe) continue;
+    const src = path.join(srcDir, safe);
+    if (!fs.existsSync(src)) continue;
+    try {
+      const sourceStat = await fs.promises.lstat(src);
+      if (!sourceStat.isFile()) continue;
+      const hash = await sha256OfFileStream(src);
+      const ext = path.extname(safe);
+      const stem = path.basename(safe, ext);
+      // At most three candidates: the original name, a stable distinct copy,
+      // then a fresh name if that copy has itself been edited. Never overwrite
+      // a historical attachment or follow a leaf link while comparing bytes.
+      const candidates = [safe, `${stem}-${hash.slice(0, 12)}${ext}`, `${stem}-${crypto.randomBytes(6).toString('hex')}${ext}`];
+      const copiedBefore = copied.length;
+      for (const name of candidates) {
+        const target = path.join(destDir, name);
+        try {
+          const existing = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (existing) {
+            if (existing.isFile() && existing.size === sourceStat.size && await sha256OfFileStream(target) === hash) {
+              copied.push(name);
+              break;
+            }
+            continue;
+          }
+          if (!isPathAllowed(destDir, [userCloudRoot(uid)])) throw new Error('attachment destination out of scope');
+          await copyLocalFileAtomic(src, target, { bytes: sourceStat.size, mtimeMs: sourceStat.mtimeMs });
+          copied.push(name);
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'E_IMPORT_TARGET_EXISTS') continue;
+          throw error;
+        }
+      }
+      if (copied.length === copiedBefore) throw new Error('attachment copy destination unavailable');
+    } catch (err) {
+      log.warn(`attachment copy failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
+    }
+  }
+  return copied;
+}
+
+// ── Fire pub/sub (renderer-side refresh hook) ───────────────────────────
+
+export type AutoFireEvent =
+  | {
+      type: 'conv_created';
+      source: AutoFireSource;
+      /** Set only on a scheduled occurrence run late after wake or startup. */
+      catch_up?: true;
+      user_id: string;
+      cid: string;
+      task_id: string;
+      duration_ms?: number;
+    }
+  | {
+      type: 'fire_failed';
+      source: AutoFireSource;
+      catch_up?: true;
+      user_id: string;
+      task_id: string;
+      cid?: string;
+      error_code: AutoFireErrorCode;
+      duration_ms?: number;
+    };
+
+type FireListener = (ev: AutoFireEvent) => void;
+const _fireListeners = new Set<FireListener>();
+
+export function subscribeFires(fn: FireListener): () => void {
+  _fireListeners.add(fn);
+  return () => { _fireListeners.delete(fn); };
+}
+
+export function subscribeFiresForUser(uid: string, fn: FireListener): () => void {
+  return subscribeFires((ev) => {
+    if (ev.user_id === uid) fn(ev);
+  });
+}
+
+function _emitFire(ev: AutoFireEvent): void {
+  for (const fn of _fireListeners) {
+    try { fn(ev); }
+    catch (err) { log.warn(`fire listener threw`, logErrorSummary(err)); }
+  }
+}
+
+// ── Scheduler ───────────────────────────────────────────────────────────
+//
+// Per-task setTimeout, no polling. Each enabled own-device task gets a
+// single timer set for its next due time (capped at MAX_TIMEOUT_MS so
+// system sleep/wake self-corrects within an hour). When the timer fires,
+// the task is re-read (config may have changed), `isDue` is re-checked
+// against the current wall clock, and if due, fired; then a fresh timer
+// is registered for the next occurrence. CRUD operations explicitly
+// cancel + re-register the affected task's timer so changes apply
+// immediately without waiting for any tick.
+//
+// Suspend cancels every armed timer. Resume and startup restore them and arm
+// a one-shot catch-up for an occurrence missed within CATCH_UP_WINDOW_MS; a
+// missed boundary is otherwise skipped.
+// A locked session is still runnable and must not be mistaken for system sleep:
+// if the callback can run under the current scheduler epoch, it may execute.
+
+/** Max single-step delay (1h). Lets sleep/wake re-evaluate against wall
+ *  clock within an hour even without the powerMonitor hook firing. Node's
+ *  int32 setTimeout limit is ~24.85d; this is well below. */
+const MAX_TIMEOUT_MS = 60 * 60 * 1000;
+
+/** Oldest missed occurrence that wake or startup still runs late. Only the
+ *  most recent missed occurrence is run, once; older ones are skipped. */
+const CATCH_UP_WINDOW_MS = 12 * HOUR_MS;
+
+/** Wait after wake or startup before a catch-up run, so networking and the
+ *  app window settle first. Sleeping again before then cancels it like any
+ *  other timer, and the next wake re-evaluates it. */
+const CATCH_UP_DELAY_MS = 60 * 1000;
+export const AUTO_TASK_CATCH_UP_DELAY_MS = CATCH_UP_DELAY_MS;
+export const AUTO_TASK_CATCH_UP_WINDOW_MS = CATCH_UP_WINDOW_MS;
+
+type ArmedTimer = {
+  handle: NodeJS.Timeout;
+  /** Actual schedule boundary, not the capped one-hour wake-up time. */
+  dueAtMs: number;
+  /** Only scheduling inputs. Content-only syncs may preserve the timer, while
+   *  schedule, run-state, end-condition, or device changes must rebuild it. */
+  scheduleStateKey: string;
+  /** Missed boundary this timer runs late; absent for on-time timers. */
+  catchUpBoundaryMs?: number;
+};
+
+type SchedulerPowerMonitor = {
+  on: (event: 'suspend' | 'resume', listener: () => void) => unknown;
+  removeListener: (event: 'suspend' | 'resume', listener: () => void) => unknown;
+};
+
+const _timers = new Map<string, ArmedTimer>();
+let _started = false;
+let _schedulerSuspended = false;
+let _schedulerPowerMonitor: SchedulerPowerMonitor | null = null;
+let _schedulerEpoch = 0;
+
+// One bounded clock sample for the scheduler, not one poll or disk scan per task.
+// Date/Intl follow the device timezone; monotonic elapsed time exposes manual
+// clock corrections that ordinary setTimeout deadlines would otherwise miss.
+let _clockMonitor: ReturnType<typeof setInterval> | null = null;
+let _clockSample: { wall: number; monotonic: number; zone: string; offset: number } | null = null;
+function _sampleDeviceClock() {
+  return { wall: Date.now(), monotonic: performance.now(),
+    zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    offset: new Date().getTimezoneOffset() };
+}
+function _startClockMonitor(): void {
+  if (_clockMonitor) return;
+  _clockSample = _sampleDeviceClock();
+  _clockMonitor = setInterval(() => {
+    const next = _sampleDeviceClock();
+    const previous = _clockSample;
+    _clockSample = next;
+    if (!previous || !_started || _schedulerSuspended || !_timers.size || !hasActiveUser()) return;
+    const changed = previous.zone !== next.zone || previous.offset !== next.offset
+      || Math.abs((next.wall - previous.wall) - (next.monotonic - previous.monotonic)) > 2000;
+    if (!changed) return;
+    const epoch = ++_schedulerEpoch;
+    _cancelAllTimers();
+    void _rescheduleAll(getActiveUserId(), 'restore', epoch, true)
+      .catch(err => log.warn('device clock reschedule failed', logErrorSummary(err)));
+  }, 30_000);
+  _clockMonitor.unref?.();
+}
+
+function schedulerEpochIsCurrent(schedulerEpoch?: number): boolean {
+  if (schedulerEpoch === undefined) return true;
+  return schedulerEpoch === _schedulerEpoch;
+}
+
+function isActiveUser(uid: string): boolean {
+  if (!hasActiveUser()) return false;
+  try {
+    return getActiveUserId() === uid;
+  } catch {
+    return false;
+  }
+}
+
+function _scheduleBaseline(task: AutoTask): Date | null {
+  if (task.last_run_at) {
+    const d = new Date(task.last_run_at);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  if (task.schedule.type === 'one_time') return null;
+  if (task.schedule.type === 'hourly' && task.schedule_anchor_at) {
+    const anchor = new Date(task.schedule_anchor_at);
+    if (!Number.isNaN(anchor.getTime())) return anchor;
+  }
+  const created = new Date(task.created_at);
+  return Number.isNaN(created.getTime()) ? null : created;
+}
+
+/** Compute the next moment a task should fire, or null if it never will
+ *  again (disabled, one_time already fired, device-mismatch). Recurring
+ *  tasks without a prior run use a persisted hourly edit anchor when present,
+ *  otherwise `created_at`, so a daily 09:00 task created at 20:00 starts
+ *  tomorrow instead of immediately back-filling this morning's boundary. */
+function _nextDueAt(task: AutoTask, now: Date, lastRun: Date | null): Date | null {
+  if (!task.enabled || !_endAllowsAt(task, now)) return null;
+  const sched = task.schedule;
+  let candidate: Date | null = null;
+  if (sched.type === 'one_time') {
+    if (lastRun) return null;
+    return new Date(sched.at);  // past = "fire ASAP" (setTimeout(<0) clamps to 0)
+  }
+  if (sched.type === 'hourly') candidate = _nextHourlyAt(now, lastRun, sched.interval_hours);
+  if (sched.type === 'daily') candidate = _nextDailyAt(now, lastRun, sched.hour, sched.minute);
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => sched.type === 'weekly'
+      ? _nextWeeklyAt(now, lastRun, day, sched.hour, sched.minute)
+      : _nextMonthlyAt(now, lastRun, day, sched.hour, sched.minute));
+    candidate = new Date(Math.min(...candidates.map(date => date.getTime())));
+  }
+  return candidate && _endAllowsAt(task, candidate) ? candidate : null;
+}
+
+function _nextHourlyAt(now: Date, lastRun: Date | null, intervalHours: number): Date | null {
+  if (!lastRun) return new Date(now.getTime() + intervalHours * HOUR_MS);
+  const boundary = new Date(lastRun.getTime() + intervalHours * HOUR_MS);
+  if (Number.isNaN(boundary.getTime())) return null;
+  return now.getTime() >= boundary.getTime() ? now : boundary;
+}
+
+function _nextDailyAt(now: Date, lastRun: Date | null, h: number, m: number): Date {
+  const today = new Date(now);
+  today.setHours(h, m, 0, 0);
+  if (now.getTime() >= today.getTime()) {
+    if (!lastRun || lastRun.getTime() < today.getTime()) return now; // already due
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return tomorrow;
+  }
+  return today;
+}
+
+function _nextWeeklyAt(now: Date, lastRun: Date | null, weekday: number, h: number, m: number): Date {
+  const today = new Date(now);
+  today.setHours(h, m, 0, 0);
+  if (now.getDay() === weekday) {
+    if (now.getTime() >= today.getTime()) {
+      if (!lastRun || lastRun.getTime() < today.getTime()) return now;
+      const nextWeek = new Date(today);
+      nextWeek.setDate(nextWeek.getDate() + 7);
+      return nextWeek;
+    }
+    return today;
+  }
+  // Days to skip ahead — `(weekday - currentDow + 7) % 7` gives 0 for "today"
+  // which we just handled; substitute 7 when zero so we always project to
+  // the future.
+  let daysAhead = (weekday - now.getDay() + 7) % 7;
+  if (daysAhead === 0) daysAhead = 7;
+  const result = new Date(today);
+  result.setDate(result.getDate() + daysAhead);
+  return result;
+}
+
+function _nextMonthlyAt(now: Date, lastRun: Date | null, day: number, h: number, m: number): Date {
+  const todayDom = now.getDate();
+  const lastDom = _lastDayOfMonth(now);
+  const targetDom = Math.min(day, lastDom);  // day=31 → fall back to last day
+  const today = new Date(now);
+  today.setDate(targetDom);
+  today.setHours(h, m, 0, 0);
+  if (todayDom === targetDom) {
+    if (now.getTime() >= today.getTime()) {
+      if (!lastRun || lastRun.getTime() < today.getTime()) return now;
+      return _monthsForwardAt(now, 1, day, h, m);
+    }
+    return today;
+  }
+  if (todayDom < targetDom) return today; // this month's target still ahead
+  return _monthsForwardAt(now, 1, day, h, m); // past it; next month
+}
+
+function _monthsForwardAt(from: Date, monthsForward: number, day: number, h: number, m: number): Date {
+  const result = new Date(from.getFullYear(), from.getMonth() + monthsForward, 1, h, m, 0, 0);
+  const lastDom = new Date(result.getFullYear(), result.getMonth() + 1, 0).getDate();
+  result.setDate(Math.min(day, lastDom));
+  return result;
+}
+
+/** Cancel any existing timer for `taskId`. */
+function _cancelTimer(taskId: string): void {
+  const prev = _timers.get(taskId);
+  if (prev) {
+    clearTimeout(prev.handle);
+    _timers.delete(taskId);
+  }
+}
+
+function _cancelAllTimers(): void {
+  for (const id of Array.from(_timers.keys())) _cancelTimer(id);
+}
+
+function _scheduleStateKey(task: AutoTask): string {
+  const schedule = task.schedule.type === 'one_time'
+    ? `one_time:${new Date(task.schedule.at).getTime()}`
+    : task.schedule.type === 'hourly'
+      ? `hourly:${task.schedule.interval_hours}`
+      : task.schedule.type === 'daily'
+        ? `daily:${task.schedule.hour}:${task.schedule.minute}`
+        : task.schedule.type === 'weekly'
+          ? `weekly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`
+          : `monthly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`;
+  const endCondition = !task.end_condition
+    ? ''
+    : task.end_condition.type === 'date'
+      ? `date:${task.end_condition.date}`
+      : `count:${task.end_condition.max_runs}`;
+  return [
+    task.enabled ? 'enabled' : 'disabled',
+    task.device_id || '',
+    task.created_at,
+    schedule,
+    task.schedule_anchor_at || '',
+    task.last_run_at || '',
+    endCondition,
+    String(_scheduledRunCount(task)),
+  ].join('\u0000');
+}
+
+/** Arm one capped wait toward an already-computed schedule boundary. A
+ *  `catchUpBoundaryMs` marks the wait as a late run of that missed boundary. */
+function _armTimerAt(
+  uid: string,
+  taskId: string,
+  dueAtMs: number,
+  scheduleStateKey: string,
+  catchUpBoundaryMs?: number,
+): void {
+  if (_schedulerSuspended) return;
+  const now = new Date();
+  const wait = dueAtMs - now.getTime();
+  const delay = Math.max(0, Math.min(wait, MAX_TIMEOUT_MS));
+  const schedulerEpoch = _schedulerEpoch;
+  let handle: NodeJS.Timeout;
+  handle = setTimeout(() => {
+    // A CRUD or sync reschedule may replace this timer after its callback is
+    // already queued. Only the currently armed handle may advance the task.
+    if (_timers.get(taskId)?.handle !== handle) return;
+    _onTimerFire(uid, taskId, dueAtMs, scheduleStateKey, schedulerEpoch, catchUpBoundaryMs)
+      .catch((err) => log.warn(`timer fire threw id=${taskId}`, logErrorSummary(err)));
+  }, delay);
+  if (typeof (handle as any).unref === 'function') (handle as any).unref();
+  _timers.set(taskId, {
+    handle,
+    dueAtMs,
+    scheduleStateKey,
+    ...(catchUpBoundaryMs !== undefined ? { catchUpBoundaryMs } : {}),
+  });
+}
+
+/** Register / refresh the timer for a single task. Idempotent: existing
+ *  timer is cancelled first. Sync — safe to call inside `_runExclusive`. */
+function _scheduleTask(uid: string, task: AutoTask, baselineOverride?: Date | null): void {
+  // CRUD and sync work can finish after an account switch. While the live
+  // scheduler is running, only the active account may touch the process-wide
+  // timer map. Different accounts may legitimately contain the same task id.
+  if (_started && !isActiveUser(uid)) return;
+  _cancelTimer(task.id);
+  if (_schedulerSuspended) return;
+  if (!task.enabled) return;
+  if (task.device_id && task.device_id !== getCurrentDevice().id) return;
+  const now = new Date();
+  const lastRun = baselineOverride === undefined ? _scheduleBaseline(task) : baselineOverride;
+  const nextDue = _nextDueAt(task, now, lastRun);
+  if (!nextDue) return;
+  _armTimerAt(uid, task.id, nextDue.getTime(), _scheduleStateKey(task));
+}
+
+/** Fire handler: re-read the task (may have been edited since scheduled),
+ *  real-clock due-check, fire if due, then reschedule for the next due. */
+async function _onTimerFire(
+  uid: string,
+  taskId: string,
+  expectedDueAtMs?: number,
+  expectedScheduleStateKey?: string,
+  schedulerEpoch?: number,
+  catchUpBoundaryMs?: number,
+): Promise<void> {
+  _timers.delete(taskId);
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  const now = new Date();
+  if (expectedDueAtMs !== undefined && now.getTime() < expectedDueAtMs) {
+    // MAX_TIMEOUT_MS is only a checkpoint for long waits. Keep the original
+    // schedule boundary intact and do not re-run due logic against persisted
+    // last_run_at, which may intentionally predate a skipped occurrence.
+    _armTimerAt(uid, taskId, expectedDueAtMs, expectedScheduleStateKey || '', catchUpBoundaryMs);
+    return;
+  }
+  const task = await _readOne(uid, taskId);
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  if (!task) return;
+  const catchUp = catchUpBoundaryMs !== undefined;
+  // A late run re-checks its occurrence now: a run, edit, disable, or another
+  // scheduler's claim since arming means nothing is missed any more.
+  const dueBoundary = catchUp
+    ? _catchUpBoundary(task, now)
+    : _dueBoundary(task, now, _scheduleBaseline(task));
+  let claimedElsewhereBoundary: Date | null = null;
+  const canFireHere = !_schedulerSuspended
+    && task.enabled
+    && (!task.device_id || task.device_id === getCurrentDevice().id)
+    && dueBoundary !== null;
+  if (canFireHere) {
+    if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+    if (!_tryClaimFireBoundary(uid, task, dueBoundary, now)) {
+      claimedElsewhereBoundary = dueBoundary;
+      log.info(`fire skipped duplicate uid=${maskId(uid)} id=${taskId} boundary=${dueBoundary.toISOString()}`);
+    } else {
+      const markStartedAt = Date.now();
+      let admitted: AutoTask | null;
+      try {
+        // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
+        // can't get re-picked by a future re-schedule.
+        admitted = await _markRan(uid, taskId, now, dueBoundary, catchUp, schedulerEpoch);
+        if (!admitted) {
+          _releaseFireBoundaryClaim(uid, task, dueBoundary);
+          const fresh = await _readOne(uid, taskId);
+          if (fresh && schedulerEpochIsCurrent(schedulerEpoch)) {
+            _scheduleTask(uid, fresh, catchUp ? _baselineWithoutBackfill(fresh, new Date()) : undefined);
+          }
+          return;
+        }
+        if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+      } catch (err) {
+        _releaseFireBoundaryClaim(uid, task, dueBoundary);
+        log.warn(`fire mark failed id=${taskId}`, logErrorSummary(err));
+        _emitFire({
+          type: 'fire_failed',
+          source: 'scheduled',
+          ...(catchUp ? { catch_up: true as const } : {}),
+          user_id: uid,
+          task_id: taskId,
+          error_code: 'mark_ran_failed',
+          duration_ms: Math.max(0, Date.now() - markStartedAt),
+        });
+        const fresh = await _readOne(uid, taskId);
+        if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+        if (fresh && catchUp) {
+          // Retry the same late run after the settle delay; an on-time timer
+          // could not find a boundary that is already in the past. Like
+          // `_scheduleTask`, never re-arm across a suspend or account switch.
+          if (_started && !isActiveUser(uid)) return;
+          _cancelTimer(taskId);
+          _armTimerAt(uid, taskId, Date.now() + CATCH_UP_DELAY_MS, _scheduleStateKey(fresh), dueBoundary.getTime());
+        } else if (fresh) {
+          _scheduleTask(uid, fresh);
+        }
+        return;
+      }
+      try {
+        await _fireTask(uid, admitted, 'scheduled', catchUp);
+      } catch (err) {
+        log.warn(`fire failed id=${taskId}`, logErrorSummary(err));
+      }
+    }
+  }
+  // Re-read for fresh last_run_at / enabled state, then reschedule. This
+  // is what makes the cap (MAX_TIMEOUT_MS) self-correcting — if the
+  // capped timer fired before the actual due time, no fire happens but a
+  // new timer goes in for the remaining gap (or up to another MAX cap).
+  const fresh = await _readOne(uid, taskId);
+  if (!fresh || !schedulerEpochIsCurrent(schedulerEpoch)) return;
+  // A late run that is no longer owed must not fall back to back-filling.
+  const baseline = claimedElsewhereBoundary
+    || (catchUp && !canFireHere ? _baselineWithoutBackfill(fresh, new Date()) : undefined);
+  _scheduleTask(uid, fresh, baseline);
+}
+
+export function _onTimerFireForTest(uid: string, taskId: string): Promise<void> {
+  return _onTimerFire(uid, taskId, undefined, undefined, _schedulerEpoch);
+}
+
+function _baselineWithoutBackfill(task: AutoTask, now: Date): Date | null {
+  const baseline = _scheduleBaseline(task);
+  return _dueBoundary(task, now, baseline) ? now : baseline;
+}
+
+export function nextDueAfterRestoreForTest(task: AutoTask, now: Date): Date | null {
+  const baseline = _baselineWithoutBackfill(task, now);
+  return _nextDueAt(task, now, baseline);
+}
+
+/** Cancel + re-register every timer.
+ *
+ * Past-due boundaries are used only as an in-memory scheduling baseline, so
+ * nothing is persisted and no overdue conversation is created here. With
+ * `catchUp` (system wake and startup), an occurrence missed within
+ * CATCH_UP_WINDOW_MS instead gets a one-shot timer that runs it late. */
+type RescheduleMode = 'restore' | 'live_sync';
+
+async function _rescheduleAll(
+  uid: string,
+  mode: RescheduleMode = 'restore',
+  schedulerEpoch?: number,
+  catchUp = false,
+): Promise<void> {
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  // Live sync rebuilds the process-wide timer map. Preserve the exact boundary
+  // for unchanged scheduling state whether it is future or already runnable;
+  // newly synced or materially changed overdue tasks still use restore
+  // semantics and never backfill.
+  const armedTimers = mode === 'live_sync'
+    ? new Map(Array.from(_timers, ([id, timer]) => [id, {
+        dueAtMs: timer.dueAtMs,
+        scheduleStateKey: timer.scheduleStateKey,
+        catchUpBoundaryMs: timer.catchUpBoundaryMs,
+      }]))
+    : new Map<string, { dueAtMs: number; scheduleStateKey: string; catchUpBoundaryMs?: number }>();
+  _cancelAllTimers();
+  const tasks = await listTasks(uid);
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  const now = new Date();
+  let catchUps = 0;
+  for (const t of tasks) {
+    if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+    const priorTimer = armedTimers.get(t.id);
+    const currentScheduleStateKey = _scheduleStateKey(t);
+    if (priorTimer && priorTimer.scheduleStateKey === currentScheduleStateKey) {
+      _armTimerAt(uid, t.id, priorTimer.dueAtMs, currentScheduleStateKey, priorTimer.catchUpBoundaryMs);
+      continue;
+    }
+    const missed = catchUp && (!_started || isActiveUser(uid)) ? _catchUpBoundary(t, now) : null;
+    if (missed) {
+      _armTimerAt(uid, t.id, now.getTime() + CATCH_UP_DELAY_MS, currentScheduleStateKey, missed.getTime());
+      catchUps += 1;
+      log.info(`catch-up armed id=${t.id} boundary=${missed.toISOString()}`);
+      continue;
+    }
+    const baseline = _baselineWithoutBackfill(t, now);
+    _scheduleTask(uid, t, baseline);
+  }
+  log.info(`rescheduler ran timers=${_timers.size}${catchUp ? ` catch_ups=${catchUps}` : ''}`);
+}
+
+export function rescheduleAllForTest(uid: string): Promise<void> {
+  return _rescheduleAll(uid);
+}
+
+export function rescheduleAllAfterSyncForTest(uid: string): Promise<void> {
+  return _rescheduleAll(uid, 'live_sync');
+}
+
+export function armedDueAtForTest(taskId: string): number | null {
+  return _timers.get(taskId)?.dueAtMs ?? null;
+}
+
+export function nextDueAtForTest(task: AutoTask, now: Date): Date | null {
+  return _nextDueAt(task, now, _scheduleBaseline(task));
+}
+
+/** Public CRUD hook — call after any task mutation lands on disk. */
+function _onTaskMutated(uid: string, task: AutoTask | null, taskId?: string): void {
+  if (_started && !isActiveUser(uid)) return;
+  if (task) _scheduleTask(uid, task, _baselineWithoutBackfill(task, new Date()));
+  else if (taskId) _cancelTimer(taskId);
+}
+
+function _suspendScheduler(): void {
+  // Invalidate a callback that has already left the timer queue and is
+  // awaiting disk or sleep-state IO.
+  _schedulerEpoch += 1;
+  _schedulerSuspended = true;
+  _cancelAllTimers();
+  log.info('scheduler suspended');
+}
+
+async function _resumeScheduler(uid: string): Promise<void> {
+  _schedulerSuspended = false;
+  const schedulerEpoch = _schedulerEpoch;
+  if (!isActiveUser(uid)) return;
+  await _rescheduleAll(uid, 'restore', schedulerEpoch, true);
+  log.info('scheduler resumed');
+}
+
+const _onSystemSuspend = (): void => {
+  if (!_started) return;
+  _suspendScheduler();
+};
+
+const _onSystemResume = (): void => {
+  if (!_started) return;
+  if (!hasActiveUser()) {
+    _schedulerSuspended = false;
+    return;
+  }
+  _resumeScheduler(getActiveUserId())
+    .catch((err) => log.warn(`resume failed`, logErrorSummary(err)));
+};
+
+async function _attachSchedulerPowerMonitor(): Promise<void> {
+  if (_schedulerPowerMonitor) return;
+  try {
+    const { powerMonitor } = await import('electron');
+    if (_schedulerPowerMonitor || !_started || !powerMonitor
+        || typeof powerMonitor.on !== 'function'
+        || typeof powerMonitor.removeListener !== 'function') return;
+    _schedulerPowerMonitor = powerMonitor as unknown as SchedulerPowerMonitor;
+    _schedulerPowerMonitor.on('suspend', _onSystemSuspend);
+    _schedulerPowerMonitor.on('resume', _onSystemResume);
+  } catch (err) {
+    log.warn(`power monitor registration failed`, logErrorSummary(err));
+  }
+}
+
+function _detachSchedulerPowerMonitor(): void {
+  const monitor = _schedulerPowerMonitor;
+  _schedulerPowerMonitor = null;
+  if (!monitor) return;
+  monitor.removeListener('suspend', _onSystemSuspend);
+  monitor.removeListener('resume', _onSystemResume);
+}
+
+export function suspendSchedulerForTest(): void {
+  _suspendScheduler();
+}
+
+export function resumeSchedulerForTest(uid: string): Promise<void> {
+  return _resumeScheduler(uid);
+}
+
+/** Initial bootstrap — list every task and register a timer for each
+ *  enabled / own-device one, catching up an occurrence missed while Orkas was
+ *  closed. Called once on startup; deferred via the deferred boot phase
+ *  (util/boot_init.ts) so first-paint doesn't pay the disk scan cost. */
+export function startScheduler(): void {
+  if (_started) return;
+  _started = true;
+  _schedulerSuspended = false;
+  _startClockMonitor();
+  void _attachSchedulerPowerMonitor();
+  if (!hasActiveUser()) return;
+  const uid = getActiveUserId();
+  _pruneFireBoundaryClaims(uid);
+  const schedulerEpoch = _schedulerEpoch;
+  _rescheduleAll(uid, 'restore', schedulerEpoch, true)
+    .catch((err) => log.warn(`bootstrap failed uid=${maskId(uid)}`, logErrorSummary(err)));
+}
+
+/** Re-read task configs after sync writes directly into cloud/auto_tasks.
+ *  CRUD paths schedule their own task, but the sync engine bypasses those
+ *  hooks while materializing files from another device. */
+export async function rescheduleAllForActiveUser(): Promise<void> {
+  if (!hasActiveUser()) return;
+  const uid = getActiveUserId();
+  const schedulerEpoch = _schedulerEpoch;
+  await _rescheduleAll(uid, 'live_sync', schedulerEpoch);
+}
+
+export function stopScheduler(): void {
+  if (_clockMonitor) clearInterval(_clockMonitor);
+  _clockMonitor = null;
+  _clockSample = null;
+  _schedulerEpoch += 1;
+  _cancelAllTimers();
+  _detachSchedulerPowerMonitor();
+  _schedulerSuspended = false;
+  _started = false;
+  log.info('scheduler stopped');
+}
+
+registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
+  // Invalidate callbacks before users.activateUser swaps filesystem and
+  // credential roots. clearTimeout alone is insufficient when a callback has
+  // already left the timer queue and is awaiting disk or sleep-state IO.
+  _schedulerEpoch += 1;
+  const switchEpoch = _schedulerEpoch;
+  _cancelAllTimers();
+  if (!_started) return;
+  queueMicrotask(() => {
+    if (!_started || !schedulerEpochIsCurrent(switchEpoch) || !isActiveUser(nextUid)) return;
+    _rescheduleAll(nextUid, 'restore', switchEpoch)
+      .catch((err) => log.warn(`account-switch reschedule failed uid=${maskId(nextUid)}`, logErrorSummary(err)));
+  });
+});

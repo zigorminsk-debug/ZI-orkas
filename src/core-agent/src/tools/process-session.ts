@@ -1,0 +1,745 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions, stopCommandSessionsForHostExit } from "./command-sessions.js";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+import {
+  buildSandboxedShellInvocation,
+  buildSandboxEnv,
+  decodeProcessOutput,
+  defaultShellForPlatform,
+  killProcessTree,
+} from "../sandbox/executor.js";
+import {
+  defineTool,
+  type AgentTool,
+  type CommandExecutionObservation,
+  type ToolContext,
+  type ToolResult,
+  type ToolReadContinuation,
+} from "./base.js";
+
+export type ProcessSessionStatus = "running" | "exited" | "error" | "stopped";
+
+interface ProcessSession {
+  id: string;
+  owner: string;
+  command: string;
+  cwd: string;
+  child: ChildProcessWithoutNullStreams;
+  closed: boolean;
+  env: NodeJS.ProcessEnv;
+  status: ProcessSessionStatus;
+  createdAt: number;
+  updatedAt: number;
+  output: string;
+  outputStart: number;
+  outputEnd: number;
+  outputTruncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
+  executionObservationReported: boolean;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | string | null;
+  error?: string;
+  lifetimeTimer: NodeJS.Timeout;
+  cleanupTimer?: NodeJS.Timeout;
+  killTimer?: NodeJS.Timeout;
+  termination?: Promise<void>;
+}
+
+const PROCESS_OUTPUT_BUFFER_CHARS = 1_000_000;
+const PROCESS_READ_DEFAULT_CHARS = 32_000;
+const PROCESS_READ_MAX_CHARS = 64_000;
+const PROCESS_INPUT_MAX_CHARS = 64_000;
+const PROCESS_COMMAND_PREVIEW_CHARS = 800;
+const PROCESS_DEFAULT_LIFETIME_MS = 6 * 60 * 60 * 1000;
+const PROCESS_MIN_LIFETIME_MS = 60_000;
+const PROCESS_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const PROCESS_EXITED_RETENTION_MS = 60 * 60 * 1000;
+const PROCESS_MAX_RUNNING_PER_OWNER = 8;
+const PROCESS_INITIAL_ACTIVITY_WAIT_MS = process.platform === "win32" ? 1_500 : 300;
+
+const PROCESS_HOST_EXIT_BUDGET_MS = 5_000;
+
+// Shared across module instances like the managed command registry.
+const SESSIONS_KEY = Symbol.for("orkas.core_agent.process_sessions");
+const sessions: Map<string, ProcessSession> = ((globalThis as any)[SESSIONS_KEY] ??= new Map<string, ProcessSession>());
+
+/** Host-owned storage cleanup must wait until managed children close. */
+export function runningProcessSessions(owner: string): number {
+  let count = 0;
+  for (const session of sessions.values()) if (session.owner === owner && !session.closed) count++;
+  return count;
+}
+
+function processOwner(ctx: ToolContext): string {
+  const owner = ctx.state?.processSessionOwner;
+  return typeof owner === "string" ? owner : "";
+}
+
+function boundedLifetime(value: unknown): number {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue) || numberValue <= 0) return PROCESS_DEFAULT_LIFETIME_MS;
+  return Math.max(
+    PROCESS_MIN_LIFETIME_MS,
+    Math.min(PROCESS_MAX_LIFETIME_MS, Math.trunc(numberValue)),
+  );
+}
+
+function commandPreview(command: string): string {
+  return command.length <= PROCESS_COMMAND_PREVIEW_CHARS
+    ? command
+    : `${command.slice(0, PROCESS_COMMAND_PREVIEW_CHARS)}...`;
+}
+
+function appendOutput(
+  session: ProcessSession,
+  bytes: Buffer | string,
+  stream?: "stdout" | "stderr",
+): void {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8");
+  if (stream === "stdout") session.stdoutBytes += buffer.length;
+  if (stream === "stderr") session.stderrBytes += buffer.length;
+  const text = decodeProcessOutput(buffer, process.platform, session.env);
+  if (!text) return;
+  session.output += text;
+  session.outputEnd += text.length;
+  if (session.output.length > PROCESS_OUTPUT_BUFFER_CHARS) {
+    const dropped = session.output.length - PROCESS_OUTPUT_BUFFER_CHARS;
+    session.output = session.output.slice(dropped);
+    session.outputStart += dropped;
+    session.outputTruncated = true;
+  }
+  session.updatedAt = Date.now();
+}
+
+function clearTimers(session: ProcessSession): void {
+  clearTimeout(session.lifetimeTimer);
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  if (session.killTimer) clearTimeout(session.killTimer);
+}
+
+function scheduleCleanup(session: ProcessSession): void {
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  session.cleanupTimer = setTimeout(() => {
+    if (sessions.get(session.id) === session && session.status !== "running") {
+      clearTimers(session);
+      sessions.delete(session.id);
+    }
+  }, PROCESS_EXITED_RETENTION_MS);
+  if (typeof session.cleanupTimer.unref === "function") session.cleanupTimer.unref();
+}
+
+function finishSession(
+  session: ProcessSession,
+  status: ProcessSessionStatus,
+  patch: {
+    exitCode?: number | null;
+    signal?: NodeJS.Signals | string | null;
+    error?: string;
+  } = {},
+): void {
+  if (session.status !== "running") return;
+  session.status = status;
+  session.updatedAt = Date.now();
+  if ("exitCode" in patch) session.exitCode = patch.exitCode;
+  if ("signal" in patch) session.signal = patch.signal;
+  if (patch.error) session.error = patch.error;
+  clearTimeout(session.lifetimeTimer);
+  // Terminal bookkeeping must not cancel escalation: even a closed shell
+  // can leave descendants that ignored SIGTERM in its process group.
+  scheduleCleanup(session);
+}
+
+function killSession(session: ProcessSession, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+  if (session.termination) return session.termination;
+  session.termination = new Promise<void>((resolve) => {
+    try { killProcessTree(session.child, signal, { onComplete: resolve }); }
+    catch { resolve(); }
+  });
+  // Windows performs its bounded forceful sweep in the existing helper.
+  // POSIX still escalates the process group even if its shell exited first.
+  if (process.platform === "win32") return session.termination;
+  if (session.killTimer) clearTimeout(session.killTimer);
+  session.killTimer = setTimeout(() => {
+    try { killProcessTree(session.child, "SIGKILL"); } catch { /* best effort */ }
+  }, 5_000);
+  if (typeof session.killTimer.unref === "function") session.killTimer.unref();
+  return session.termination;
+}
+
+function ownedSession(ctx: ToolContext, sessionId: unknown): ProcessSession | ToolResult {
+  const id = String(sessionId ?? "").trim();
+  if (!id) return { content: "E_BAD_INPUT: `session_id` is required", isError: true };
+  const session = sessions.get(id);
+  if (!session || session.owner !== processOwner(ctx)) {
+    return { content: "E_PROCESS_SESSION_NOT_FOUND: process session not found", isError: true };
+  }
+  return session;
+}
+
+function isToolResult(value: ProcessSession | ToolResult): value is ToolResult {
+  return !("child" in value);
+}
+
+function readRange(
+  session: ProcessSession,
+  cursorValue: unknown,
+  maxCharsValue: unknown,
+) {
+  const requestedCursor = Number(cursorValue);
+  const cursor = Number.isFinite(requestedCursor)
+    ? Math.max(0, Math.trunc(requestedCursor))
+    : session.outputStart;
+  const maxCharsNumber = Number(maxCharsValue);
+  const maxChars = Number.isFinite(maxCharsNumber) && maxCharsNumber > 0
+    ? Math.max(1, Math.min(PROCESS_READ_MAX_CHARS, Math.trunc(maxCharsNumber)))
+    : PROCESS_READ_DEFAULT_CHARS;
+  const effectiveCursor = Math.max(session.outputStart, Math.min(cursor, session.outputEnd));
+  return { cursor, effectiveCursor, maxChars };
+}
+
+function readPayload(session: ProcessSession, cursorValue: unknown, maxCharsValue: unknown): Record<string, unknown> {
+  const { cursor, effectiveCursor, maxChars } = readRange(session, cursorValue, maxCharsValue);
+  const relativeStart = effectiveCursor - session.outputStart;
+  const output = session.output.slice(relativeStart, relativeStart + maxChars);
+  const nextCursor = effectiveCursor + output.length;
+  return {
+    session_id: session.id,
+    command: commandPreview(session.command),
+    cwd: session.cwd,
+    status: session.status,
+    created_at: new Date(session.createdAt).toISOString(),
+    updated_at: new Date(session.updatedAt).toISOString(),
+    output,
+    cursor: effectiveCursor,
+    next_cursor: nextCursor,
+    output_start: session.outputStart,
+    output_end: session.outputEnd,
+    truncated_before_cursor: cursor < session.outputStart,
+    has_more: nextCursor < session.outputEnd,
+    ...(session.status !== "running" ? { exit_code: session.exitCode ?? null } : {}),
+    ...(session.signal ? { signal: session.signal } : {}),
+    ...(session.error ? { error: session.error } : {}),
+  };
+}
+
+function resultJson(
+  value: unknown,
+  isError = false,
+  execution?: CommandExecutionObservation,
+): ToolResult {
+  return {
+    content: JSON.stringify(value, null, 2),
+    ...(isError ? { isError: true } : {}),
+    ...(execution ? { observations: { execution } } : {}),
+  };
+}
+
+function takeTerminalExecutionObservation(
+  session: ProcessSession,
+): CommandExecutionObservation | undefined {
+  if (session.status === "running" || session.executionObservationReported) return undefined;
+  session.executionObservationReported = true;
+  const timedOut = session.status === "stopped" && session.signal === "timeout";
+  const aborted = session.status === "stopped" && !timedOut;
+  const status: CommandExecutionObservation["status"] = timedOut
+    ? "timed_out"
+    : aborted
+      ? "aborted"
+      : session.status === "error" && session.exitCode === undefined && !!session.error
+        ? "start_failed"
+      : session.status === "exited" && session.exitCode === 0
+        ? "succeeded"
+        : "failed";
+  return {
+    status,
+    exitCode: session.exitCode ?? null,
+    durationMs: Math.max(0, session.updatedAt - session.createdAt),
+    timedOut,
+    outputLimitExceeded: false,
+    stdout: {
+      bytes: session.stdoutBytes,
+      truncated: session.outputTruncated && session.stdoutBytes > 0,
+    },
+    stderr: {
+      bytes: session.stderrBytes,
+      truncated: session.outputTruncated && session.stderrBytes > 0,
+    },
+  };
+}
+
+function terminalResultJson(
+  session: ProcessSession,
+  cursor: unknown,
+  maxChars: unknown,
+): ToolResult {
+  const failed = session.status === "error" || session.signal === "timeout";
+  return resultJson(
+    readPayload(session, cursor, maxChars),
+    failed,
+    takeTerminalExecutionObservation(session),
+  );
+}
+
+export function processSessionCapacityError(ctx: ToolContext): ToolResult | null {
+  const owner = processOwner(ctx);
+  const running = [...sessions.values()].filter((session) => session.owner === owner && session.status === "running").length
+    + runningCommandSessions(owner);
+  return running >= PROCESS_MAX_RUNNING_PER_OWNER
+    ? { content: `E_PROCESS_SESSION_LIMIT: at most ${PROCESS_MAX_RUNNING_PER_OWNER} running process sessions are allowed`, isError: true }
+    : null;
+}
+
+function startProcessSession(command: string, ctx: ToolContext, maxLifetimeMs: unknown): ProcessSession | ToolResult {
+  const owner = processOwner(ctx);
+  const capacityError = processSessionCapacityError(ctx);
+  if (capacityError) return capacityError;
+
+  const cwd = path.resolve(ctx.workingDir ?? ".");
+  try {
+    fs.mkdirSync(cwd, { recursive: true });
+  } catch (error) {
+    return {
+      content: `E_PROCESS_START: cannot create working directory: ${(error as Error).message}`,
+      isError: true,
+      observations: {
+        execution: {
+          status: "start_failed",
+          exitCode: null,
+          durationMs: 0,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 0, truncated: false },
+          stderr: { bytes: Buffer.byteLength((error as Error).message), truncated: false },
+        },
+      },
+    };
+  }
+  const env = buildSandboxEnv((ctx.state?.sandboxEnv ?? {}) as Record<string, string>);
+  const shell = process.platform === "win32"
+    ? defaultShellForPlatform()
+    : (process.env.SHELL || "/bin/bash");
+  const allowedDirs = Array.isArray(ctx.state?.sandboxAllowedDirs)
+    ? ctx.state.sandboxAllowedDirs.filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    )
+    : undefined;
+  const invocation = buildSandboxedShellInvocation(shell, command, allowedDirs);
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(invocation.command, invocation.args, {
+      cwd,
+      env,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    }) as ChildProcessWithoutNullStreams;
+  } catch (error) {
+    return {
+      content: `E_PROCESS_START: ${(error as Error).message}`,
+      isError: true,
+      observations: {
+        execution: {
+          status: "start_failed",
+          exitCode: null,
+          durationMs: 0,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: { bytes: 0, truncated: false },
+          stderr: { bytes: Buffer.byteLength((error as Error).message), truncated: false },
+        },
+      },
+    };
+  }
+
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const lifetime = boundedLifetime(maxLifetimeMs);
+  const session: ProcessSession = {
+    id,
+    owner,
+    command,
+    cwd,
+    child,
+    closed: false,
+    env,
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    output: "",
+    outputStart: 0,
+    outputEnd: 0,
+    outputTruncated: false,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    executionObservationReported: false,
+    lifetimeTimer: setTimeout(() => {}, lifetime),
+  };
+  clearTimeout(session.lifetimeTimer);
+  session.lifetimeTimer = setTimeout(() => {
+    appendOutput(session, `\n[core-agent] Process session timed out after ${lifetime}ms.\n`);
+    killSession(session);
+    finishSession(session, "stopped", { signal: "timeout" });
+  }, lifetime);
+  if (typeof session.lifetimeTimer.unref === "function") session.lifetimeTimer.unref();
+  sessions.set(id, session);
+
+  child.stdout.on("data", (data: Buffer) => appendOutput(session, data, "stdout"));
+  child.stderr.on("data", (data: Buffer) => appendOutput(session, data, "stderr"));
+  child.stdin.on("error", () => undefined);
+  child.on("error", (error) => {
+    appendOutput(session, `\n[core-agent] Process error: ${error.message}\n`);
+    finishSession(session, "error", { error: error.message });
+  });
+  child.on("close", (code, signal) => {
+    session.closed = true;
+    finishSession(session, code === 0 ? "exited" : "error", {
+      exitCode: code,
+      signal: signal ?? null,
+    });
+  });
+  return session;
+}
+
+async function waitForInitialProcessActivity(session: ProcessSession): Promise<void> {
+  // PowerShell startup can exceed 300ms when a Windows test or build host is
+  // busy. Keep the start response deterministic for quick commands while
+  // preserving the shorter POSIX path for silent long-running processes.
+  const deadline = Date.now() + PROCESS_INITIAL_ACTIVITY_WAIT_MS;
+  while (session.status === "running" && session.outputEnd === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function waitForProcessClose(session: ProcessSession, maxWaitMs = 500): Promise<void> {
+  if (session.closed) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      session.child.off("close", finish);
+      session.updatedAt = Date.now();
+      resolve();
+    };
+    const timer = setTimeout(finish, maxWaitMs);
+    session.child.once("close", finish);
+  });
+}
+
+export const processStartTool: AgentTool = defineTool({
+  name: "process_start",
+  description:
+    "Start a persistent shell process for long builds, test runs, watchers, development servers, or commands that need later stdin. It returns a session_id that remains usable across later Agent runs in the same host scope. Use bash for commands expected to finish in one call; use an interactive-CLI tool when the user must enter secrets or complete OAuth.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      command: { type: "string", description: "Shell command to start in the working directory." },
+      max_lifetime_ms: {
+        type: "number",
+        description: "Optional lifetime. Default 6 hours; minimum 1 minute; maximum 24 hours.",
+      },
+    },
+    required: ["command"],
+  },
+  async execute(input, ctx) {
+    const command = String(input.command ?? "").trim();
+    if (!command) return { content: "E_BAD_INPUT: `command` is required", isError: true };
+    const session = startProcessSession(command, ctx, input.max_lifetime_ms);
+    if (isToolResult(session)) return session;
+    await waitForInitialProcessActivity(session);
+    // A short command can emit its final stderr/stdout immediately before the
+    // wrapping shell closes. Give that close event a brief chance to arrive so
+    // callers receive the terminal exit code rather than a stale `running`.
+    if (session.status === "running" && session.outputEnd > 0) {
+      await waitForProcessClose(session, 300);
+    }
+    return session.status === "running"
+      ? resultJson(readPayload(session, session.outputStart, PROCESS_READ_DEFAULT_CHARS))
+      : terminalResultJson(session, session.outputStart, PROCESS_READ_DEFAULT_CHARS);
+  },
+});
+
+export const processReadTool: AgentTool = defineTool({
+  name: "process_read",
+  description:
+    "Read new output and current status from a process_start session without blocking. Pass the previous next_cursor to receive only later output. If status is running and output is empty, continue other useful work or read again only after meaningful progress is expected.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", description: "Session id returned by process_start." },
+      cursor: { type: "number", description: "Previous next_cursor. Omit to read from retained output start." },
+      max_chars: { type: "number", description: "Maximum output characters, default 32000 and max 64000." },
+    },
+    required: ["session_id"],
+  },
+  executionMode: "parallel",
+  inspectReadContinuation(input, ctx) {
+    if (!input) return undefined;
+    return inspectProcessRead({ ...input, action: "read", yield_time_ms: input.yield_time_ms ?? 0 }, ctx, false);
+  },
+  async execute(input, ctx) {
+    const session = ownedSession(ctx, input.session_id);
+    if (isToolResult(session)) return session;
+    const waitMs = input.yield_time_ms === undefined ? 0 : commandSessionWait(input.yield_time_ms) ?? 0;
+    const cursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
+    if (session.status === "running" && session.outputEnd <= cursor && waitMs > 0 && !ctx.signal?.aborted) {
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          session.child.stdout.off("data", finish);
+          session.child.stderr.off("data", finish);
+          session.child.off("close", finish);
+          ctx.signal?.removeEventListener("abort", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, waitMs);
+        session.child.stdout.once("data", finish);
+        session.child.stderr.once("data", finish);
+        session.child.once("close", finish);
+        ctx.signal?.addEventListener("abort", finish, { once: true });
+      });
+    }
+    return session.status === "running"
+      ? resultJson(readPayload(session, input.cursor, input.max_chars))
+      : terminalResultJson(session, input.cursor, input.max_chars);
+  },
+});
+
+export const processWriteTool: AgentTool = defineTool({
+  name: "process_write",
+  description:
+    "Write known, non-secret characters to a running process_start session. Use for test runners, REPL commands, server controls, or confirmations whose answer is already known. Do not send passwords, tokens, API keys, or OAuth codes through this tool.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", description: "Session id returned by process_start." },
+      chars: { type: "string", description: "Characters to write to stdin." },
+      add_newline: { type: "boolean", description: "Append a newline. Default false." },
+    },
+    required: ["session_id", "chars"],
+  },
+  async execute(input, ctx) {
+    const session = ownedSession(ctx, input.session_id);
+    if (isToolResult(session)) return session;
+    if (session.status !== "running") {
+      return {
+        content: `E_PROCESS_NOT_RUNNING: process session is ${session.status}`,
+        isError: true,
+      };
+    }
+    const chars = String(input.chars ?? "");
+    if (chars.length > PROCESS_INPUT_MAX_CHARS) {
+      return {
+        content: `E_BAD_INPUT: chars exceeds ${PROCESS_INPUT_MAX_CHARS} characters`,
+        isError: true,
+      };
+    }
+    try {
+      session.child.stdin.write(input.add_newline === true ? `${chars}\n` : chars, "utf8");
+      session.updatedAt = Date.now();
+      return resultJson({ session_id: session.id, status: session.status, written_chars: chars.length });
+    } catch (error) {
+      return { content: `E_PROCESS_WRITE: ${(error as Error).message}`, isError: true };
+    }
+  },
+});
+
+export const processStopTool: AgentTool = defineTool({
+  name: "process_stop",
+  description:
+    "Stop a process_start session and its process tree. Use when the work is complete, a watcher/server is no longer needed, or a command is stuck.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", description: "Session id returned by process_start." },
+    },
+    required: ["session_id"],
+  },
+  async execute(input, ctx) {
+    const session = ownedSession(ctx, input.session_id);
+    if (isToolResult(session)) return session;
+    if (session.status === "running") {
+      killSession(session);
+      finishSession(session, "stopped", { signal: "agent" });
+    }
+    // A shell closing is not proof that its descendants have been reaped.
+    // Repeated/concurrent stops share the original ownership receipt.
+    await session.termination;
+    await waitForProcessClose(session);
+    return terminalResultJson(session, session.outputEnd, PROCESS_READ_DEFAULT_CHARS);
+  },
+});
+
+type ProcessSessionAction = "read" | "write" | "stop";
+
+const PROCESS_SESSION_ACTION_FIELDS: Readonly<Record<ProcessSessionAction, ReadonlySet<string>>> = {
+  read: new Set(["action", "session_id", "cursor", "max_chars", "yield_time_ms"]),
+  write: new Set(["action", "session_id", "chars", "add_newline"]),
+  stop: new Set(["action", "session_id"]),
+};
+
+function processSessionActionError(
+  action: ProcessSessionAction,
+  input: Record<string, unknown>,
+): string | null {
+  const unexpected = Object.keys(input)
+    .filter((key) => !Object.values(PROCESS_SESSION_ACTION_FIELDS).some((fields) => fields.has(key)))
+    .sort();
+  return unexpected.length
+    ? `E_BAD_INPUT: process_session(${action}) does not accept: ${unexpected.join(", ")}`
+    : null;
+}
+
+function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, includeManaged = true): ToolReadContinuation | undefined {
+  if (!input || input.action !== "read" || processSessionActionError("read", input)
+    || typeof input.session_id !== "string" || !input.session_id.trim()
+    || commandSessionWait(input.yield_time_ms) === null
+    || (input.cursor !== undefined && (typeof input.cursor !== "number" || !Number.isFinite(input.cursor)))
+    || (input.max_chars !== undefined && (typeof input.max_chars !== "number" || !Number.isFinite(input.max_chars) || input.max_chars < 1))) return undefined;
+  const managed = includeManaged ? inspectCommandRead(input, ctx) : undefined;
+  if (managed) return managed;
+  const session = ownedSession(ctx, input.session_id);
+  if (isToolResult(session)) return undefined;
+  const { effectiveCursor, maxChars } = readRange(session, input.cursor, input.max_chars);
+  const waitCursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
+  return {
+    version: JSON.stringify([session.id, effectiveCursor, Math.min(session.outputEnd, effectiveCursor + maxChars), session.status]),
+    waiting: !ctx.signal?.aborted && session.status === "running" && session.outputEnd <= waitCursor && (commandSessionWait(input.yield_time_ms) ?? 0) > 0,
+  };
+}
+
+/** Public lifecycle umbrella. The action discriminator removes three repeated
+ * tool definitions while the operation implementations above keep their
+ * focused validation and observations. The legacy exports remain available to
+ * non-model callers, but only this tool is advertised by the builtin registry. */
+export const processSessionTool: AgentTool = defineTool({
+  name: "process_session",
+  compatibilityInputFields: ["command", "max_lifetime_ms"],
+  description:
+    "Read, send input to, or stop a running shell session. Start commands with bash; use interactive_cli for user-entered secrets or OAuth.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["read", "write", "stop"],
+        description: "read: session_id/cursor; write: session_id/chars; stop: session_id. Known unused fields are ignored and listed in ignored_fields; session_id always selects the existing session.",
+      },
+      session_id: { type: "string", description: "Required for read, write, and stop." },
+      yield_time_ms: { type: "integer", minimum: 0, maximum: 30000, default: 10000, description: "Read only. Wait for new output or exit; zero polls immediately." },
+      cursor: { type: "number", description: "Read only. Previous next_cursor." },
+      max_chars: { type: "number", description: "Read only. Default 32000; maximum 64000." },
+      chars: { type: "string", description: "Write only. Known non-secret characters for stdin." },
+      add_newline: { type: "boolean", description: "Write only. Append a newline; default false." },
+    },
+    required: ["action", "session_id"],
+  },
+  executionMode: "parallel",
+  inspectReadContinuation: inspectProcessRead,
+  async execute(input, ctx) {
+    const action = String(input.action ?? "") as ProcessSessionAction;
+    if (!(["read", "write", "stop"] as const).includes(action)) {
+      return {
+        content: "E_BAD_INPUT: `action` must be read, write, or stop",
+        isError: true,
+      };
+    }
+    const fieldError = processSessionActionError(action, input);
+    if (fieldError) return { content: fieldError, isError: true };
+    const ignoredFields = Object.keys(input).filter((key) => !PROCESS_SESSION_ACTION_FIELDS[action].has(key)).sort();
+    const notice = ignoredFields.length ? `ignored_fields: ${JSON.stringify(ignoredFields)}\n` : "";
+    input = Object.fromEntries(Object.entries(input).filter(([key]) => PROCESS_SESSION_ACTION_FIELDS[action].has(key)));
+    const withNotice = (result: ToolResult): ToolResult => {
+      if (!notice) return result;
+      try {
+        const payload: unknown = JSON.parse(result.content);
+        if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+          return { ...result, content: JSON.stringify({ ...payload, ignored_fields: ignoredFields }) };
+        }
+      } catch { /* Preserve non-JSON errors with a text receipt. */ }
+      return { ...result, content: `${notice}${result.content}` };
+    };
+    if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
+      return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
+    }
+    const managed = await continueCommandSession(input, ctx);
+    if (managed) return withNotice(managed);
+    if (action === "read") return withNotice(await processReadTool.execute({ ...input, yield_time_ms: input.yield_time_ms ?? 10_000 }, ctx));
+    if (action === "write") return withNotice(await processWriteTool.execute(input, ctx));
+    if (action === "stop") return withNotice(await processStopTool.execute(input, ctx));
+    return processStopTool.execute(input, ctx);
+  },
+});
+
+export function getProcessSessionTools(): AgentTool[] {
+  return [processSessionTool];
+}
+
+/** A shell closing is not proof of exit: a descendant can release its pipes and
+ * stay in the process group. Windows has no group; its helper already sweeps the tree. */
+function processGroupAlive(pid: number | undefined): boolean {
+  if (process.platform === "win32" || !pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Host exit: stop every command this process still owns, across both registries,
+ * so that none outlives the app with no owner and no timeout. `run_in_background`
+ * is an explicit detach and is never registered here. Resolves within `budgetMs`,
+ * giving TERM most of it and promptly once the commands are gone.
+ */
+export async function stopAllProcessSessions(budgetMs = PROCESS_HOST_EXIT_BUDGET_MS): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  const termDeadline = deadline - Math.floor(budgetMs * 0.4);
+  const targets = stopCommandSessionsForHostExit();
+  for (const session of sessions.values()) {
+    if (session.status !== "running") continue;
+    killSession(session);
+    finishSession(session, "stopped", { signal: "agent" });
+    targets.push({
+      pid: () => session.child.pid,
+      settled: Promise.all([session.termination, waitForProcessClose(session, budgetMs)]),
+      kill: () => killProcessTree(session.child, "SIGKILL"),
+    });
+  }
+  if (!targets.length) return;
+  let settled = false;
+  void Promise.all(targets.map((target) => target.settled)).then(() => { settled = true; });
+  const stopped = () => settled && !targets.some((target) => processGroupAlive(target.pid()));
+  const waitUntil = async (time: number) => {
+    while (!stopped() && Date.now() < time) await new Promise((resolve) => setTimeout(resolve, 25));
+  };
+  await waitUntil(termDeadline);
+  if (!stopped() && process.platform !== "win32") for (const target of targets) target.kill();
+  await waitUntil(deadline);
+}
+
+/** Test-only cleanup; production sessions are retained by their lifecycle. */
+export async function _resetProcessSessionsForTest(): Promise<void> {
+  await resetCommandSessionsForTest();
+  const active = [...sessions.values()];
+  for (const session of active) {
+    if (session.status === "running") {
+      try { killProcessTree(session.child, "SIGKILL"); } catch { /* best effort */ }
+    }
+  }
+  await Promise.all(active.map(async (session) => {
+    await session.termination;
+    await waitForProcessClose(session, 2_000);
+  }));
+  for (const session of active) {
+    clearTimers(session);
+  }
+  sessions.clear();
+}

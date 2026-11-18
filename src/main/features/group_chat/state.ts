@@ -1,0 +1,1292 @@
+import { appConversationRoot } from '../../paths';
+/**
+ * Group-chat state — members.json + state.json IO + session id builders.
+ *
+ * Two small JSON files per conversation, both under
+ * `<uid>/cloud/chats/<cid>/`:
+ *
+ *   members.json — the current actor roster. Commander + user are seeded
+ *     when the conv is first sent to; agents auto-join the first time
+ *     they're @-mentioned.
+ *
+ *   state.json — `status` (idle / running / aborted), `last_active_at`,
+ *     and `in_flight` (which actor workers are currently running).
+ *     Updated by `bus.ts`; UI subscribes via the streamEvents channel.
+ *
+ * Reserved actor ids: `commander` (the orchestrator) and `user` (the human).
+ * Agent actor ids are the agent_id verbatim — collisions with reserved
+ * tokens are rejected by `safeId` ∩ "not in RESERVED" elsewhere.
+ */
+
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+import { Mutex } from 'async-mutex';
+
+import {
+  userChatsDir, projectChatIndexFile, userRunningConversationsFile,
+} from '../../paths';
+import { conversationLayout, listProjectIds } from '../../util/project-layout';
+import {
+  genId12, nowIso, readJson, writeJson, safeId,
+} from '../../storage';
+import { createLogger } from '../../logger';
+import { logErrorSummary, maskId } from '../../util/log-redact';
+
+import { readCodingDirectory, readCodingDirectoryFromStateFile, writeCodingDirectory, cloudConversationState } from '../local_agents/project-directory';
+
+const log = createLogger('group_chat.state');
+
+// ── Types ────────────────────────────────────────────────────────────────
+
+export type ActorKind = 'commander' | 'user' | 'agent' | 'worker';
+
+export interface Actor {
+  kind: ActorKind;
+  /** `commander` / `user` for the two reserved roles; agent_id otherwise. */
+  id: string;
+  /** Display name. Commander/user fall back to localized strings in UI. */
+  name?: string;
+  joined_at: string;
+}
+
+export interface MembersFile {
+  version: 1;
+  actors: Actor[];
+}
+
+export type GroupStatus = 'idle' | 'running' | 'aborted';
+
+export interface RunningConversationEntry {
+  conversation_id: string;
+  project_id?: string;
+}
+
+export interface RunningConversationRegistry {
+  version: 1;
+  items: RunningConversationEntry[];
+}
+
+export interface OrchestrationLedger {
+  version: 1;
+  id: string;
+  kind: 'suspended_orchestration';
+  status: 'waiting_for_agent' | 'waiting_for_form' | 'interrupted';
+  blocked_on: 'agent_handoff' | 'agent_form';
+  source_tool?: 'hand_off_to' | 'dispatch_to' | 'run_worker';
+  owner_agent_id: string;
+  owner_agent_name?: string;
+  form_id?: string;
+  user_goal: string;
+  handoff_message: string;
+  resume_instruction: string;
+  created_at: string;
+  updated_at: string;
+  interrupted_at?: string;
+  interrupt_message?: string;
+}
+
+/** In-memory receipt for one Commander-created Agent hand-off admission.
+ * The queue write lives in bus.ts, so callers retain this receipt until that
+ * write succeeds and use it to restore the prior floor/ledger on admission
+ * failure or a concurrent user abort. It is deliberately not persisted. */
+export interface AgentHandoffAdmission {
+  token: string;
+  ownerAgentId: string;
+  floorApplied: boolean;
+  ledgerApplied: boolean;
+  previousActiveRecipient?: string;
+  previousActiveRecipients?: string[];
+  previousActiveRecipientSource?: StateFile['active_recipient_source'];
+  previousLedger?: OrchestrationLedger;
+}
+
+export interface StateFile {
+  version: 1;
+  status: GroupStatus;
+  last_active_at: string;
+  /** Actor ids currently running their worker loop. */
+  in_flight: string[];
+  /** Optional causal identity for startup recovery. Legacy actor-only rosters
+   * remain readable; settlement removes the corresponding entry atomically. */
+  in_flight_turns?: Record<string, { turn_id: string; source_message_id: string }>;
+  /** Per-conversation workspace subdirectory basename (relative to the
+   *  user's root workspace). Lazily filled by `conv_workspace.ts` on the
+   *  first write_file in this conversation; **empty / missing → legacy
+   *  conversations stay at the root workspace** (no migration). Once set
+   *  it is **frozen** — renaming the conv title afterwards does not move
+   *  the directory or update this field. See `conv_workspace.ts` for the
+   *  slug rules and the placeholder fallback. */
+  workspace_dir?: string;
+  /** Device-local projection (never written to cloud state). Project directory for coding-agent dispatches in
+   *  this conversation. Initialised on the first coding-agent turn from
+   *  that agent's detail-page project-dir setting; missing setting =
+   *  effective workspace path. Absolute path. Missing / empty → coding
+   *  agents fall back to the conv's workspace root. The field is
+   *  per-conversation, NOT per-agent: one project for the whole
+   *  conversation across however many coding agents it has. */
+  coding_project_dir?: string;
+  /** True when the user picked `coding_project_dir` explicitly, either
+   *  via the agent detail page's custom project-dir setting at initial
+   *  conversation setup, or via the `<agent-input-form>` directory
+   *  picker (form-submit hook in `group_chat/index.ts`). Cleared
+   *  whenever `coding_project_dir` is cleared. */
+  coding_project_dir_explicit?: boolean;
+  /** Legacy selection without device provenance; never an execution root. */
+  coding_project_dir_pending?: string;
+  /** Conversation-scoped absolute roots for file tools. Used by narrow
+   *  system-created workflows such as sync-conflict resolution where the
+   *  target file lives outside the active workspace. */
+  tool_extra_roots?: string[];
+  /** The "floor": the actor a no-`@` user message currently routes to.
+   *  Absent ⇒ commander (the default orchestrator). Set to an agent id when
+   *  the commander hands the conversation off to that agent via `hand_off_to`
+   *  (so the user keeps talking to it without re-`@`-ing every message), and
+   *  reset to commander when the agent hands back, the user `@commander`s, or
+   *  the UI returns control. Server-authoritative + model-decided: it is the
+   *  single source of truth for "who the user is talking to", mirrored to the
+   *  renderer for free since `state_changed` carries the whole StateFile. */
+  active_recipient?: string;
+  /** Monotonic floor generation for snapshot ordering and stale release guards. */
+  active_recipient_revision?: number;
+  /** Explicit user-choice generation; automatic waits/releases do not advance it. */
+  active_recipient_choice_revision?: number;
+  active_recipient_handoff_id?: string;
+  /** Legacy multi-recipient defaults are read as Commander and removed on write. */
+  active_recipients?: string[];
+  /** Why the current floor was established. A direct user selection remains
+   *  sticky after a normal external-CLI completion; a Commander hand-off may
+   *  ask that Agent to return the floor when the handed-off interaction ends.
+   *  Missing is the legacy shape and retains Commander-hand-off behavior. */
+  active_recipient_source?: 'user_selection' | 'commander_handoff';
+  /** Lightweight suspended-orchestration state. This is deliberately NOT the
+   *  old plan DAG: it records only the interactive hand-off that is currently
+   *  blocking a larger commander-owned task, plus the instruction needed to
+   *  resume after the agent hands back. `active_recipient` answers "who gets
+   *  the next no-@ user message"; this answers "what commander task should be
+   *  resumed when that interaction completes." */
+  orchestration_ledger?: OrchestrationLedger;
+
+}
+
+export const COMMANDER_ID = 'commander';
+export const USER_ID = 'user';
+export const RESERVED_IDS: ReadonlySet<string> = new Set([COMMANDER_ID, USER_ID]);
+
+function _cleanLedgerText(v: unknown, max = 4000): string {
+  return String(typeof v === 'string' ? v : '')
+    .replace(/\0/g, '')
+    .trim()
+    .slice(0, max);
+}
+
+/** The existing ledger goal bound also applies to its host-owned source copy. */
+export function boundOrchestrationGoal(value: unknown): string {
+  return _cleanLedgerText(value);
+}
+
+function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const row = v as Record<string, unknown>;
+  const owner = typeof row.owner_agent_id === 'string' ? row.owner_agent_id.trim() : '';
+  if (!owner || !safeId(owner) || RESERVED_IDS.has(owner)) return undefined;
+  const status = row.status === 'interrupted'
+    ? 'interrupted'
+    : row.status === 'waiting_for_form'
+      ? 'waiting_for_form'
+      : 'waiting_for_agent';
+  const blocked_on = row.blocked_on === 'agent_form' || status === 'waiting_for_form'
+    ? 'agent_form'
+    : 'agent_handoff';
+  const sourceTool = row.source_tool === 'hand_off_to' || row.source_tool === 'dispatch_to' || row.source_tool === 'run_worker'
+    ? row.source_tool
+    : undefined;
+  const formId = typeof row.form_id === 'string' && /^[a-f0-9]{8,64}$/.test(row.form_id)
+    ? row.form_id
+    : undefined;
+  const id = typeof row.id === 'string' && /^[A-Za-z0-9_.-]+$/.test(row.id) ? row.id : genId12();
+  const now = nowIso();
+  const user_goal = _cleanLedgerText(row.user_goal);
+  const handoff_message = _cleanLedgerText(row.handoff_message);
+  const resume_instruction = _cleanLedgerText(row.resume_instruction);
+  if (!resume_instruction) return undefined;
+  return {
+    version: 1,
+    id,
+    kind: 'suspended_orchestration',
+    status,
+    blocked_on,
+    ...(sourceTool ? { source_tool: sourceTool } : {}),
+    owner_agent_id: owner,
+    ...(formId ? { form_id: formId } : {}),
+    ...(typeof row.owner_agent_name === 'string' && row.owner_agent_name.trim()
+      ? { owner_agent_name: _cleanLedgerText(row.owner_agent_name, 200) }
+      : {}),
+    user_goal,
+    handoff_message,
+    resume_instruction,
+    created_at: typeof row.created_at === 'string' && row.created_at ? row.created_at : now,
+    updated_at: typeof row.updated_at === 'string' && row.updated_at ? row.updated_at : now,
+    ...(typeof row.interrupted_at === 'string' && row.interrupted_at ? { interrupted_at: row.interrupted_at } : {}),
+    ...(typeof row.interrupt_message === 'string' && row.interrupt_message.trim()
+      ? { interrupt_message: _cleanLedgerText(row.interrupt_message) }
+      : {}),
+  };
+}
+
+// ── session_id builders ──────────────────────────────────────────────────
+// Format: `<kind>-<tail>` (CLAUDE.md §5). User scoping comes from the path root
+// (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl`), not from the session_id.
+
+/** Commander session — one per conversation, shared across all turns. */
+export function buildGconvSessionId(cid: string): string {
+  return `gconv-${cid}`;
+}
+
+/** Per-agent session — one per (conv, agent), shared across all the agent's
+ * turns in that conv. */
+export function buildGmemberSessionId(cid: string, agentId: string): string {
+  return `gmember-${cid}-${agentId}`;
+}
+
+/** Ephemeral anonymous-worker session (G8b). One per spun-up worker; throwaway
+ * — lands under `local/sessions/` (machine-private, GC'd, never synced) since
+ * the worker is one-shot and explicitly purged after it hands its result back
+ * to the commander. The `gworker` kind is registered as ephemeral in
+ * `session-store.ts`. */
+export function buildGworkerSessionId(cid: string, workerId: string): string {
+  return `gworker-${cid}-${workerId}`;
+}
+
+/** Resolve an actor's session id from its kind/id. The user actor has no
+ * session — it's the human. Throws on unknown kind. */
+export function actorSessionId(cid: string, actor: Actor): string {
+  if (actor.kind === 'commander') return buildGconvSessionId(cid);
+  if (actor.kind === 'agent') return buildGmemberSessionId(cid, actor.id);
+  if (actor.kind === 'worker') return buildGworkerSessionId(cid, actor.id);
+  throw new Error(`actor ${actor.kind}/${actor.id} has no session`);
+}
+
+// ── Members IO ───────────────────────────────────────────────────────────
+
+function ensureGroupDir(uid: string, cid: string, projectIdHint?: string | null): string {
+  const d = conversationLayout(uid, cid, projectIdHint).groupDir;
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+/** Per-Agent `visibility/` slices were derived copies of the canonical log;
+ *  the code that wrote and read them is gone, but existing conversations still
+ *  carry the directory (private data, never updated, still synced). Sweep it
+ *  once per process the first time a conversation's roster is read. */
+const _sweptLegacyVisibility = new Set<string>();
+
+function sweepLegacyVisibilityDir(uid: string, cid: string, groupDir: string): void {
+  const key = `${uid}\u0000${cid}`;
+  if (_sweptLegacyVisibility.has(key)) return;
+  _sweptLegacyVisibility.add(key);
+  const dir = path.join(groupDir, 'visibility');
+  if (!fs.existsSync(dir)) return;
+  void fsp.rm(dir, { recursive: true, force: true }).then(
+    () => log.info('legacy visibility slices removed', { cid: maskId(cid) }),
+    (err: unknown) => log.warn('legacy visibility sweep failed', { cid: maskId(cid), error: logErrorSummary(err) }),
+  );
+}
+
+export function _resetLegacyVisibilitySweepForTest(): void {
+  _sweptLegacyVisibility.clear();
+}
+
+export async function readMembers(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<MembersFile> {
+  const layout = conversationLayout(uid, cid, projectIdHint);
+  sweepLegacyVisibilityDir(uid, cid, layout.groupDir);
+  const file = layout.membersFile;
+  if (!fs.existsSync(file)) return { version: 1, actors: [] };
+  try {
+    const data: any = await readJson(file);
+    if (data && typeof data === 'object' && Array.isArray(data.actors)) {
+      return { version: 1, actors: data.actors as Actor[] };
+    }
+  } catch (err) {
+    log.warn(`read members failed user=${uid} cid=${cid}: ${(err as Error).message}`);
+  }
+  return { version: 1, actors: [] };
+}
+
+async function writeMembers(
+  uid: string,
+  cid: string,
+  m: MembersFile,
+  projectIdHint?: string | null,
+): Promise<void> {
+  ensureGroupDir(uid, cid, projectIdHint);
+  await writeJson(conversationLayout(uid, cid, projectIdHint).membersFile, m);
+}
+
+/** Idempotent. Returns true if the actor was newly added.
+ *
+ *  Mutex-guarded against concurrent callers — `groupChat.send` and
+ *  `streamEvents` both call `seedReservedActors` on the same microtask
+ *  cycle when the user submits the very first message of a new conv, and
+ *  without serialisation the two `addMember(commander)` calls race on the
+ *  members.json tmp-rename, surfacing as
+ *  `ENOENT: ... members.json.tmp -> members.json` and killing the stream.
+ *  Reuses `_stateLock` because it's already per-`(uid,cid)` and members
+ *  shares the cid scope. */
+export async function addMember(
+  uid: string,
+  cid: string,
+  actor: Omit<Actor, 'joined_at'>,
+  projectIdHint?: string | null,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const members = await readMembers(uid, cid, projectIdHint);
+    if (members.actors.find((a) => a.id === actor.id)) return false;
+    const next: Actor = { ...actor, joined_at: nowIso() };
+    members.actors.push(next);
+    await writeMembers(uid, cid, members, projectIdHint);
+    log.info('member-joined', { uid: maskId(uid), cid: maskId(cid), actor: actor.id, kind: actor.kind });
+    return true;
+  });
+}
+
+/** Seed commander + user at conv creation / first activity. Idempotent. */
+export async function seedReservedActors(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<void> {
+  await addMember(uid, cid, { kind: 'commander', id: COMMANDER_ID, name: 'Commander' }, projectIdHint);
+  await addMember(uid, cid, { kind: 'user', id: USER_ID, name: 'User' }, projectIdHint);
+}
+
+export async function findActor(uid: string, cid: string, actorId: string): Promise<Actor | null> {
+  const m = await readMembers(uid, cid);
+  return m.actors.find((a) => a.id === actorId) || null;
+}
+
+export async function isMember(uid: string, cid: string, actorId: string): Promise<boolean> {
+  return (await findActor(uid, cid, actorId)) !== null;
+}
+
+/** Lazy-add an agent actor; called by router when @<aid> resolves to an
+ * unknown-but-valid agent. Returns true if the actor was newly added. */
+export async function ensureAgentMember(
+  uid: string, cid: string, agentId: string, name?: string,
+): Promise<boolean> {
+  if (!safeId(agentId) || RESERVED_IDS.has(agentId)) return false;
+  return addMember(uid, cid, { kind: 'agent', id: agentId, ...(name ? { name } : {}) });
+}
+
+/** Sync an agent's display name into every conversation roster that already
+ *  has it as a member. Called by `agents.updateCustomAgent` when the name
+ *  changes — without it, the @-router's roster-first lookup keeps resolving
+ *  on the snapshot copied at member-join time, so old conversations would
+ *  still respond to `@<old-name>`. Returns the number of rosters touched. */
+export async function renameAgentInMembers(
+  uid: string, agentId: string, newName: string,
+): Promise<number> {
+  if (!uid || !safeId(agentId) || RESERVED_IDS.has(agentId) || !newName) return 0;
+  const indexFiles = [
+    path.join(userChatsDir(uid), '_index.json'),
+    ...listProjectIds(uid).map((pid) => projectChatIndexFile(uid, pid)),
+  ];
+  const cids = new Set<string>();
+  try {
+    for (const indexFile of indexFiles) {
+      if (!fs.existsSync(indexFile)) continue;
+      const data: any = await readJson(indexFile);
+      const items: any[] = Array.isArray(data) ? data
+        : (data && Array.isArray(data.items) ? data.items : []);
+      for (const item of items) {
+        const cid = item && typeof item.conversation_id === 'string' ? item.conversation_id : '';
+        if (cid && safeId(cid)) cids.add(cid);
+      }
+    }
+  } catch (err) {
+    log.warn(`read conv index failed user=${uid}: ${(err as Error).message}`);
+    return 0;
+  }
+  let touched = 0;
+  for (const cid of cids) {
+    const file = conversationLayout(uid, cid).membersFile;
+    if (!fs.existsSync(file)) continue;
+    let m: MembersFile;
+    try { m = await readMembers(uid, cid); }
+    catch { continue; }
+    const actor = m.actors.find((a) => a.id === agentId);
+    if (!actor || actor.name === newName) continue;
+    actor.name = newName;
+    try {
+      await writeMembers(uid, cid, m);
+      touched += 1;
+    } catch (err) {
+      log.warn(`write members failed user=${uid} cid=${cid}: ${(err as Error).message}`);
+    }
+  }
+  if (touched > 0) log.info('renamed agent in members', { uid: maskId(uid), agent: agentId, conversations: touched });
+  return touched;
+}
+
+// ── State IO ─────────────────────────────────────────────────────────────
+
+/** Shared decoding for the normal state reader and raw startup snapshots. */
+export function parseInFlightTurns(inFlight: unknown, value: unknown): StateFile['in_flight_turns'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const roster = new Set(Array.isArray(inFlight) ? inFlight : []);
+  const entries = Object.entries(value).filter(([actor, row]) => {
+    const turn = row as Record<string, unknown> | null;
+    return safeId(actor) && actor !== USER_ID && roster.has(actor)
+      && turn && typeof turn.turn_id === 'string' && safeId(turn.turn_id)
+      && typeof turn.source_message_id === 'string' && safeId(turn.source_message_id);
+  }).map(([actor, row]) => {
+    const turn = row as NonNullable<StateFile['in_flight_turns']>[string];
+    return [actor, { turn_id: turn.turn_id, source_message_id: turn.source_message_id }];
+  });
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+export async function readState(uid: string, cid: string, projectIdHint?: string | null, opts?: { strict?: boolean }): Promise<StateFile> {
+  const cloud = await readCloudState(uid, cid, projectIdHint, opts);
+  return { ...cloudConversationState(cloud),
+    ...readCodingDirectoryFromStateFile(uid, cid, conversationLayout(uid, cid, projectIdHint).stateFile),
+  };
+}
+
+async function readCloudState(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+  opts?: { strict?: boolean },
+): Promise<StateFile> {
+  const file = conversationLayout(uid, cid, projectIdHint).stateFile;
+  if (!opts?.strict && !fs.existsSync(file)) {
+    return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
+  }
+  try {
+    const data: any = await readJson(file, opts);
+    if (opts?.strict && (!data || typeof data !== 'object' || Array.isArray(data))) {
+      throw new Error('Conversation state is invalid');
+    }
+    if (data && typeof data === 'object') {
+      const orchestrationLedger = _sanitizeOrchestrationLedger(data.orchestration_ledger);
+      const inFlightTurns = parseInFlightTurns(data.in_flight, data.in_flight_turns);
+      const recipients = Array.isArray(data.active_recipients)
+        ? [...new Set<string>(data.active_recipients.filter((id: unknown) => (
+            typeof id === 'string' && safeId(id) && id !== USER_ID
+          )))] : [];
+      return {
+        version: 1,
+        ...(typeof data.active_recipient_handoff_id === 'string' ? { active_recipient_handoff_id: data.active_recipient_handoff_id } : {}),
+        active_recipient_revision: Number.isSafeInteger(data.active_recipient_revision) ? data.active_recipient_revision : 0,
+        // Legacy files conservatively treat their last floor change as a choice.
+        active_recipient_choice_revision: Number.isSafeInteger(data.active_recipient_choice_revision)
+          ? data.active_recipient_choice_revision
+          : Number.isSafeInteger(data.active_recipient_revision) ? data.active_recipient_revision : 0,
+        status: (data.status as GroupStatus) || 'idle',
+        last_active_at: typeof data.last_active_at === 'string' ? data.last_active_at : nowIso(),
+        in_flight: Array.isArray(data.in_flight) ? data.in_flight.filter((s: unknown) => typeof s === 'string') : [],
+        ...(inFlightTurns ? { in_flight_turns: inFlightTurns } : {}),
+        ...(typeof data.workspace_dir === 'string' && data.workspace_dir
+          ? { workspace_dir: data.workspace_dir }
+          : {}),
+        ...(typeof data.coding_project_dir === 'string' && data.coding_project_dir
+          ? { coding_project_dir: data.coding_project_dir }
+          : {}),
+        ...(typeof data.coding_project_dir_explicit === 'boolean'
+          ? { coding_project_dir_explicit: data.coding_project_dir_explicit }
+          : {}),
+        ...(Array.isArray(data.tool_extra_roots)
+          ? { tool_extra_roots: data.tool_extra_roots.filter((s: unknown) => (
+              typeof s === 'string' && path.isAbsolute(s)
+            )) }
+          : {}),
+        ...(recipients.length > 1 ? {} : typeof data.active_recipient === 'string' && data.active_recipient
+          && data.active_recipient !== COMMANDER_ID
+          ? {
+              active_recipient: data.active_recipient,
+              ...(data.active_recipient_source === 'user_selection'
+                || data.active_recipient_source === 'commander_handoff'
+                ? { active_recipient_source: data.active_recipient_source }
+                : {}),
+            }
+          : {}),
+        ...(orchestrationLedger ? { orchestration_ledger: orchestrationLedger } : {}),
+      };
+    }
+  } catch (err) {
+    if (opts?.strict) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
+    }
+    log.warn(`read state failed user=${uid} cid=${cid}: ${(err as Error).message}`);
+  }
+  return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
+}
+
+async function writeStateRaw(uid: string, cid: string, s: StateFile): Promise<void> {
+  ensureGroupDir(uid, cid);
+  await writeJson(conversationLayout(uid, cid).stateFile, cloudConversationState(s));
+}
+
+// A compact local journal makes boot crash recovery proportional to the
+// number of turns that were running at shutdown instead of total history.
+// Per-user serialisation prevents two conversations starting/stopping at the
+// same time from losing each other's registry update.
+const _runningRegistryMutex = new Map<string, Mutex>();
+function _runningRegistryLock(uid: string): Mutex {
+  let m = _runningRegistryMutex.get(uid);
+  if (!m) { m = new Mutex(); _runningRegistryMutex.set(uid, m); }
+  return m;
+}
+
+function _sanitizeRunningRegistry(data: unknown): RunningConversationRegistry | null {
+  const row = data as Record<string, unknown> | null;
+  if (!row || row.version !== 1 || !Array.isArray(row.items)) return null;
+  const seen = new Set<string>();
+  const items: RunningConversationEntry[] = [];
+  for (const raw of row.items) {
+    const item = raw as Record<string, unknown> | null;
+    const cid = typeof item?.conversation_id === 'string' ? item.conversation_id : '';
+    if (!safeId(cid)) return null;
+    if (seen.has(cid)) continue;
+    seen.add(cid);
+    if (item?.project_id !== undefined
+      && (typeof item.project_id !== 'string' || !safeId(item.project_id))) return null;
+    const pid = typeof item?.project_id === 'string' ? item.project_id : '';
+    items.push({ conversation_id: cid, ...(pid ? { project_id: pid } : {}) });
+  }
+  return { version: 1, items };
+}
+
+async function _readRunningRegistry(uid: string): Promise<RunningConversationRegistry | null> {
+  try {
+    return _sanitizeRunningRegistry(await readJson(userRunningConversationsFile(uid)));
+  } catch {
+    return null;
+  }
+}
+
+/** Read the compact boot journal. `valid=false` requests a one-time indexed
+ * migration scan for installs upgrading from before the journal existed. */
+export async function readRunningConversationRegistry(
+  uid: string,
+): Promise<{ valid: boolean; items: RunningConversationEntry[] }> {
+  return _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid);
+    return registry
+      ? { valid: true, items: registry.items }
+      : { valid: false, items: [] };
+  });
+}
+
+/** Establish an empty valid journal without overwriting a concurrently
+ * created entry. Used after the one-time migration fallback is selected. */
+export async function ensureRunningConversationRegistry(uid: string): Promise<void> {
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    if (await _readRunningRegistry(uid)) return;
+    await writeJson(userRunningConversationsFile(uid), { version: 1, items: [] });
+  });
+}
+
+async function _trackRunningConversation(uid: string, cid: string): Promise<void> {
+  if (appConversationRoot(uid, cid)) return;
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid) || { version: 1 as const, items: [] };
+    const layout = conversationLayout(uid, cid);
+    const next: RunningConversationEntry = {
+      conversation_id: cid,
+      ...(layout.projectId ? { project_id: layout.projectId } : {}),
+    };
+    const index = registry.items.findIndex((item) => item.conversation_id === cid);
+    if (index >= 0
+      && registry.items[index].project_id === next.project_id) return;
+    if (index >= 0) registry.items[index] = next;
+    else registry.items.push(next);
+    await writeJson(userRunningConversationsFile(uid), registry);
+  });
+}
+
+export async function untrackRunningConversation(uid: string, cid: string): Promise<void> {
+  if (appConversationRoot(uid, cid)) return;
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid);
+    if (!registry) return;
+    const items = registry.items.filter((item) => item.conversation_id !== cid);
+    if (items.length === registry.items.length) return;
+    await writeJson(userRunningConversationsFile(uid), { version: 1, items });
+  });
+}
+
+async function _writeStatusTransition(
+  uid: string, cid: string, current: GroupStatus, next: GroupStatus, state: StateFile,
+): Promise<void> {
+  // Register before persisting `running`: a crash can leave an extra journal
+  // row (self-healing), but must never leave an untracked running state.
+  if (current !== 'running' && next === 'running') {
+    await _trackRunningConversation(uid, cid);
+  }
+  await writeStateRaw(uid, cid, state);
+  // Persist non-running state before removing the row for the same reason.
+  if (current === 'running' && next !== 'running') {
+    await untrackRunningConversation(uid, cid);
+  }
+}
+
+// Per-cid serialisation lock for state.json read-modify-write. Without
+// it, concurrent `setStatus` / `markInFlight` calls (e.g. abort racing
+// against a worker's turn-start `_syncStateStatus(forceRunning)`) can
+// both read the same baseline, both write, and the slower one's write
+// wins — silently overwriting the other's intent. async-mutex serialises
+// per-cid and is already in the dep whitelist (used elsewhere for jsonl
+// append). Lazy create so we only pay for cids that actually see traffic.
+const _stateMutex = new Map<string, Mutex>();
+function _stateLock(uid: string, cid: string): Mutex {
+  const k = `${uid}:${cid}`;
+  let m = _stateMutex.get(k);
+  if (!m) { m = new Mutex(); _stateMutex.set(k, m); }
+  return m;
+}
+
+export async function setStatus(uid: string, cid: string, status: GroupStatus): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const current = s.status;
+    s.status = status;
+    s.last_active_at = nowIso();
+    if (status !== 'running') { s.in_flight = []; delete s.in_flight_turns; }
+    await _writeStatusTransition(uid, cid, current, status, s);
+    return s;
+  });
+}
+
+/** Recheck both state owners under the existing writer lock. A status query
+ * may have read `running` before normal finalization or a user cancellation;
+ * it must not overwrite either, or a newly admitted turn, from that snapshot. */
+export async function recoverOrphanRunningState(
+  uid: string, cid: string, isRuntimeIdle: () => boolean,
+): Promise<{ recovered: boolean; state: StateFile }> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if ((s.status !== 'running' && !s.in_flight.some(Boolean)) || !isRuntimeIdle()) {
+      return { recovered: false, state: s };
+    }
+    const current = s.status;
+    // Cancellation is sticky even if an orphan roster also needs clearing.
+    s.status = current === 'aborted' ? 'aborted' : 'idle';
+    s.in_flight = [];
+    delete s.in_flight_turns;
+    s.last_active_at = nowIso();
+    await _writeStatusTransition(uid, cid, current, s.status, s);
+    return { recovered: true, state: s };
+  });
+}
+
+/** Atomic read-decide-write status transition. The `decide` callback runs
+ *  with the lock held and the current status passed in; return the new
+ *  status or `null` to leave it unchanged. Callers needing "set X only if
+ *  Y" semantics use this so the read + decision can't race a concurrent
+ *  writer (e.g. `_syncStateStatus` deciding 'running' vs 'idle' must NOT
+ *  override an `abort` that happened in the meantime). */
+export async function transitionStatus(
+  uid: string, cid: string,
+  decide: (cur: GroupStatus) => GroupStatus | null,
+): Promise<{ changed: boolean; state: StateFile }> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const cur = s.status;
+    const next = decide(cur);
+    if (next === null || next === cur) return { changed: false, state: s };
+    s.status = next;
+    s.last_active_at = nowIso();
+    if (next !== 'running') { s.in_flight = []; delete s.in_flight_turns; }
+    await _writeStatusTransition(uid, cid, cur, next, s);
+    return { changed: true, state: s };
+  });
+}
+
+/** Set the conversation floor (`active_recipient`). Pass an agent id to hand the
+ *  user off to that agent; pass `commander` / `user` / empty to reset the floor
+ *  to the commander (stored as absence). `source` is supplied only when the
+ *  caller establishes a new ownership reason; same-recipient follow-ups preserve
+ *  the existing source. Mutex-guarded like `setStatus` so a hand-off can't race
+ *  a concurrent status write. Returns the new state. */
+export async function setActiveRecipient(
+  uid: string,
+  cid: string,
+  recipientId: string,
+  source?: StateFile['active_recipient_source'],
+  expectedRevision?: number,
+  onApplied?: (state: StateFile) => void,
+): Promise<StateFile> {
+  return setActiveRecipients(uid, cid, [recipientId], source, expectedRevision, onApplied);
+}
+
+/** Persist a single default atomically; multi-recipient sends return to Commander. */
+export async function setActiveRecipients(
+  uid: string,
+  cid: string,
+  recipientIds: string[],
+  source?: StateFile['active_recipient_source'],
+  expectedRevision?: number,
+  onApplied?: (state: StateFile) => void,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (expectedRevision !== undefined && (s.active_recipient_revision || 0) !== expectedRevision) return s;
+    const ids = [...new Set(recipientIds.filter((id) => id && id !== USER_ID))];
+    const recipientId = ids.length === 1 ? ids[0] : '';
+    const next = (recipientId && recipientId !== COMMANDER_ID && recipientId !== USER_ID)
+      ? recipientId : '';
+    const previous = s.active_recipient || '';
+    delete s.active_recipients;
+    if (next) {
+      s.active_recipient = next;
+      if (source) s.active_recipient_source = source;
+      else if (previous !== next) delete s.active_recipient_source;
+    } else {
+      delete s.active_recipient;
+      delete s.active_recipient_source;
+    }
+    if (source === 'user_selection') {
+      s.active_recipient_choice_revision = (s.active_recipient_choice_revision || 0) + 1;
+    }
+    if (source || previous !== next) {
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+      delete s.active_recipient_handoff_id;
+    }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    onApplied?.(s);
+    return s;
+  });
+}
+
+export async function setOrchestrationLedger(
+  uid: string,
+  cid: string,
+  ledger: Omit<OrchestrationLedger, 'version' | 'id' | 'kind' | 'status' | 'created_at' | 'updated_at'>
+    & Partial<Pick<OrchestrationLedger, 'id' | 'status' | 'created_at'>>,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const now = nowIso();
+    s.orchestration_ledger = _buildOrchestrationLedger(ledger, now);
+    s.last_active_at = now;
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+type OrchestrationLedgerInput = Parameters<typeof setOrchestrationLedger>[2];
+
+function _buildOrchestrationLedger(ledger: OrchestrationLedgerInput, now: string): OrchestrationLedger {
+  return {
+    version: 1,
+    id: ledger.id || genId12(),
+    kind: 'suspended_orchestration',
+    status: ledger.status || 'waiting_for_agent',
+    blocked_on: ledger.blocked_on,
+    ...(ledger.source_tool ? { source_tool: ledger.source_tool } : {}),
+    owner_agent_id: ledger.owner_agent_id,
+    ...(ledger.form_id ? { form_id: ledger.form_id } : {}),
+    ...(ledger.owner_agent_name ? { owner_agent_name: ledger.owner_agent_name } : {}),
+    user_goal: _cleanLedgerText(ledger.user_goal),
+    handoff_message: _cleanLedgerText(ledger.handoff_message),
+    resume_instruction: _cleanLedgerText(ledger.resume_instruction),
+    created_at: ledger.created_at || now,
+    updated_at: now,
+  };
+}
+
+/** Record a suspended orchestration only while the single state slot is free
+ * or already belongs to the same Agent. Parallel waits keep their resume on
+ * their own task row; this slot is the compatibility mirror that the
+ * Commander prompt and explicit handbacks read. */
+export async function setOrchestrationLedgerIfFree(
+  uid: string,
+  cid: string,
+  ledger: OrchestrationLedgerInput,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.orchestration_ledger && s.orchestration_ledger.owner_agent_id !== ledger.owner_agent_id) return false;
+    const now = nowIso();
+    s.orchestration_ledger = _buildOrchestrationLedger(ledger, now);
+    s.last_active_at = now;
+    await writeStateRaw(uid, cid, s);
+    return true;
+  });
+}
+
+/** Floor binding for an Agent task waiting for a user reply or form. */
+export function waitingFloorBinding(taskId: string): string {
+  return `wait:${taskId}`;
+}
+
+/** Give a free floor to a waiting Agent, or bind its existing automatic floor, so the
+ * user's next mention-less reply reaches that Agent instead of Commander.
+ * A floor someone already holds is never taken: the first Agent to ask keeps
+ * it until its task is done. */
+export async function claimFloorForWaitingTask(
+  uid: string,
+  cid: string,
+  agentId: string,
+  taskId: string,
+  expectedChoiceRevision?: number,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (expectedChoiceRevision !== undefined
+      && expectedChoiceRevision !== (s.active_recipient_choice_revision || 0)) return false;
+    if (s.active_recipients?.length || (s.active_recipient
+      && (s.active_recipient !== agentId || s.active_recipient_source === 'user_selection'))) return false;
+    if (s.active_recipient_handoff_id === waitingFloorBinding(taskId)) return false;
+    s.active_recipient = agentId;
+    s.active_recipient_source = 'commander_handoff';
+    s.active_recipient_handoff_id = waitingFloorBinding(taskId);
+    s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return true;
+  });
+}
+
+/** Return a floor taken by `claimFloorForWaitingTask` once that task is done.
+ * A floor the user or a hand-off has since re-assigned is left alone. */
+export async function releaseWaitingFloor(
+  uid: string,
+  cid: string,
+  agentId: string,
+  taskId: string,
+  expectedRevision?: number,
+  handoffBinding?: string,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (expectedRevision !== undefined && expectedRevision !== (s.active_recipient_revision || 0)) return false;
+    if (
+      s.active_recipient !== agentId
+      || s.active_recipient_source !== 'commander_handoff'
+      || (s.active_recipient_handoff_id !== waitingFloorBinding(taskId)
+        && (!handoffBinding || s.active_recipient_handoff_id !== handoffBinding))
+    ) return false;
+    delete s.active_recipient;
+    delete s.active_recipient_source;
+    delete s.active_recipient_handoff_id;
+    s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return true;
+  });
+}
+
+/** Atomically establish the durable state for a scheduled `hand_off_to`.
+ * Agent execution is admitted separately by the conversation FIFO; keeping
+ * the state mutation under one lock prevents a visible floor with no matching
+ * resume ledger. The returned receipt owns rollback until queue admission has
+ * completed. */
+export async function beginAgentHandoff(
+  uid: string,
+  cid: string,
+  params: {
+    ownerAgentId: string;
+    ownerAgentName?: string;
+    claimFloor: boolean;
+    expectedChoiceRevision?: number;
+    userGoal: string;
+    handoffMessage: string;
+    resumeInstruction?: string;
+  },
+): Promise<AgentHandoffAdmission> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.status === 'aborted') {
+      throw Object.assign(new Error('conversation was cancelled before hand-off admission'), {
+        code: 'E_HANDOFF_CANCELLED',
+      });
+    }
+    const token = genId12();
+    const previousLedger = s.orchestration_ledger
+      ? { ...s.orchestration_ledger }
+      : undefined;
+    const receipt: AgentHandoffAdmission = {
+      token,
+      ownerAgentId: params.ownerAgentId,
+      floorApplied: params.claimFloor
+        && !s.active_recipient
+        && (params.expectedChoiceRevision === undefined
+          || params.expectedChoiceRevision === (s.active_recipient_choice_revision || 0)),
+      ledgerApplied: !!params.resumeInstruction?.trim(),
+      ...(s.active_recipient ? { previousActiveRecipient: s.active_recipient } : {}),
+      ...(s.active_recipients ? { previousActiveRecipients: [...s.active_recipients] } : {}),
+      ...(s.active_recipient_source
+        ? { previousActiveRecipientSource: s.active_recipient_source }
+        : {}),
+      ...(previousLedger ? { previousLedger } : {}),
+    };
+    if (receipt.floorApplied) {
+      delete s.active_recipients;
+      s.active_recipient = params.ownerAgentId;
+      s.active_recipient_source = 'commander_handoff';
+      s.active_recipient_handoff_id = token;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+    }
+    const resumeInstruction = _cleanLedgerText(params.resumeInstruction || '');
+    if (resumeInstruction) {
+      const now = nowIso();
+      s.orchestration_ledger = {
+        version: 1,
+        id: token,
+        kind: 'suspended_orchestration',
+        status: 'waiting_for_agent',
+        blocked_on: 'agent_handoff',
+        source_tool: 'hand_off_to',
+        owner_agent_id: params.ownerAgentId,
+        ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
+        user_goal: _cleanLedgerText(params.userGoal),
+        handoff_message: _cleanLedgerText(params.handoffMessage),
+        resume_instruction: resumeInstruction,
+        created_at: now,
+        updated_at: now,
+      };
+    }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return receipt;
+  });
+}
+
+/** Best-effort rollback for a hand-off whose queue admission did not finish.
+ * Restore only state still owned by this receipt; a user-selected floor or a
+ * newer orchestration always wins. An interrupted receipt is removed rather
+ * than resurrecting an older suspended flow after the user's intervention. */
+export async function rollbackAgentHandoff(
+  uid: string,
+  cid: string,
+  receipt: AgentHandoffAdmission,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    let changed = false;
+    if (
+      receipt.floorApplied
+      && s.active_recipient === receipt.ownerAgentId
+      && s.active_recipient_source === 'commander_handoff'
+      && s.active_recipient_handoff_id === receipt.token
+    ) {
+      delete s.active_recipient_handoff_id;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+      if (receipt.previousActiveRecipients) {
+        s.active_recipients = [...receipt.previousActiveRecipients];
+        delete s.active_recipient;
+        s.active_recipient_source = 'user_selection';
+      } else if (receipt.previousActiveRecipient) {
+        s.active_recipient = receipt.previousActiveRecipient;
+        if (receipt.previousActiveRecipientSource) {
+          s.active_recipient_source = receipt.previousActiveRecipientSource;
+        } else {
+          delete s.active_recipient_source;
+        }
+      } else {
+        delete s.active_recipient;
+        delete s.active_recipient_source;
+      }
+      changed = true;
+    }
+    if (receipt.ledgerApplied && s.orchestration_ledger?.id === receipt.token) {
+      if (s.orchestration_ledger.status === 'interrupted') {
+        delete s.orchestration_ledger;
+      } else if (receipt.previousLedger) {
+        s.orchestration_ledger = { ...receipt.previousLedger };
+      } else {
+        delete s.orchestration_ledger;
+      }
+      changed = true;
+    }
+    if (changed) {
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
+/** Clear only Commander-owned suspended hand-off state on explicit task
+ * cancellation. A floor selected directly by the user remains sticky. */
+export async function clearOrchestrationForCancellation(
+  uid: string,
+  cid: string,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    let changed = false;
+    if (s.orchestration_ledger) {
+      delete s.orchestration_ledger;
+      changed = true;
+    }
+    if (s.active_recipient_source === 'commander_handoff') {
+      delete s.active_recipient;
+      delete s.active_recipient_source;
+      delete s.active_recipient_handoff_id;
+      s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+      changed = true;
+    }
+    if (changed) {
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
+export async function clearOrchestrationLedger(uid: string, cid: string): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+export async function markOrchestrationInterrupted(
+  uid: string,
+  cid: string,
+  interruptMessage: string,
+  ownerAgentId?: string,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (
+      s.orchestration_ledger
+      && s.orchestration_ledger.status !== 'interrupted'
+      && (!ownerAgentId || s.orchestration_ledger.owner_agent_id === ownerAgentId)
+    ) {
+      const now = nowIso();
+      s.orchestration_ledger = {
+        ...s.orchestration_ledger,
+        status: 'interrupted',
+        interrupt_message: _cleanLedgerText(interruptMessage),
+        interrupted_at: now,
+        updated_at: now,
+      };
+      s.last_active_at = now;
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
+export async function takeOrchestrationLedgerForAgent(
+  uid: string,
+  cid: string,
+  agentId: string,
+  expectedLedgerId?: string,
+): Promise<OrchestrationLedger | null> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const ledger = s.orchestration_ledger;
+    if (!ledger || ledger.owner_agent_id !== agentId || ledger.status !== 'waiting_for_agent'
+      || (expectedLedgerId !== undefined && ledger.id !== expectedLedgerId)) return null;
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return ledger;
+  });
+}
+
+export async function takeOrchestrationLedgerForForm(
+  uid: string,
+  cid: string,
+  agentId: string,
+  formId: string,
+): Promise<OrchestrationLedger | null> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const ledger = s.orchestration_ledger;
+    if (
+      !ledger
+      || ledger.owner_agent_id !== agentId
+      || ledger.status !== 'waiting_for_form'
+      || (ledger.form_id && ledger.form_id !== formId)
+    ) return null;
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return ledger;
+  });
+}
+
+/** Add / remove an actor from the in_flight roster. **Does NOT touch
+ *  `status`** — status is owned by `bus.ts::_syncStateStatus` which has
+ *  visibility into queue state too. Touching status here would race the
+ *  post-turn enqueue: turn ends → markInFlight(false) → status briefly
+ *  flips to 'idle' before the next worker picks up its queued item, and
+ *  any IPC consumer watching for 'idle' would break out prematurely.
+ *
+ *  Mutex-guarded against concurrent `setStatus` so the "read s, mutate
+ *  in_flight, write s" cycle doesn't lose status changes that landed
+ *  while we held a stale `s` snapshot. */
+export async function markInFlight(
+  uid: string, cid: string, actorId: string, running: boolean,
+  turn?: NonNullable<StateFile['in_flight_turns']>[string],
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const have = s.in_flight.includes(actorId);
+    if (running && !have) s.in_flight.push(actorId);
+    if (!running && have) s.in_flight = s.in_flight.filter((id) => id !== actorId);
+    if (running && turn) s.in_flight_turns = { ...s.in_flight_turns, [actorId]: {
+      turn_id: turn.turn_id, source_message_id: turn.source_message_id,
+    } };
+    if (!running && s.in_flight_turns) {
+      delete s.in_flight_turns[actorId];
+      if (!Object.keys(s.in_flight_turns).length) delete s.in_flight_turns;
+    }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+// In-memory throttle for `touchActivity`. `last_active_at` otherwise only
+// moves at turn boundaries (setStatus / markInFlight), so a single long turn
+// — a CLI agent rendering for 14 min, or a model turn grinding through many
+// tool calls — leaves it frozen at turn-start. The renderer's stuck-turn
+// watchdog (`renderer/modules/state.js`) reads `processing_since` (= this
+// field) and declares "service restarted, resend" once it's >12 min stale,
+// false-positiving on a turn that's actively streaming. `touchActivity`
+// advances it on real activity so the watchdog only fires when the process
+// is genuinely dead (no events → no bumps → it ages out correctly).
+const _activityBumpAt = new Map<string, number>(); // `${uid}:${cid}` → epoch ms
+const ACTIVITY_BUMP_THROTTLE_MS = 30 * 1000;
+
+/** Bump `last_active_at` to now if it's been more than the throttle window
+ *  since the last bump for this conversation. Hot-path safe: the throttle
+ *  check is synchronous and short-circuits before any lock/IO, so callers
+ *  may fire it per streamed event. Only writes while `status === 'running'`
+ *  — a bump that lands just after turn-end must not resurrect an idle conv.
+ *  Self-contained error handling: a transient state read/write failure
+ *  during streaming must never break the turn, so callers fire-and-forget. */
+export async function touchActivity(uid: string, cid: string): Promise<void> {
+  const k = `${uid}:${cid}`;
+  const now = Date.now();
+  if (now - (_activityBumpAt.get(k) || 0) < ACTIVITY_BUMP_THROTTLE_MS) return;
+  _activityBumpAt.set(k, now);
+  try {
+    await _stateLock(uid, cid).runExclusive(async () => {
+      const s = await readState(uid, cid);
+      if (s.status !== 'running') return;
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    });
+  } catch (err) {
+    log.warn(`touchActivity failed cid=${cid}: ${(err as Error).message}`);
+  }
+}
+
+/** Atomically lock in the per-conversation workspace subdirectory basename.
+ *  No-op if the field is already set (frozen-on-first-write semantics — see
+ *  `conv_workspace.ts`). Returns the resulting state. */
+export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.workspace_dir) return s;
+    s.workspace_dir = dir;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Set / clear the per-conversation coding-agent project directory.
+ *  Pass `''` (or missing) to clear; an absolute path otherwise.
+ *  Caller is responsible for absolute-path validation — we only do
+ *  string handling here. Returns the resulting state.
+ *
+ *  `opts.explicit` records whether this value came from a user-chosen
+ *  custom directory (agent detail setting or `<agent-input-form>`).
+ *  Clearing `dir` also clears the flag so the next initialisation
+ *  doesn't accidentally inherit a stale `true`. */
+export async function setCodingProjectDir(
+  uid: string, cid: string, dir: string,
+  opts: { explicit: boolean; needsConfirmation?: boolean },
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const trimmed = String(dir || '').trim();
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit, opts.needsConfirmation);
+    delete s.coding_project_dir;
+    delete s.coding_project_dir_explicit;
+    delete s.coding_project_dir_pending;
+    Object.assign(s, readCodingDirectory(uid, cid));
+    return s;
+  });
+}
+
+/** Initialise the coding-agent project directory only if the conversation has
+ *  none yet. The already-set check runs inside the state lock so concurrent
+ *  first turns converge on one working directory. */
+export async function setCodingProjectDirOnce(
+  uid: string, cid: string, dir: string,
+  opts: { explicit: boolean },
+): Promise<{ state: StateFile; applied: boolean }> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const trimmed = String(dir || '').trim();
+    if (s.coding_project_dir || s.coding_project_dir_pending || !trimmed) return { state: s, applied: false };
+    writeCodingDirectory(uid, cid, trimmed, opts.explicit);
+    Object.assign(s, readCodingDirectory(uid, cid));
+    return { state: s, applied: true };
+  });
+}
+
+export async function setToolExtraRoots(uid: string, cid: string, roots: readonly string[]): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const clean = Array.from(new Set(
+      roots
+        .map((r) => String(r || '').trim())
+        .filter((r) => r && path.isAbsolute(r)),
+    ));
+    if (clean.length) s.tool_extra_roots = clean;
+    else delete s.tool_extra_roots;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Add roots to those the conversation's tools may already write, keeping
+ *  the existing ones in their order. */
+export async function addToolExtraRoots(uid: string, cid: string, roots: readonly string[]): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const added = roots.map((r) => String(r || '').trim()).filter((r) => r && path.isAbsolute(r));
+    const merged = Array.from(new Set([...(s.tool_extra_roots || []), ...added]));
+    if (merged.length === (s.tool_extra_roots || []).length) return s;
+    s.tool_extra_roots = merged;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Drop the whole group dir (called from chats.deleteConversation). */
+export async function purgeGroupDir(uid: string, cid: string): Promise<void> {
+  const dir = conversationLayout(uid, cid).groupDir;
+  try { await fsp.rm(dir, { recursive: true, force: true }); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`purge group dir failed user=${uid} cid=${cid}: ${(err as Error).message}`);
+    }
+  }
+  await untrackRunningConversation(uid, cid);
+  // Suppress unused import lint when the function body is the only path consumer.
+  void path;
+}

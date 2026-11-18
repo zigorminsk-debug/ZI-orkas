@@ -1,0 +1,1488 @@
+// ─── Chat file preview ────────────────────────────────────────────────
+// In-app overlay for files the LLM produced (green chips) and for non-image
+// user attachment chips. Mirrors `chat-lightbox.js`'s lazy-singleton pattern;
+// kept separate from it because the renderer logic per kind diverges enough
+// (iframe vs. <div> vs. <pre> body, composition fit vs. no zoom/pan) that one merged module
+// would just be two co-located if-trees.
+//
+// Render strategies:
+//   image (browser-native raster formats and SVG) → delegate to openChatImageLightbox
+//   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
+//   audio (.mp3/.wav/.ogg/.opus/.m4a/.aac/.flac) → <audio controls>
+//   pdf   (.pdf)                       → <iframe> + Chromium PDFium
+//   office(.docx/.docm/.xlsx/.xlsm/.pptx/.pptm)
+//                                      → readonly sandboxed HTML iframe
+//   html  (.html/.htm)                 → sandbox="allow-scripts" iframe
+//   md    (.md/.markdown)              → mountMdViewEdit (markdown toolbar
+//                                        only fires here — that's the
+//                                        contract the markdown editor
+//                                        carries that text files don't)
+//   text  (.txt/.json/.csv/.code…)     → mountTextViewEdit (<pre> view +
+//                                        plain textarea edit, no toolbar)
+//   else                               → uiConfirm "Open the folder?"
+//
+// chat-media://local/<abs> serves pdf/html bytes (streamed via
+// serveFileRange — no JS-heap explosion even on huge files). Markdown / text
+// go via the `produced.readText` IPC; that path slurps the whole file into
+// the JS heap and crosses IPC, hence the 2 MB cap on the main side, hence
+// the "too large → open folder" fallback below.
+//
+// Security:
+//   - HTML iframe sandbox is "allow-scripts" ONLY — no allow-same-origin,
+//     no allow-popups, no allow-top-navigation. `chat-media://` origin ≠
+//     renderer origin, so SOP already blocks parent.* access; the sandbox
+//     flags pre-empt top-window navigation and new-window pop.
+//   - The reveal-in-folder header button goes through workspace.revealPath,
+//     which validates an existing absolute path without granting read access.
+//
+// Usage:
+//   openChatFileViewer(absPath, displayName?, opts?)
+//     opts.cid — pass through when the file is a per-conv attachment, so
+//                main can include the cid's attachment dir in the read scope.
+//                Workspace-only paths can omit it.
+//     opts.projectId — pass through when the file belongs to a project file
+//                pool so text preview can include that scope.
+
+let _viewerEl = null;
+let _viewerBody = null;
+let _viewerTitle = null;
+let _viewerRevealBtn = null;
+let _viewerAddLibraryBtn = null;
+let _viewerSaveAppBtn = null;
+let _viewerSaveNewAppBtn = null;
+let _viewerMdActions = null;
+let _viewerKeyHandler = null;
+let _viewerCurrentPath = null;
+let _viewerCurrentCid = null;
+let _viewerCurrentProjectId = null;
+let _viewerLibraryProjectScoped = false;
+// Active view/edit controller — md (mountMdViewEdit) or text
+// (mountTextViewEdit). Both expose the same shape (`destroy / isDirty /
+// getMode / setMode`), so the close path can teardown without branching.
+let _viewerEditController = null;
+let _viewerDirty = false;
+let _viewerDiscardConfirmPending = false;
+let _viewerRenderSeq = 0;
+let _viewerBlobUrl = null;
+let _viewerMediaCleanup = null;
+let _viewerLibraryRestoreTimer = null;
+let _viewerSaveRestoreTimer = null;
+let _viewerHtmlCanvasResizeHandler = null;
+let _viewerPdfPreviewSeq = 0;
+let _viewerPdfPreviewState = null;
+let _viewerHtmlPreviewSeq = 0;
+let _viewerHtmlPreviewState = null;
+
+const _VIEWER_PDF_SLOW_LOAD_MS = 5000;
+const _VIEWER_HTML_SLOW_LOAD_MS = 5000;
+
+const _viewerLog = (typeof createLogger === 'function')
+  ? createLogger('chat-file-viewer')
+  : { warn: () => {}, info: () => {}, error: () => {} };
+
+function _viewerClearPdfSlowTimer(state) {
+  if (!state || !state.slowTimer) return;
+  clearTimeout(state.slowTimer);
+  state.slowTimer = null;
+}
+
+function _viewerBeginPdfPreview(cid, projectId) {
+  _viewerPdfPreviewSeq += 1;
+  const state = {
+    previewId: _viewerPdfPreviewSeq,
+    source: projectId ? 'project' : (cid ? 'conversation' : 'workspace'),
+    startedAt: Date.now(),
+    loaded: false,
+    failed: false,
+    slowTimer: null,
+  };
+  _viewerPdfPreviewState = state;
+  _viewerLog.info('pdf preview opened', {
+    preview_id: state.previewId,
+    source: state.source,
+  });
+  state.slowTimer = setTimeout(() => {
+    if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+    state.slowTimer = null;
+    _viewerLog.warn('pdf preview iframe load slow', {
+      preview_id: state.previewId,
+      source: state.source,
+      threshold_ms: _VIEWER_PDF_SLOW_LOAD_MS,
+      duration_ms: _viewerDurationSince(state.startedAt),
+    });
+  }, _VIEWER_PDF_SLOW_LOAD_MS);
+  return state;
+}
+
+function _viewerPdfIframeLoaded(state) {
+  if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+  state.loaded = true;
+  _viewerClearPdfSlowTimer(state);
+  // Chromium's iframe load confirms that PDFium accepted the viewer document;
+  // it does not claim that every page has painted.
+  _viewerLog.info('pdf preview iframe loaded', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerPdfIframeFailed(state, errorCode = 'iframe_load_failed') {
+  if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+  state.failed = true;
+  _viewerClearPdfSlowTimer(state);
+  _viewerLog.warn('pdf preview iframe failed', {
+    preview_id: state.previewId,
+    source: state.source,
+    error_code: errorCode,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerFinishPdfPreview(reason) {
+  const state = _viewerPdfPreviewState;
+  if (!state) return;
+  _viewerClearPdfSlowTimer(state);
+  _viewerLog.info('pdf preview closed', {
+    preview_id: state.previewId,
+    source: state.source,
+    outcome: state.failed ? 'failed' : (state.loaded ? 'loaded' : 'closed_before_load'),
+    reason,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerPdfPreviewState = null;
+}
+
+function _viewerClearHtmlSlowTimer(state) {
+  if (!state || !state.slowTimer) return;
+  clearTimeout(state.slowTimer);
+  state.slowTimer = null;
+}
+
+function _viewerBeginHtmlPreview(cid, projectId) {
+  _viewerHtmlPreviewSeq += 1;
+  const state = {
+    previewId: _viewerHtmlPreviewSeq,
+    source: projectId ? 'project' : (cid ? 'conversation' : 'workspace'),
+    startedAt: Date.now(),
+    layoutFinished: false,
+    iframeLoaded: false,
+    ready: false,
+    failed: false,
+    slowTimer: null,
+  };
+  _viewerHtmlPreviewState = state;
+  _viewerLog.info('html preview opened', {
+    preview_id: state.previewId,
+    source: state.source,
+  });
+  state.slowTimer = setTimeout(() => {
+    if (_viewerHtmlPreviewState !== state || state.ready || state.failed) return;
+    state.slowTimer = null;
+    _viewerLog.warn('html preview load slow', {
+      preview_id: state.previewId,
+      source: state.source,
+      threshold_ms: _VIEWER_HTML_SLOW_LOAD_MS,
+      duration_ms: _viewerDurationSince(state.startedAt),
+      layout_finished: state.layoutFinished,
+      iframe_loaded: state.iframeLoaded,
+    });
+  }, _VIEWER_HTML_SLOW_LOAD_MS);
+  return state;
+}
+
+function _viewerHtmlLayoutFinished(state, layoutKind, errorCode) {
+  if (_viewerHtmlPreviewState !== state || state.layoutFinished || state.failed) return;
+  state.layoutFinished = true;
+  const data = {
+    preview_id: state.previewId,
+    source: state.source,
+    layout_kind: layoutKind === 'fixed-canvas' ? 'fixed_canvas' : 'responsive',
+    duration_ms: _viewerDurationSince(state.startedAt),
+  };
+  if (errorCode) {
+    _viewerLog.warn('html preview layout finished', { ...data, error_code: errorCode });
+  } else {
+    _viewerLog.info('html preview layout finished', data);
+  }
+  _viewerMaybeCompleteHtmlPreview(state);
+}
+
+function _viewerHtmlIframeLoaded(state) {
+  if (_viewerHtmlPreviewState !== state || state.iframeLoaded || state.failed) return;
+  state.iframeLoaded = true;
+  _viewerLog.info('html preview iframe loaded', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerMaybeCompleteHtmlPreview(state);
+}
+
+function _viewerHtmlIframeFailed(state, errorCode = 'iframe_load_failed') {
+  if (_viewerHtmlPreviewState !== state || state.ready || state.failed) return;
+  state.failed = true;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.warn('html preview iframe failed', {
+    preview_id: state.previewId,
+    source: state.source,
+    error_code: errorCode,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerMaybeCompleteHtmlPreview(state) {
+  if (_viewerHtmlPreviewState !== state || state.ready || state.failed
+      || !state.layoutFinished || !state.iframeLoaded) return;
+  state.ready = true;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.info('html preview ready', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerFinishHtmlPreview(reason) {
+  const state = _viewerHtmlPreviewState;
+  if (!state) return;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.info('html preview closed', {
+    preview_id: state.previewId,
+    source: state.source,
+    outcome: state.failed ? 'failed' : (state.ready ? 'loaded' : 'closed_before_ready'),
+    reason,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerHtmlPreviewState = null;
+}
+
+function _viewerStableFailure(value, fallback, fallbackType = 'operation') {
+  const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
+  const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+  let errorCode = fallback;
+  if (rawCode === 'not_found' || /not found|does not exist/.test(message)) errorCode = 'source_not_found';
+  else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+  else if (/unsupported|no html entry/.test(message)) errorCode = 'unsupported_source';
+  else if (!value) errorCode = 'invalid_response';
+  let errorType = fallbackType;
+  if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+  else if (errorCode === 'permission_denied') errorType = 'authorization';
+  else if (errorCode === 'source_not_found') errorType = 'operation';
+  return { error_type: errorType, error_code: errorCode };
+}
+
+function _viewerLogFailure(action, failure) {
+  _viewerLog.warn('file viewer operation failed', { action, ...(failure || {}) });
+}
+
+function _viewerDurationSince(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
+}
+
+async function _viewerShowAlert(message, action) {
+  if (typeof uiAlert !== 'function') return;
+  try {
+    await uiAlert(message);
+  } catch (_) {
+    _viewerLogFailure(action, {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  }
+}
+
+function _scheduleAddLibraryButtonRestore(original, seq) {
+  if (seq !== _viewerRenderSeq) return;
+  clearTimeout(_viewerLibraryRestoreTimer);
+  _viewerLibraryRestoreTimer = setTimeout(() => {
+    try {
+      if (!_viewerAddLibraryBtn || seq !== _viewerRenderSeq) return;
+      _viewerAddLibraryBtn.innerHTML = original;
+      _viewerAddLibraryBtn.disabled = false;
+    } catch (_) {
+      _viewerLogFailure('file_preview_add_library_presentation', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }, 1500);
+}
+
+function _scheduleSaveAppButtonRestore(path, original, seq) {
+  if (seq !== _viewerRenderSeq) return;
+  clearTimeout(_viewerSaveRestoreTimer);
+  _viewerSaveRestoreTimer = setTimeout(() => {
+    try {
+      if (!_viewerSaveAppBtn || seq !== _viewerRenderSeq) return;
+      _viewerSaveAppBtn.innerHTML = original;
+      _refreshSaveAppButton(path);
+    } catch (_) {
+      _viewerLogFailure('file_preview_save_app_presentation', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }, 1500);
+}
+
+// Extensions we'll try to render inline. Anything else falls through to the
+// "unsupported — open folder?" dialog. Lists are intentionally narrow:
+// adding a new ext here is fine, but the renderer should actually have
+// something useful to do with it; otherwise the fallback is the better UX.
+// Local SVG is safe on this path: chat-media://local validates passive SVG
+// markup and materializes relative contact-sheet images before serving it.
+const _IMAGE_EXTS = new Set([
+  '.png', '.apng', '.jpg', '.jpeg', '.jpe', '.jfif', '.webp', '.gif',
+  '.avif', '.bmp', '.ico', '.svg',
+]);
+const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.oga', '.opus', '.weba', '.m4a', '.aac', '.flac']);
+const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.xls', '.pptx', '.pptm']);
+const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
+// Text exts: the source-as-text bucket. Keep code-ish exts here too so the
+// user can peek at a generated script without leaving the app. No syntax
+// highlighting in this round; <pre> with white-space:pre-wrap is enough.
+const _TEXT_EXTS = new Set([
+  '.txt', '.log',
+  '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
+  '.json', '.yaml', '.yml',
+  '.xml', '.ini', '.toml', '.conf',
+  '.py', '.pyi',
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat',
+  '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp',
+  '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
+]);
+function _extOf(name) {
+  if (!name) return '';
+  const i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(i).toLowerCase() : '';
+}
+
+// Pure kind classifier. Exposed as `_kindOf` for fixture tests via the
+// CJS-bridge at the bottom of this file (PC/CLAUDE.md §9 escape hatch).
+function _kindOf(name) {
+  const ext = _extOf(name);
+  if (_IMAGE_EXTS.has(ext)) return 'image';
+  if (_VIDEO_EXTS.has(ext)) return 'video';
+  if (_AUDIO_EXTS.has(ext)) return 'audio';
+  if (ext === '.pdf') return 'pdf';
+  if (_OFFICE_EXTS.has(ext)) return 'office';
+  if (ext === '.html' || ext === '.htm') return 'html';
+  if (_MARKDOWN_EXTS.has(ext)) return 'markdown';
+  if (_TEXT_EXTS.has(ext)) return 'text';
+  return 'unsupported';
+}
+
+// Build `chat-media://local/<abs>` URL. Matches main-side _pathnameToAbsPath:
+// strip the leading `/` on Unix (the parser adds it back via pathname); on
+// Windows replace `\` with `/`. encodeURI (not encodeURIComponent) preserves
+// the `/` separators while escaping spaces / non-ASCII so URL parsing on
+// the main side stays well-formed.
+function _chatMediaLocalUrl(absPath) {
+  let p = String(absPath || '');
+  // Normalize Windows drive paths: `C:\a\b` → `C:/a/b`.
+  if (p.includes('\\')) p = p.replace(/\\/g, '/');
+  // Strip the single leading slash on Unix so the abs path becomes the URL
+  // path; main re-adds it. Win paths start with `C:` so this branch is a
+  // no-op there.
+  if (p.startsWith('/')) p = p.slice(1);
+  const encoded = p.split('/').map((segment, index) => (
+    index === 0 && /^[A-Za-z]:$/.test(segment)
+      ? segment
+      : encodeURIComponent(segment)
+  )).join('/');
+  return `chat-media://local/${encoded}`;
+}
+
+function _viewerAbsPathFromChatMediaLocalUrl(src) {
+  const raw = String(src || '').trim();
+  if (!raw) return '';
+  let url;
+  try { url = new URL(raw); }
+  catch (_) { return ''; }
+  if (url.protocol !== 'chat-media:' || url.hostname.toLowerCase() !== 'local') return '';
+  let p = '';
+  try { p = decodeURIComponent(url.pathname || ''); }
+  catch (_) { return ''; }
+  if (!p) return '';
+  if (/^\/[A-Za-z]:[\\/]/.test(p)) return p.slice(1);
+  if (/^\/\/[^/]/.test(p)) p = p.replace(/^\/+/, '/');
+  return p.startsWith('/') ? p : `/${p}`;
+}
+
+// Localized label helper — falls back to the English fallback when i18n
+// tables aren't loaded yet (mirrors dialogs.js).
+function _viewerLabel(key, fallback) {
+  try { const v = t(key); return v === key ? fallback : v; } catch (_) { return fallback; }
+}
+
+function _viewerLabelVars(key, fallback, vars) {
+  try {
+    const v = t(key, vars || undefined);
+    return v === key ? fallback : v;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function _viewerLoadingHtml() {
+  const label = _viewerLabel('common.loading', 'Loading…');
+  return `<div class="office-preview-loading chat-file-viewer-loading is-preview-loading" role="status" aria-live="polite">
+    <span class="chat-file-viewer-loading-spinner office-preview-loading-spinner" aria-hidden="true"></span>
+    <span class="chat-file-viewer-loading-label office-preview-loading-label">${escapeHtml(label)}</span>
+  </div>`;
+}
+
+function _viewerShowLoading() {
+  if (!_viewerBody) return;
+  _viewerBody.setAttribute('aria-busy', 'true');
+  _viewerBody.innerHTML = _viewerLoadingHtml();
+}
+
+function _viewerAppendLoadingResource(resource) {
+  if (!_viewerBody || !resource) return;
+  resource.classList.add('chat-file-viewer-loading-resource');
+  _viewerBody.appendChild(resource);
+}
+
+function _viewerFinishLoading(resource) {
+  if (!_viewerBody) return;
+  if (resource && !_viewerBody.contains(resource)) return;
+  if (resource) resource.classList.remove('chat-file-viewer-loading-resource');
+  const loading = _viewerBody.querySelector('.chat-file-viewer-loading');
+  if (loading) loading.remove();
+  _viewerBody.removeAttribute('aria-busy');
+}
+
+function _viewerUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
+function _viewerAddLibraryButtonHtml(_label, iconName = 'database') {
+  return _viewerUiIconHtml(iconName, 'chat-file-viewer-add-library-icon');
+}
+
+function _viewerSaveAppButtonHtml(_label, iconName = 'layout-grid') {
+  return _viewerUiIconHtml(iconName, 'chat-file-viewer-save-app-icon');
+}
+
+function _setViewerButtonLabel(btn, label) {
+  if (!btn) return;
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('title', label);
+  btn.dataset.tooltip = label;
+}
+
+function _setSaveAppVisible(visible) {
+  if (!_viewerSaveAppBtn) return;
+  _viewerSaveAppBtn.hidden = !visible;
+  if (_viewerSaveNewAppBtn) {
+    _viewerSaveNewAppBtn.hidden = !visible || _viewerSaveAppBtn.dataset.hasTarget !== 'true';
+    _viewerSaveNewAppBtn.disabled = !visible;
+  }
+  _viewerSaveAppBtn.disabled = !visible;
+}
+
+function _viewerFileOperationPolicy() {
+  if (typeof window !== 'undefined' && window.FileOperationPolicy) return window.FileOperationPolicy;
+  if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
+    // eslint-disable-next-line global-require
+    return require('./file-operation-policy.js');
+  }
+  return null;
+}
+
+function _viewerCanAddToLibrary(name, options = {}) {
+  const policy = _viewerFileOperationPolicy();
+  return !!(policy && policy.canAddToLibrary(name, options));
+}
+
+function _viewerConversationIsProjectScoped(cid) {
+  if (window.OrkasPreviewHost?.projectScopedFor) return window.OrkasPreviewHost.projectScopedFor(cid);
+  if (!cid || typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
+  const conversation = conversations.find((item) => item && item.conversation_id === cid);
+  return !!(conversation && conversation.project_id);
+}
+
+function _isViewerOpen() {
+  return !!(_viewerEl && _viewerEl.classList.contains('is-open'));
+}
+
+function _ensureViewer() {
+  if (_viewerEl) return _viewerEl;
+  const root = document.createElement('div');
+  root.className = 'chat-file-viewer';
+  root.setAttribute('aria-hidden', 'true');
+  const closeLabel = _viewerLabel('chat.preview_close_title', 'Close');
+  const revealLabel = _viewerLabel('chat.preview_reveal_title', 'Open in folder');
+  const addLibraryLabel = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
+  const saveAppLabel = _viewerLabel('apps.save_from_file_action', 'Save as app');
+  const folderIcon = _viewerUiIconHtml('folder', 'chat-file-viewer-folder-icon');
+  root.innerHTML = `
+    <div class="chat-file-viewer-backdrop"></div>
+    <div class="chat-file-viewer-stage">
+      <div class="chat-file-viewer-header">
+        <span class="chat-file-viewer-title"></span>
+        <div class="chat-file-viewer-actions">
+          <div class="chat-file-viewer-md-actions"></div>
+          <button type="button" class="chat-file-viewer-add-library" aria-label="${addLibraryLabel}" title="${addLibraryLabel}" data-tooltip="${addLibraryLabel}">
+            ${_viewerAddLibraryButtonHtml(addLibraryLabel)}
+          </button>
+          <button type="button" class="chat-file-viewer-save-app" aria-label="${saveAppLabel}" title="${saveAppLabel}" data-tooltip="${saveAppLabel}" hidden>
+            ${_viewerSaveAppButtonHtml(saveAppLabel)}
+          </button>
+          <button type="button" class="chat-file-viewer-save-new-app" hidden>
+            ${_viewerSaveAppButtonHtml('', 'plus')}
+          </button>
+          <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}" data-tooltip="${revealLabel}">${folderIcon}</button>
+          <button type="button" class="modal-close-btn chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}" data-tooltip="${closeLabel}">${_viewerUiIconHtml('x', 'modal-close-icon')}</button>
+        </div>
+      </div>
+      <div class="chat-file-viewer-body"></div>
+    </div>
+  `;
+  document.body.appendChild(root);
+
+  _viewerEl = root;
+  _viewerBody = root.querySelector('.chat-file-viewer-body');
+  _viewerTitle = root.querySelector('.chat-file-viewer-title');
+  _viewerRevealBtn = root.querySelector('.chat-file-viewer-reveal');
+  _viewerAddLibraryBtn = root.querySelector('.chat-file-viewer-add-library');
+  _viewerSaveAppBtn = root.querySelector('.chat-file-viewer-save-app');
+  _viewerSaveNewAppBtn = root.querySelector('.chat-file-viewer-save-new-app');
+  _viewerSaveNewAppBtn.addEventListener('click', () => _onSaveAppClick('new'));
+  _viewerMdActions = root.querySelector('.chat-file-viewer-md-actions');
+
+  // i18n change → re-label the icon-only buttons. Same lazy listener pattern
+  // as chat-lightbox; the singleton is created on first open so the
+  // listener doesn't leak per re-open.
+  window.addEventListener('i18n-change', () => {
+    if (!_viewerEl) return;
+    const c = _viewerEl.querySelector('.chat-file-viewer-close');
+    const r = _viewerEl.querySelector('.chat-file-viewer-reveal');
+    const a = _viewerEl.querySelector('.chat-file-viewer-add-library');
+    const s = _viewerEl.querySelector('.chat-file-viewer-save-app');
+    const cl = _viewerLabel('chat.preview_close_title', 'Close');
+    const rl = _viewerLabel('chat.preview_reveal_title', 'Open in folder');
+    const al = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
+    const sl = s?.dataset.hasTarget === 'true' ? _viewerLabel('apps.update_original', 'Update original app') : _viewerLabel('apps.save_from_file_action', 'Save as app');
+    _setViewerButtonLabel(_viewerSaveNewAppBtn, _viewerLabel('apps.save_new', 'Save new app'));
+    _setViewerButtonLabel(c, cl);
+    _setViewerButtonLabel(r, rl);
+    if (a) {
+      _setViewerButtonLabel(a, al);
+      if (!a.disabled) a.innerHTML = _viewerAddLibraryButtonHtml(al);
+    }
+    if (s) {
+      _setViewerButtonLabel(s, sl);
+      if (!s.disabled) s.innerHTML = _viewerSaveAppButtonHtml(sl);
+    }
+  });
+
+  root.querySelector('.chat-file-viewer-close').addEventListener('click', closeChatFileViewer);
+  _viewerRevealBtn.addEventListener('click', _onRevealClick);
+  _viewerAddLibraryBtn.addEventListener('click', _onAddLibraryClick);
+  _viewerSaveAppBtn.addEventListener('click', () => _onSaveAppClick());
+
+  return root;
+}
+
+async function _confirmDiscardViewerEdits() {
+  if (!_viewerDirty) return true;
+  if (_viewerDiscardConfirmPending) return false;
+  _viewerDiscardConfirmPending = true;
+  const message = _viewerLabel('chat.md_drawer.close_confirm', 'Discard unsaved changes?');
+  try {
+    return typeof uiConfirm === 'function' ? await uiConfirm(message) : false;
+  } finally {
+    _viewerDiscardConfirmPending = false;
+  }
+}
+
+function _teardownViewerContent(reason = 'replaced') {
+  clearTimeout(_viewerLibraryRestoreTimer);
+  clearTimeout(_viewerSaveRestoreTimer);
+  _viewerLibraryRestoreTimer = _viewerSaveRestoreTimer = null;
+  _viewerMediaCleanup?.();
+  _viewerMediaCleanup = null;
+  _viewerFinishPdfPreview(reason);
+  _viewerFinishHtmlPreview(reason);
+  if (_viewerEditController) {
+    try { _viewerEditController.destroy(); }
+    catch { _viewerLog.warn('edit controller destroy failed', { error_code: 'destroy_failed' }); }
+  }
+  _viewerEditController = null;
+  _viewerDirty = false;
+  window.OrkasPreviewHost?.setDirty(false);
+  _viewerLibraryProjectScoped = false;
+  if (_viewerHtmlCanvasResizeHandler && typeof window !== 'undefined') {
+    window.removeEventListener('resize', _viewerHtmlCanvasResizeHandler);
+    _viewerHtmlCanvasResizeHandler = null;
+  }
+  if (_viewerBlobUrl) {
+    try {
+      if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(_viewerBlobUrl);
+      }
+    }
+    catch (_) { /* non-fatal */ }
+    _viewerBlobUrl = null;
+  }
+  if (_viewerBody) {
+    _viewerBody.removeAttribute('aria-busy');
+    _viewerBody.innerHTML = '';
+  }
+  if (_viewerMdActions) _viewerMdActions.innerHTML = '';
+  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office', 'is-office-fit', 'is-html-canvas');
+}
+
+function _typesetViewerMarkdown() {
+  if (typeof typesetMath !== 'function' || !_viewerBody) return;
+  try { typesetMath(_viewerBody); } catch (_) { /* non-fatal */ }
+}
+
+async function _onRevealClick() {
+  const p = _viewerCurrentPath;
+  if (!p) return;
+  try {
+    const payload = { path: p };
+    if (_viewerCurrentCid) payload.cid = _viewerCurrentCid;
+    if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
+    const res = await window.orkas.invoke('workspace.revealPath', payload);
+    if (!res || !res.ok) {
+      _viewerLogFailure(
+        'file_preview_reveal',
+        _viewerStableFailure(res, 'reveal_failed', 'operation'),
+      );
+    }
+  } catch (err) {
+    _viewerLogFailure(
+      'file_preview_reveal',
+      _viewerStableFailure(err, 'reveal_failed', 'ipc'),
+    );
+  }
+}
+
+async function _onAddLibraryClick() {
+  const seq = _viewerRenderSeq;
+  const p = _viewerCurrentPath;
+  if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
+  if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
+  const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
+  const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
+  const original = _viewerAddLibraryButtonHtml(label);
+  _viewerAddLibraryBtn.disabled = true;
+  let res;
+  try {
+    const payload = { path: p };
+    if (_viewerCurrentCid) payload.cid = _viewerCurrentCid;
+    if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
+    res = await window.orkas.invoke('library.importProduced', payload);
+  } catch (err) {
+    const failure = _viewerStableFailure(err, 'library_import_failed', 'ipc');
+    const reason = String(err && err.message || err);
+    _viewerLogFailure('file_preview_add_library', failure);
+    let message = `Add to Library failed: ${reason}`;
+    if (typeof t === 'function') {
+      try {
+        const got = t('chat.preview_add_library_failed_with', { reason });
+        if (got && got !== 'chat.preview_add_library_failed_with') message = got;
+      } catch (_) { /* keep fallback */ }
+    }
+    await _viewerShowAlert(message, 'file_preview_add_library_presentation');
+    return;
+  } finally {
+    if (!res || !res.ok) {
+      _scheduleAddLibraryButtonRestore(original, seq);
+    }
+  }
+
+  if (!res || !res.ok) {
+    const failure = _viewerStableFailure(res, 'library_import_failed', 'operation');
+    const reason = String((res && res.error) || 'failed');
+    _viewerLogFailure('file_preview_add_library', failure);
+    await _viewerShowAlert(`Add to Library failed: ${reason}`, 'file_preview_add_library_presentation');
+    return;
+  }
+
+  const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
+  window.OrkasPreviewHost?.filesChanged();
+  try {
+    if (seq === _viewerRenderSeq) _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
+    if (scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
+      loadContexts();
+    }
+    if (scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
+      loadProjectDetail(res.projectId).catch(() => {});
+    }
+  } catch (_) {
+    _viewerLogFailure('file_preview_add_library_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  } finally {
+    _scheduleAddLibraryButtonRestore(original, seq);
+  }
+}
+
+function _viewerFileActionPayload(path) {
+  const payload = { path };
+  if (_viewerCurrentCid) payload.cid = _viewerCurrentCid;
+  if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
+  return payload;
+}
+
+async function _refreshSaveAppButton(path) {
+  const seq = _viewerRenderSeq;
+  if (!_viewerSaveAppBtn) return;
+  _setSaveAppVisible(false);
+  if (!path) return;
+  try {
+    const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _viewerFileActionPayload(path));
+    if (seq !== _viewerRenderSeq || !_isViewerOpen() || _viewerCurrentPath !== path) return;
+    const canSave = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
+    _viewerSaveAppBtn.dataset.hasTarget = String(!!inspected?.target);
+    _setViewerButtonLabel(_viewerSaveAppBtn, _viewerLabel(inspected?.target ? 'apps.update_original' : 'apps.save_from_file_action', 'Save as app'));
+    _setViewerButtonLabel(_viewerSaveNewAppBtn, _viewerLabel('apps.save_new', 'Save new app'));
+    _setSaveAppVisible(canSave);
+  } catch {
+    if (seq !== _viewerRenderSeq || !_isViewerOpen() || _viewerCurrentPath !== path) return;
+    _viewerLog.warn('inspect app bundle failed', { error_code: 'inspect_failed' });
+    _setSaveAppVisible(false);
+  }
+}
+
+async function _onSaveAppClick(mode = 'auto') {
+  const seq = _viewerRenderSeq;
+  const p = _viewerCurrentPath;
+  if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
+  if (_viewerDirty) {
+    const message = _viewerLabel('apps.save_from_file_dirty', 'Save the file changes before saving it as an app.');
+    await _viewerShowAlert(message, 'file_preview_save_app_presentation');
+    return;
+  }
+  const label = _viewerLabel('apps.save_from_file_action', 'Save as app');
+  const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to Apps');
+  const original = _viewerSaveAppButtonHtml(label);
+  try { _setSaveAppVisible(false); } catch (_) {
+    _viewerLogFailure('file_preview_save_app_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  }
+  let res;
+  try {
+    res = await window.OrkasAppSave.save('savedApps.saveFromPath', {..._viewerFileActionPayload(p), ...(mode === 'new' ? {mode} : {})}, _viewerLabel);
+    if (res?.canceled) {
+      _scheduleSaveAppButtonRestore(p, original, seq);
+      return;
+    }
+  } catch (err) {
+    const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
+    _viewerLogFailure('file_preview_save_app', failure);
+    // Raw errors may hold local paths; the failure is logged by code only.
+    await _viewerShowAlert(_viewerLabel('apps.save_failed', 'Could not save the app'), 'file_preview_save_app_presentation');
+    _scheduleSaveAppButtonRestore(p, original, seq);
+    return;
+  }
+  if (!res || res.ok === false) {
+    const failure = _viewerStableFailure(res, 'saved_app_save_failed', 'operation');
+    _viewerLogFailure('file_preview_save_app', failure);
+    // Raw errors may hold local paths; the failure is logged by code only.
+    const message = res?.error === 'app_bundle_root'
+      ? _viewerLabel('apps.save_root_folder_required', 'Move the HTML and its resources into a separate folder, then save as an app again.')
+      : _viewerLabel('apps.save_failed', 'Could not save the app');
+    await _viewerShowAlert(message, 'file_preview_save_app_presentation');
+    _scheduleSaveAppButtonRestore(p, original, seq);
+    return;
+  }
+  window.OrkasPreviewHost?.filesChanged();
+  try {
+    if (seq === _viewerRenderSeq) _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
+    if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
+    else if (typeof uiAlert === 'function') await uiAlert(doneLabel);
+    if (typeof loadSavedApps === 'function') loadSavedApps(true, { localOnly: true });
+  } catch (_) {
+    _viewerLogFailure('file_preview_save_app_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  }
+  _scheduleSaveAppButtonRestore(p, original, seq);
+}
+
+async function _openViewerShell(displayName, opts) {
+  const el = _ensureViewer();
+  if (!(await _confirmDiscardViewerEdits())) return null;
+  _teardownViewerContent();
+  _viewerRenderSeq += 1;
+  const absPath = opts && opts.absPath;
+  const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
+  const kind = (opts && opts.kind) || '';
+  _viewerCurrentPath = absPath || null;
+  _viewerCurrentCid = cid;
+  _viewerCurrentProjectId = projectId;
+  _viewerLibraryProjectScoped = !!projectId || _viewerConversationIsProjectScoped(cid);
+  if (_viewerRevealBtn) _viewerRevealBtn.hidden = !absPath;
+  if (_viewerAddLibraryBtn) {
+    _viewerAddLibraryBtn.disabled = false;
+    _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(_viewerLabel('chat.preview_add_library_title', 'Add to Library'));
+    _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind, {
+      projectScoped: _viewerLibraryProjectScoped,
+    });
+  }
+  if (_viewerSaveAppBtn) _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(_viewerLabel('apps.save_from_file_action', 'Save as app'));
+  void _refreshSaveAppButton(_viewerCurrentPath);
+  _viewerTitle.textContent = displayName || '';
+  // `is-markdown` / `is-text` switch the body to a flex column so an editor
+  // textarea can fill the available height. View-mode `<pre>` and view-mode
+  // markdown both rely on this same layout — see style.css §chat-file-viewer
+  // for the per-class rules.
+  if (opts && opts.kind === 'markdown') el.classList.add('is-markdown');
+  if (opts && opts.kind === 'text') el.classList.add('is-text');
+  if (opts && opts.kind === 'office') el.classList.add('is-office');
+  el.classList.add('is-open');
+  el.setAttribute('aria-hidden', 'false');
+  if (!_viewerKeyHandler) {
+    _viewerKeyHandler = (e) => {
+      if (!_isViewerOpen()) return;
+      // IME guard: Esc commits IME composition cancel — don't double-fire close.
+      if (e.isComposing || e.keyCode === 229) return;
+      const active = document.activeElement;
+      if (active && active.tagName === 'TEXTAREA' && active.closest('.chat-file-viewer')) return;
+      if (e.key === 'Escape') void closeChatFileViewer();
+    };
+    document.addEventListener('keydown', _viewerKeyHandler);
+  }
+  return _viewerRenderSeq;
+}
+
+async function closeChatFileViewer(opts) {
+  if (!_viewerEl) return;
+  const force = !!(opts && opts.force);
+  if (!force && !(await _confirmDiscardViewerEdits())) return false;
+  _viewerRenderSeq += 1;
+  // A video handoff replaces only the media surface; keep its shell visible
+  // throughout teardown so the compositor does not retire the entire viewer.
+  if (!force || !opts?.keepShell) {
+    _viewerEl.classList.remove('is-open');
+    _viewerEl.setAttribute('aria-hidden', 'true');
+  }
+  // Drop iframe / blob src so big preview docs can be GC'd promptly when
+  // the user closes the overlay. Without this, hidden iframes keep the
+  // PDFium / HTML document alive in memory until the next reopen.
+  _teardownViewerContent('closed');
+  _viewerCurrentPath = null;
+  _viewerCurrentCid = null;
+  _viewerCurrentProjectId = null;
+  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = true;
+  if (_viewerSaveAppBtn) _viewerSaveAppBtn.hidden = true;
+  if (_viewerKeyHandler) {
+    document.removeEventListener('keydown', _viewerKeyHandler);
+    _viewerKeyHandler = null;
+  }
+  if (!force) window.OrkasPreviewHost?.close();
+  return true;
+}
+
+// ── Per-kind body builders ───────────────────────────────────────────────
+
+async function _renderPdfBody(absPath, displayName, cid, projectId) {
+  const seq = await _openViewerShell(displayName, { kind: 'pdf', absPath, cid, projectId });
+  if (!seq) return;
+  const state = _viewerBeginPdfPreview(cid, projectId);
+  // `#toolbar=1&navpanes=0` are Chromium PDFium control hints (keep toolbar,
+  // hide left sidebar). Same pattern as the KB context PDF viewer.
+  try {
+    const url = _chatMediaLocalUrl(absPath);
+    const iframe = document.createElement('iframe');
+    iframe.className = 'chat-file-viewer-pdf';
+    iframe.title = displayName || '';
+    iframe.addEventListener('load', () => {
+      _viewerPdfIframeLoaded(state);
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    iframe.addEventListener('error', () => {
+      _viewerPdfIframeFailed(state);
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    _viewerShowLoading();
+    _viewerAppendLoadingResource(iframe);
+    iframe.src = `${url}#toolbar=1&navpanes=0`;
+  } catch (err) {
+    _viewerPdfIframeFailed(state, 'iframe_setup_failed');
+    throw err;
+  }
+}
+
+function _htmlCanvasDimensions(layout) {
+  if (!layout || layout.kind !== 'fixed-canvas') return null;
+  const width = Number(layout.width);
+  const height = Number(layout.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height)
+      || width < 16 || height < 16 || width > 7680 || height > 7680
+      || width * height > 16777216) return null;
+  return { width, height };
+}
+
+function _htmlCanvasWidthFit(canvasWidth, canvasHeight, viewportWidth) {
+  const width = Number(canvasWidth);
+  const height = Number(canvasHeight);
+  const availableWidth = Number(viewportWidth);
+  if (!(width > 0 && height > 0 && availableWidth > 0)) return null;
+  const scale = Math.min(1, Math.max(0.01, availableWidth / width));
+  return { scale, renderedHeight: Math.ceil(height * scale) };
+}
+
+function _fitHtmlCanvasFrame() {
+  if (!_viewerBody) return;
+  const wrap = _viewerBody.querySelector('.chat-file-viewer-html-canvas-wrap');
+  if (!wrap) return;
+  const width = Number(wrap.dataset.width || 0);
+  const height = Number(wrap.dataset.height || 0);
+  const fit = _htmlCanvasWidthFit(width, height, _viewerBody.clientWidth);
+  if (!fit) return;
+  wrap.style.setProperty('--html-canvas-width', `${width}px`);
+  wrap.style.setProperty('--html-canvas-height', `${height}px`);
+  wrap.style.setProperty('--html-canvas-scale', String(fit.scale));
+  wrap.style.setProperty('--html-canvas-rendered-height', `${fit.renderedHeight}px`);
+}
+
+function _viewerMaybeRevealHtml(state, iframe, resource, seq) {
+  if (!state || state.uiRevealed || !state.ready || state.failed
+      || seq !== _viewerRenderSeq || !_isViewerOpen()
+      || !_viewerBody || !_viewerBody.contains(iframe)) return;
+  state.uiRevealed = true;
+  if (!_viewerEl.classList.contains('is-html-canvas')) {
+    _viewerFinishLoading(resource);
+    return;
+  }
+  requestAnimationFrame(() => {
+    if (seq !== _viewerRenderSeq || !_viewerBody || !_viewerBody.contains(iframe)) return;
+    _fitHtmlCanvasFrame();
+    _viewerFinishLoading(resource);
+    // A tall canvas can introduce a vertical scrollbar and reduce clientWidth.
+    // Refit once after layout so the right edge remains fully visible.
+    requestAnimationFrame(_fitHtmlCanvasFrame);
+  });
+}
+
+async function _grantHtmlPreviewAssets(absPath, cid, projectId) {
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+  const payload = { path: absPath };
+  if (cid) payload.cid = cid;
+  if (projectId) payload.projectId = projectId;
+  try { await window.orkas.invoke('produced.grantHtmlPreviewAssets', payload); }
+  catch (_) { /* only the page's same-folder assets stay unavailable */ }
+}
+
+async function _renderHtmlBody(absPath, displayName, cid, projectId) {
+  const seq = await _openViewerShell(displayName, { kind: 'html', absPath, cid, projectId });
+  if (!seq) return;
+  const state = _viewerBeginHtmlPreview(cid, projectId);
+  const url = _chatMediaLocalUrl(absPath);
+  // sandbox: opaque origin. chat-media:// is a distinct origin from
+  // file://, so SOP blocks parent.* access; we additionally forbid
+  // allow-same-origin (no cookie / localStorage) and top navigation.
+  // The page's own folder assets load through the grant below. Keep these
+  // flags equal to main's HTML_PREVIEW_SANDBOX_FLAGS: the agent-side HTML
+  // preview check applies the same sandbox. Browser actions use existing
+  // host handlers.
+  const sandbox = 'allow-scripts allow-forms allow-downloads allow-popups allow-modals';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'chat-file-viewer-html';
+  iframe.setAttribute('sandbox', sandbox);
+  iframe.title = displayName || '';
+  const frameHost = document.createElement('div');
+  frameHost.className = 'chat-file-viewer-html-host';
+  frameHost.appendChild(iframe);
+  iframe.addEventListener('load', () => {
+    _viewerHtmlIframeLoaded(state);
+    _viewerMaybeRevealHtml(state, iframe, frameHost, seq);
+  }, { once: true });
+  iframe.addEventListener('error', () => {
+    _viewerHtmlIframeFailed(state);
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(frameHost);
+  }, { once: true });
+  _viewerShowLoading();
+  // Grant the page's same-folder stylesheets, scripts, data and fonts before
+  // its first request. A failed grant still previews the document itself.
+  await _grantHtmlPreviewAssets(absPath, cid, projectId);
+  if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+  // Set the destination while detached: mounting a frame without src emits
+  // an about:blank load that consumes the one-shot readiness listener.
+  // Navigation and the independent layout scan still run in parallel.
+  iframe.src = url;
+  _viewerAppendLoadingResource(frameHost);
+  const payload = { path: absPath, htmlPreviewLayoutOnly: true };
+  if (cid) payload.cid = cid;
+  if (projectId) payload.projectId = projectId;
+
+  let canvas = null;
+  let layoutErrorCode = '';
+  try {
+    const res = await window.orkas.invoke('produced.readText', payload);
+    if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+    if (res && res.ok) canvas = _htmlCanvasDimensions(res.layout);
+    else layoutErrorCode = 'layout_probe_failed';
+  } catch (_) {
+    layoutErrorCode = 'layout_probe_failed';
+  }
+  if (seq !== _viewerRenderSeq || !_isViewerOpen() || state.failed) return;
+  if (canvas) {
+    _viewerEl.classList.add('is-html-canvas');
+    frameHost.classList.remove('chat-file-viewer-html-host');
+    frameHost.classList.add('chat-file-viewer-html-canvas-wrap');
+    frameHost.dataset.width = String(canvas.width);
+    frameHost.dataset.height = String(canvas.height);
+    iframe.classList.add('chat-file-viewer-html-canvas-frame');
+    _viewerHtmlCanvasResizeHandler = () => _fitHtmlCanvasFrame();
+    window.addEventListener('resize', _viewerHtmlCanvasResizeHandler);
+  }
+  _viewerHtmlLayoutFinished(state, canvas ? 'fixed-canvas' : 'responsive', layoutErrorCode);
+  _viewerMaybeRevealHtml(state, iframe, frameHost, seq);
+}
+
+async function _renderOfficeBody(absPath, displayName, cid, projectId) {
+  const seq = await _openViewerShell(displayName, { kind: 'office', absPath, cid, projectId });
+  if (!seq) return;
+  _viewerShowLoading();
+  try {
+    const payload = { path: absPath };
+    if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
+    const res = await window.orkas.invoke('produced.officePreviewHtml', payload);
+    if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+    if (!res || !res.ok) {
+      const err = (res && res.error) || 'unknown';
+      await closeChatFileViewer({ force: true });
+      if (err === 'too_large') {
+        const sizeMb = ((res && res.size) || 0) / 1024 / 1024;
+        const capMb = ((res && res.cap) || 50 * 1024 * 1024) / 1024 / 1024;
+        await _showUnsupportedDialog(absPath, cid, projectId, {
+          messageKey: 'chat.preview_too_large_message',
+          vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath, size: sizeMb.toFixed(1), cap: capMb.toFixed(0) },
+          fallback: `File is ${sizeMb.toFixed(1)} MB (over the ${capMb.toFixed(0)} MB preview cap). Open the containing folder?`,
+        });
+      } else {
+        await _showUnsupportedDialog(absPath, cid, projectId, {
+          messageKey: 'chat.preview_read_failed_message',
+          vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath },
+          fallback: 'Could not read this file. Open the containing folder?',
+        });
+      }
+      return;
+    }
+    const blob = new Blob([String(res.html || '')], { type: 'text/html;charset=utf-8' });
+    _viewerBlobUrl = URL.createObjectURL(blob);
+    const fitHeight = _officeFitFrameHeight(res);
+    if (fitHeight) _viewerEl.classList.add('is-office-fit');
+    const sandbox = res.allowScripts === true ? 'allow-scripts' : '';
+    const iframe = document.createElement('iframe');
+    iframe.className = 'chat-file-viewer-office';
+    iframe.setAttribute('sandbox', sandbox);
+    iframe.title = displayName || '';
+    if (fitHeight) iframe.style.height = `${fitHeight}px`;
+    iframe.addEventListener('load', () => {
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    iframe.addEventListener('error', () => {
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    _viewerAppendLoadingResource(iframe);
+    iframe.src = _viewerBlobUrl;
+  } catch (_) {
+    if (seq !== _viewerRenderSeq) return;
+    _viewerLog.warn('office preview failed', { error_code: 'office_preview_failed' });
+    await closeChatFileViewer({ force: true });
+    await _showUnsupportedDialog(absPath, cid, projectId, {
+      messageKey: 'chat.preview_read_failed_message',
+      vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath },
+      fallback: 'Could not read this file. Open the containing folder?',
+    });
+  }
+}
+
+function _officeFitFrameHeight(res) {
+  if (!res || res.kind !== 'spreadsheet') return 0;
+  const raw = Number(res.previewHeight || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const max = Math.max(260, Math.floor((window.innerHeight || 800) * 0.92 - 50));
+  return Math.max(260, Math.min(max, Math.ceil(raw)));
+}
+
+const _VIEWER_VIDEO_END_REPLAY_SECONDS = 0.25;
+
+function _viewerVideoShouldReplayFromStart(startTime, duration, ended) {
+  if (ended) return true;
+  const rawDuration = Number(duration);
+  if (!Number.isFinite(rawDuration) || rawDuration <= 0) return false;
+  return startTime >= Math.max(0, rawDuration - _VIEWER_VIDEO_END_REPLAY_SECONDS);
+}
+
+function _viewerVideoPlaybackOptions(opts) {
+  const rawTime = Number(opts && opts.startTime);
+  const startTime = Number.isFinite(rawTime) && rawTime > 0 ? rawTime : 0;
+  const rawDuration = Number(opts && opts.duration);
+  return {
+    autoplay: !!(opts && opts.autoplay),
+    startTime: _viewerVideoShouldReplayFromStart(startTime, rawDuration, !!(opts && opts.ended)) ? 0 : startTime,
+  };
+}
+
+function _viewerVideoSeekTarget(startTime, duration) {
+  if (!Number.isFinite(startTime) || startTime <= 0) return 0;
+  const rawDuration = Number(duration);
+  if (!Number.isFinite(rawDuration) || rawDuration <= 0) return startTime;
+  if (_viewerVideoShouldReplayFromStart(startTime, rawDuration, false)) return 0;
+  return Math.min(startTime, Math.max(0, rawDuration - 0.05));
+}
+
+function _applyViewerVideoPlayback(video, opts) {
+  if (!video) return;
+  const playback = _viewerVideoPlaybackOptions(opts);
+  if (!playback.autoplay && playback.startTime <= 0) return;
+  const seek = () => {
+    if (playback.startTime > 0) {
+      try {
+        video.currentTime = _viewerVideoSeekTarget(playback.startTime, video.duration);
+      } catch (_) { /* setting currentTime can throw before metadata on some codecs */ }
+    }
+  };
+  const play = () => {
+    if (playback.autoplay && typeof video.play === 'function') {
+      try {
+        const p = video.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (_) { /* non-fatal; user can press play */ }
+    }
+  };
+  seek();
+  if (playback.autoplay) play();
+  const onMetadata = () => { seek(); play(); };
+  if (video.readyState < 1) video.addEventListener('loadedmetadata', onMetadata, { once: true });
+  return () => video.removeEventListener('loadedmetadata', onMetadata);
+}
+
+async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOpts) {
+  return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), displayName, { ...playbackOpts, absPath, cid, projectId });
+}
+
+async function openChatVideoUrlViewer(src, displayName, opts) {
+  const url = String(src || '').trim();
+  if (!url) return;
+  if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'video', src: url, title: displayName || '', options: window.OrkasPreviewWindows.options(opts) });
+  const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
+  const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
+  const seq = await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId });
+  if (!seq) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-file-viewer-video-wrap';
+  wrap.dataset.chatVideoPlaybackSurface = 'floating_player';
+  const video = document.createElement('video');
+  video.className = 'chat-file-viewer-video';
+  video.controls = true;
+  video.setAttribute('controlslist', 'nodownload nofullscreen noremoteplayback');
+  video.setAttribute('disablepictureinpicture', '');
+  video.setAttribute('disableremoteplayback', '');
+  video.setAttribute('playsinline', '');
+  video.preload = 'metadata';
+  wrap.appendChild(video);
+  const finish = () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  };
+  video.addEventListener('loadedmetadata', finish, { once: true });
+  video.addEventListener('error', finish, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(wrap);
+  const cancelPlayback = _applyViewerVideoPlayback(video, opts);
+  _viewerMediaCleanup = () => {
+    // Detaching a playing video alone does not release its decoder or cancel
+    // a pending metadata callback. Clear the source before removing the node.
+    wrap.classList.add('chat-file-viewer-loading-resource');
+    video.removeEventListener('loadedmetadata', finish);
+    video.removeEventListener('error', finish);
+    cancelPlayback?.();
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  };
+  video.src = url;
+}
+
+async function _renderAudioBody(absPath, displayName, cid, projectId) {
+  const seq = await _openViewerShell(displayName, { kind: 'audio', absPath, cid, projectId });
+  if (!seq) return;
+  const url = _chatMediaLocalUrl(absPath);
+  const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
+    ? window.fileKindIconHtml(displayName || absPath, 'audio')
+    : '';
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-file-viewer-audio-wrap';
+  wrap.innerHTML = `
+    <div class="chat-file-viewer-audio-card">
+      <span class="chat-file-viewer-audio-icon">${icon}</span>
+      <span class="chat-file-viewer-audio-name">${escapeHtml(displayName || '')}</span>
+      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata"></audio>
+    </div>
+  `;
+  const audio = wrap.querySelector('.chat-file-viewer-audio');
+  const finish = () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  };
+  audio.addEventListener('loadedmetadata', finish, { once: true });
+  audio.addEventListener('error', finish, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(wrap);
+  _viewerMediaCleanup = () => {
+    audio.removeEventListener('loadedmetadata', finish);
+    audio.removeEventListener('error', finish);
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  };
+  audio.src = url;
+}
+
+async function _renderMarkdownBody(absPath, displayName, cid, projectId, readOnly = false) {
+  const seq = await _openViewerShell(displayName, { kind: 'markdown', absPath, cid, projectId });
+  if (!seq) return;
+  _viewerShowLoading();
+  const text = await _readTextFile(absPath, cid, projectId, seq);
+  if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return; // _readTextFile already routed to the fallback dialog
+  _viewerFinishLoading();
+  if (typeof mountMdViewEdit !== 'function') {
+    _viewerLog.warn('mountMdViewEdit missing; falling back to read-only markdown preview');
+    const md = (typeof renderMarkdown === 'function') ? renderMarkdown(text) : escapeHtml(text);
+    _viewerBody.innerHTML = `<div class="chat-file-viewer-md">${md}</div>`;
+    _typesetViewerMarkdown();
+    return;
+  }
+  _viewerEditController = mountMdViewEdit({
+    bodyEl: _viewerBody,
+    actionsEl: _viewerMdActions,
+    source: { kind: 'workspace', absPath, cid: cid || undefined, projectId: projectId || undefined },
+    capabilities: projectId || readOnly
+      ? { edit: false, save: false, delete: false, reveal: false, taskCheckbox: false }
+      : { reveal: false, delete: false },
+    initialMode: 'view',
+    initialContent: text,
+    actionIconOnly: true,
+    callbacks: {
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
+      onSaved: () => _typesetViewerMarkdown(),
+    },
+  });
+  _typesetViewerMarkdown();
+}
+
+async function _renderTextBody(absPath, displayName, cid, projectId, readOnly = false) {
+  const seq = await _openViewerShell(displayName, { kind: 'text', absPath, cid, projectId });
+  if (!seq) return;
+  _viewerShowLoading();
+  // Pre-fetch via _readTextFile so the too_large / read-failure path falls
+  // back to the "open the folder?" dialog (same UX as the read-only path
+  // before). On success, hand the text to mountTextViewEdit; it owns the
+  // view ↔ edit transitions, save IPC, and dirty tracking from there.
+  const preview = {};
+  const text = await _readTextFile(absPath, cid, projectId, seq, preview);
+  if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+  _viewerFinishLoading();
+  if (typeof mountTextViewEdit !== 'function') {
+    _viewerLog.warn('mountTextViewEdit missing; falling back to read-only text preview');
+    _viewerBody.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(text)}</pre>`;
+    return;
+  }
+  _viewerEditController = mountTextViewEdit({
+    bodyEl: _viewerBody,
+    actionsEl: _viewerMdActions,
+    source: { absPath, cid: cid || undefined, projectId: projectId || undefined },
+    // Project Library files are read-only by design (the LLM owns project workspace
+    // mutations); workspace / per-conv attachments allow edit + save.
+    partial: preview.truncated === true,
+    capabilities: projectId || readOnly || preview.truncated ? { edit: false, save: false } : { edit: true, save: true },
+    initialMode: 'view',
+    initialContent: text,
+    actionIconOnly: true,
+    callbacks: {
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; window.OrkasPreviewHost?.setDirty(_viewerDirty); },
+    },
+  });
+}
+
+// Fetch a file's text via IPC. Returns the text on success; on rejection
+// surfaces the fallback dialog (and returns null so the caller knows to
+// stop). Closes the overlay before showing the dialog so it doesn't stack
+// on top of a half-built viewer.
+async function _readTextFile(absPath, cid, projectId, seq, preview) {
+  _viewerCurrentPath = absPath;
+  _viewerCurrentCid = cid || null;
+  _viewerCurrentProjectId = projectId || null;
+  try {
+    const payload = { path: absPath };
+    if (preview && /\.(csv|tsv)$/i.test(absPath)) payload.preview = true;
+    if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
+    const res = await window.orkas.invoke('produced.readText', payload);
+    if (seq && seq !== _viewerRenderSeq) return null;
+    if (res && res.ok) {
+      if (preview) preview.truncated = res.truncated === true;
+      return String(res.text || '');
+    }
+    // Specifically distinguish too_large so the user sees "file is X MB,
+    // open in folder?" instead of a generic failure.
+    const err = (res && res.error) || 'unknown';
+    await closeChatFileViewer({ force: true });
+    if (err === 'too_large') {
+      const sizeMb = ((res && res.size) || 0) / 1024 / 1024;
+      const capMb = ((res && res.cap) || 2 * 1024 * 1024) / 1024 / 1024;
+      await _showUnsupportedDialog(absPath, cid, projectId, {
+        messageKey: 'chat.preview_too_large_message',
+        vars: { name: absPath.split(/[\\/]/).pop() || absPath, size: sizeMb.toFixed(1), cap: capMb.toFixed(0) },
+        fallback: `File is ${sizeMb.toFixed(1)} MB (over the ${capMb.toFixed(0)} MB preview cap). Open the containing folder?`,
+      });
+    } else {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
+        messageKey: 'chat.preview_read_failed_message',
+        vars: { name: absPath.split(/[\\/]/).pop() || absPath },
+        fallback: 'Could not read this file. Open the containing folder?',
+      });
+    }
+    return null;
+  } catch {
+    if (seq && seq !== _viewerRenderSeq) return null;
+    _viewerLog.warn('readText failed', { error_code: 'read_failed' });
+    await closeChatFileViewer({ force: true });
+    await _showUnsupportedDialog(absPath, cid, projectId, {
+      messageKey: 'chat.preview_read_failed_message',
+      vars: { name: absPath.split(/[\\/]/).pop() || absPath },
+      fallback: 'Could not read this file. Open the containing folder?',
+    });
+    return null;
+  }
+}
+
+// Fallback dialog: explain to the user that we can't preview this file
+// inline, and offer to open the folder it lives in. uiConfirm returns true
+// on the (relabeled) primary button.
+async function _showUnsupportedDialog(absPath, cid, projectId, opts) {
+  const name = absPath.split(/[\\/]/).pop() || absPath;
+  const ext = _extOf(name) || _viewerLabel('chat.preview_unsupported_no_ext', '(no extension)');
+  const message = opts && opts.messageKey
+    ? _viewerLabel(opts.messageKey, opts.fallback || '')
+    : _viewerLabel('chat.preview_unsupported_message', `Cannot preview ${ext} files in app. Open the containing folder?`);
+  // i18n substitution: do the {var} replace ourselves — `t()` only
+  // substitutes when called with `vars`, but _viewerLabel hides that. Reach
+  // through to `t` directly with vars when we have them.
+  let final = message;
+  if (opts && opts.vars && typeof t === 'function') {
+    try {
+      const v = t(opts.messageKey, opts.vars);
+      if (v && v !== opts.messageKey) final = v;
+    } catch (_) { /* keep fallback */ }
+  } else if (typeof t === 'function') {
+    try {
+      const v = t('chat.preview_unsupported_message', { ext });
+      if (v && v !== 'chat.preview_unsupported_message') final = v;
+    } catch (_) { /* keep fallback */ }
+  }
+  const okLabel = _viewerLabel('chat.preview_unsupported_reveal', 'Open Folder');
+  const cancelLabel = _viewerLabel('chat.preview_cancel', 'Close');
+  const ok = await uiConfirm({ message: final, okLabel, cancelLabel });
+  if (!ok) return;
+  try {
+    const payload = { path: absPath };
+    if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
+    const res = await window.orkas.invoke('workspace.revealPath', payload);
+    if (!res || !res.ok) _viewerLog.warn('fallback reveal failed', { error_code: 'reveal_failed' });
+  } catch {
+    _viewerLog.warn('fallback reveal failed', { error_code: 'reveal_failed' });
+  }
+}
+
+async function _ensureViewerFileExists(absPath, cid, projectId) {
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') return {};
+  try {
+    const payload = { path: absPath };
+    if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
+    const res = await window.orkas.invoke('workspace.statPath', payload);
+    if (res && res.ok && res.exists) return { readOnly: res.readOnly === true };
+    const name = String(absPath || '').split(/[\\/]/).pop() || String(absPath || '');
+    if (!res || !res.ok) {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
+        messageKey: 'chat.preview_read_failed_message',
+        vars: { name },
+        fallback: 'Could not read this file. Open the containing folder?',
+      });
+      return false;
+    }
+    const message = _viewerLabelVars(
+      'chat.file_missing_toast',
+      'The file no longer exists.',
+      { name }
+    );
+    if (typeof uiToast === 'function') uiToast(message, { variant: 'warning' });
+    else if (typeof uiAlert === 'function') await uiAlert(message);
+    return false;
+  } catch {
+    _viewerLog.warn('statPath failed', { error_code: 'stat_failed' });
+    return {};
+  }
+}
+
+// ── Public entry point ───────────────────────────────────────────────────
+
+async function openChatFileViewer(absPath, displayName, opts) {
+  if (!absPath) return;
+  const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
+  const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
+  const exists = await _ensureViewerFileExists(absPath, cid, projectId);
+  if (!exists) return;
+  // Main's write boundary is authoritative; a caller may request stricter
+  // read-only behavior, but cannot re-enable editing for an external file.
+  if (exists.readOnly) opts = { ...opts, readOnly: true };
+  const kind = _kindOf(absPath);
+  // Unsupported files need only the owner dialog, never a preview window.
+  if (kind === 'unsupported') return _showUnsupportedDialog(absPath, cid, projectId, {});
+  if (window.OrkasPreviewWindows) {
+    if (kind === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
+    if (kind === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: name, options: window.OrkasPreviewWindows.options(opts) });
+  }
+
+  if (kind === 'image') {
+    // Delegate — the image lightbox already has zoom / pan / keyboard. We
+    // need the chat-media:// URL since openChatImageLightbox expects an
+    // <img>-loadable src, not an abs path.
+    if (typeof openChatImageLightbox === 'function') {
+      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId, sourceElement: opts?.sourceElement });
+    }
+    return;
+  }
+  if (kind === 'pdf')      return _renderPdfBody(absPath, name, cid, projectId);
+  if (kind === 'office')   return _renderOfficeBody(absPath, name, cid, projectId);
+  if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId, opts);
+  if (kind === 'audio')    return _renderAudioBody(absPath, name, cid, projectId);
+  if (kind === 'html')     return _renderHtmlBody(absPath, name, cid, projectId);
+  if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId, opts?.readOnly);
+  if (kind === 'text')     return _renderTextBody(absPath, name, cid, projectId, opts?.readOnly);
+  // unsupported — go straight to the dialog, never open the shell.
+  return _showUnsupportedDialog(absPath, cid, projectId, {});
+}
+
+// CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _htmlCanvasDimensions, _htmlCanvasWidthFit };
+}

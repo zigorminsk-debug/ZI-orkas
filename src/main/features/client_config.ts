@@ -1,0 +1,1495 @@
+/**
+ * PC-side product config center.
+ *
+ * Server JSON is the authority for overrides. This feature owns local
+ * defaults, last-known-good cache, immediate/restart application, and typed
+ * views such as the provider model catalog.
+ */
+
+import * as fs from 'node:fs';
+import type { Lang } from '../i18n';
+import { getActiveUserId, hasActiveUser } from './users';
+import { userRemoteConfigFile } from '../paths';
+import { readJsonSync, writeJsonSync } from '../storage';
+import { createLogger } from '../logger';
+import { logErrorSummary } from '../util/log-redact';
+import { fetchAndReadWithRetry } from '../util/retry';
+import { desktopPlatform } from '../system_info';
+import { withCommonHeaders } from './api_common';
+import { DEFAULT_RETRY_ERROR_POLICY, type RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors';
+import { PUBLIC_PROVIDER_MODELS, type ProviderModelEntry } from '../model/public_model_catalog';
+
+export type { RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors';
+export type { ProviderModelEntry } from '../model/public_model_catalog';
+
+export type ClientConfigEffect = 'immediate' | 'restart';
+export type ClientConfigDefaultValue<T> = T | (() => T);
+
+export interface ClientConfigDefinition<T = unknown> {
+  defaultValue: ClientConfigDefaultValue<T>;
+  effect?: ClientConfigEffect;
+  merge?: (defaultValue: T, serverValue: unknown) => T;
+}
+
+export interface ApplyServerConfigResult {
+  updated: boolean;
+  immediateChanged: boolean;
+  restartChanged: boolean;
+  config_hash?: string;
+}
+
+export type ClientConfigListener<T = unknown> = (value: T | undefined, key: string) => void;
+export type ClientConfigAnyListener = (keys: string[], values: Record<string, unknown>) => void;
+
+type ConfigRefreshReason = 'startup' | 'return' | 'manual';
+type ConfigRefreshResult = {
+  updated: boolean;
+  notModified?: boolean;
+  skipped?: boolean;
+  stale?: boolean;
+  error?: string;
+};
+type ElectronAppLike = {
+  isPackaged: boolean;
+  getVersion(): string;
+  getAppPath?(): string;
+  on(event: 'browser-window-focus' | 'activate', listener: () => void): void;
+  off(event: 'browser-window-focus' | 'activate', listener: () => void): void;
+};
+type ElectronPowerMonitorLike = {
+  on(event: 'resume', listener: () => void): void;
+  off(event: 'resume', listener: () => void): void;
+};
+
+const log = createLogger('client-config');
+
+function configFailureDiagnostic(error: unknown): Record<string, unknown> {
+  return logErrorSummary(error, { closed: true });
+}
+const CLIENT_CONFIG_REFRESH_TIMEOUT_MS = 60_000;
+const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const PROD_DEFAULT = '';
+
+let started = false;
+let inFlight: Promise<ConfigRefreshResult> | null = null;
+let runtimeApp: ElectronAppLike | null = null;
+let runtimePowerMonitor: ElectronPowerMonitorLike | null = null;
+
+export interface ClientConfigStartOptions {
+  startupDelayMs?: number;
+  forceStartupRefresh?: boolean;
+}
+
+export interface RemoteConfigCache {
+  version: 1;
+  etag?: string;
+  config_hash?: string;
+  last_request_at_ms?: number;
+  active?: {
+    immediate?: Record<string, unknown>;
+    restart?: Record<string, unknown>;
+  };
+  pending_restart?: {
+    restart?: Record<string, unknown>;
+    config_hash?: string;
+    present?: boolean;
+  };
+  fetched_at_ms?: number;
+}
+
+function normalizeKey(key: unknown): string {
+  return typeof key === 'string' ? key.trim() : '';
+}
+
+function normalizeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+function sameJson(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {});
+}
+
+function own(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function changedKeys(a: Record<string, unknown>, b: Record<string, unknown>): string[] {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...keys].filter((key) => !sameJson(a[key], b[key]));
+}
+
+function emptyCache(): RemoteConfigCache {
+  return { version: 1, active: { immediate: {}, restart: {} } };
+}
+
+function normalizeRemoteConfigCache(raw: unknown): RemoteConfigCache {
+  if (!raw || typeof raw !== 'object') return emptyCache();
+  const r = raw as Record<string, unknown>;
+  const active = normalizeRecord(r.active);
+  const pending = normalizeRecord(r.pending_restart);
+  return {
+    version: 1,
+    ...(typeof r.etag === 'string' && r.etag ? { etag: r.etag } : {}),
+    ...(typeof r.config_hash === 'string' && r.config_hash ? { config_hash: r.config_hash } : {}),
+    ...(typeof r.last_request_at_ms === 'number' && r.last_request_at_ms > 0 ? { last_request_at_ms: r.last_request_at_ms } : {}),
+    active: {
+      immediate: normalizeRecord(active.immediate),
+      restart: normalizeRecord(active.restart),
+    },
+    pending_restart: {
+      restart: normalizeRecord(pending.restart),
+      ...(typeof pending.config_hash === 'string' && pending.config_hash ? { config_hash: pending.config_hash } : {}),
+      ...(pending.present === true ? { present: true } : {}),
+    },
+    ...(typeof r.fetched_at_ms === 'number' && r.fetched_at_ms > 0 ? { fetched_at_ms: r.fetched_at_ms } : {}),
+  };
+}
+
+function cacheFile(): string | null {
+  try {
+    if (!hasActiveUser()) return null;
+    return userRemoteConfigFile(getActiveUserId());
+  } catch {
+    return null;
+  }
+}
+
+let remoteConfigSnapshot: { file: string | null; version: string; data: RemoteConfigCache } | undefined;
+let remoteConfigRevision = 0;
+
+function readRemoteConfigCache(): RemoteConfigCache {
+  // Resolve the current account/root on every access. Only unchanged file contents are reused;
+  // an external replacement, account switch, or deletion must take effect on the next read.
+  const file = cacheFile();
+  let version = 'missing';
+  if (file) {
+    try {
+      const stat = fs.statSync(file, { bigint: true });
+      version = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch { /* Missing/unreadable config keeps the existing local-default behavior. */ }
+  }
+  if (remoteConfigSnapshot?.file === file && remoteConfigSnapshot.version === version) {
+    return remoteConfigSnapshot.data;
+  }
+  const raw = file && version !== 'missing' ? readJsonSync(file) : emptyCache();
+  const data = normalizeRemoteConfigCache(raw);
+  // storage returns {} on read/parse failure. Do not pin that fallback to an otherwise
+  // unchanged file: a transient IO failure must be recoverable on the next access.
+  remoteConfigSnapshot = raw && Object.keys(raw).length ? { file, version, data } : undefined;
+  remoteConfigRevision += 1;
+  return data;
+}
+
+/** Revision of the current account's persisted config, for derived read-only indexes. */
+export function getRemoteConfigRevision(): number {
+  readRemoteConfigCache();
+  return remoteConfigRevision;
+}
+
+function writeRemoteConfigCache(cache: RemoteConfigCache): void {
+  const file = cacheFile();
+  if (!file) return;
+  writeJsonSync(file, normalizeRemoteConfigCache(cache));
+  remoteConfigSnapshot = undefined;
+}
+
+function promotePendingRestartConfig(): boolean {
+  const cache = readRemoteConfigCache();
+  const pending = normalizeRecord(cache.pending_restart?.restart);
+  if (!cache.pending_restart?.present && !Object.keys(pending).length) return false;
+  const next = normalizeRemoteConfigCache({
+    ...cache,
+    active: {
+      immediate: normalizeRecord(cache.active?.immediate),
+      restart: pending,
+    },
+    pending_restart: {},
+  });
+  writeRemoteConfigCache(next);
+  return true;
+}
+
+export class ClientConfigManager {
+  private readonly definitions = new Map<string, ClientConfigDefinition>();
+  private readonly listeners = new Map<string, Set<ClientConfigListener>>();
+  private readonly anyListeners = new Set<ClientConfigAnyListener>();
+
+  registerDefault<T>(
+    key: string,
+    defaultValue: ClientConfigDefaultValue<T>,
+    options: Omit<ClientConfigDefinition<T>, 'defaultValue'> = {},
+  ): void {
+    const k = normalizeKey(key);
+    if (!k) return;
+    this.definitions.set(k, {
+      defaultValue,
+      effect: options.effect || 'immediate',
+      ...(options.merge ? { merge: options.merge as ClientConfigDefinition['merge'] } : {}),
+    });
+  }
+
+  subscribe<T = unknown>(key: string, listener: ClientConfigListener<T>): () => void {
+    const k = normalizeKey(key);
+    if (!k) return () => {};
+    const set = this.listeners.get(k) || new Set<ClientConfigListener>();
+    set.add(listener as ClientConfigListener);
+    this.listeners.set(k, set);
+    return () => {
+      set.delete(listener as ClientConfigListener);
+      if (!set.size) this.listeners.delete(k);
+    };
+  }
+
+  subscribeAll(listener: ClientConfigAnyListener): () => void {
+    this.anyListeners.add(listener);
+    return () => {
+      this.anyListeners.delete(listener);
+    };
+  }
+
+  private notifyChanged(keys: string[]): void {
+    const normalizedKeys = [...new Set(keys.map(normalizeKey).filter(Boolean))];
+    if (!normalizedKeys.length) return;
+    const values: Record<string, unknown> = {};
+    for (const key of normalizedKeys) {
+      values[key] = this.get(key);
+      const set = this.listeners.get(key);
+      if (!set?.size) continue;
+      for (const listener of [...set]) {
+        try {
+          listener(values[key], key);
+        } catch {
+          // Config listeners are best-effort; one feature must not break sync.
+        }
+      }
+    }
+    for (const listener of [...this.anyListeners]) {
+      try {
+        listener(normalizedKeys, values);
+      } catch {
+        // Config listeners are best-effort; one feature must not break sync.
+      }
+    }
+  }
+
+  private resolveDefault<T = unknown>(definition: ClientConfigDefinition<T> | undefined, fallback?: T): T | undefined {
+    if (!definition) return fallback;
+    const value = definition.defaultValue;
+    return (typeof value === 'function' ? (value as () => T)() : value) as T;
+  }
+
+  getDefault<T = unknown>(key: string): T | undefined {
+    const definition = this.definitions.get(normalizeKey(key)) as ClientConfigDefinition<T> | undefined;
+    return this.resolveDefault(definition);
+  }
+
+  getServerValue(key: string): unknown {
+    const k = normalizeKey(key);
+    if (!k) return undefined;
+    const cache = readRemoteConfigCache();
+    const immediate = cache.active.immediate;
+    if (own(immediate, k)) return structuredClone(immediate[k]);
+    const restart = cache.active.restart;
+    if (own(restart, k)) return structuredClone(restart[k]);
+    return undefined;
+  }
+
+  hasServerValue(key: string): boolean {
+    const k = normalizeKey(key);
+    if (!k) return false;
+    const cache = readRemoteConfigCache();
+    return own(cache.active.immediate, k) || own(cache.active.restart, k);
+  }
+
+  get<T = unknown>(key: string, fallback?: T): T | undefined {
+    const k = normalizeKey(key);
+    if (!k) return fallback;
+    const definition = this.definitions.get(k) as ClientConfigDefinition<T> | undefined;
+    const defaultValue = this.resolveDefault(definition, fallback);
+    const cache = readRemoteConfigCache();
+    const source = own(cache.active.immediate, k) ? cache.active.immediate : cache.active.restart;
+    if (own(source, k)) {
+      // Callers and custom merge functions own their value, never the cached snapshot.
+      const serverValue = structuredClone(source[k]);
+      if (definition?.merge) {
+        return definition.merge(defaultValue as T, serverValue) as T;
+      }
+      return serverValue as T;
+    }
+    if (definition) return defaultValue;
+    return fallback;
+  }
+
+  readCache(): RemoteConfigCache {
+    return structuredClone(readRemoteConfigCache());
+  }
+
+  lastRequestAtMs(): number {
+    const cache = readRemoteConfigCache();
+    return Number(cache.last_request_at_ms) || Number(cache.fetched_at_ms) || 0;
+  }
+
+  shouldRefresh(minIntervalMs: number, nowMs = Date.now()): boolean {
+    const last = this.lastRequestAtMs();
+    return !last || nowMs - last >= minIntervalMs;
+  }
+
+  markRefreshAttempt(nowMs = Date.now()): void {
+    const cache = readRemoteConfigCache();
+    writeRemoteConfigCache({
+      ...cache,
+      last_request_at_ms: nowMs,
+    });
+  }
+
+  markNotModified(etag = '', nowMs = Date.now()): void {
+    const cache = readRemoteConfigCache();
+    writeRemoteConfigCache({
+      ...cache,
+      ...(etag ? { etag } : {}),
+      last_request_at_ms: nowMs,
+      fetched_at_ms: nowMs,
+    });
+  }
+
+  promotePendingRestart(): boolean {
+    const before = readRemoteConfigCache();
+    const activeRestart = normalizeRecord(before.active?.restart);
+    const pendingRestart = normalizeRecord(before.pending_restart?.restart);
+    const promoted = promotePendingRestartConfig();
+    if (promoted) {
+      this.notifyChanged(changedKeys(activeRestart, pendingRestart));
+    }
+    return promoted;
+  }
+
+  applyServerPayload(
+    body: Record<string, unknown>,
+    etag: string,
+    nowMs = Date.now(),
+  ): ApplyServerConfigResult {
+    const current = readRemoteConfigCache();
+    const immediate = normalizeRecord(body.immediate);
+    const restart = normalizeRecord(body.restart);
+    const configHash = typeof body.config_hash === 'string' ? body.config_hash : '';
+
+    const activeImmediate = normalizeRecord(current.active?.immediate);
+    const activeRestart = normalizeRecord(current.active?.restart);
+    const pendingRestart = normalizeRecord(current.pending_restart?.restart);
+    const immediateChanged = !sameJson(activeImmediate, immediate);
+    const immediateChangedKeys = changedKeys(activeImmediate, immediate);
+    const hasPendingRestart = current.pending_restart?.present === true || Object.keys(pendingRestart).length > 0;
+    const restartMatchesActive = sameJson(activeRestart, restart);
+    const restartChanged = restartMatchesActive
+      ? hasPendingRestart
+      : !sameJson(pendingRestart, restart);
+
+    const next = normalizeRemoteConfigCache({
+      ...current,
+      etag,
+      config_hash: configHash || current.config_hash,
+      active: {
+        immediate: immediateChanged ? immediate : activeImmediate,
+        restart: activeRestart,
+      },
+      pending_restart: restartChanged
+        ? (restartMatchesActive ? {} : { restart, config_hash: configHash, present: true })
+        : current.pending_restart,
+      last_request_at_ms: nowMs,
+      fetched_at_ms: nowMs,
+    });
+
+    const updated = immediateChanged
+      || restartChanged
+      || current.etag !== etag
+      || current.config_hash !== configHash;
+    writeRemoteConfigCache(next);
+    if (updated && immediateChangedKeys.length) this.notifyChanged(immediateChangedKeys);
+
+    return {
+      updated,
+      immediateChanged,
+      restartChanged,
+      config_hash: next.config_hash,
+    };
+  }
+}
+
+export const clientConfig = new ClientConfigManager();
+
+export type ClientConfigChannel = 'open';
+
+function channel(_app: ElectronAppLike): ClientConfigChannel {
+  return 'open';
+}
+
+function region(): string {
+  return 'global';
+}
+
+export function clientConfigPlatform(platform = process.platform): string {
+  return desktopPlatform(platform);
+}
+
+function apiBase(_app: ElectronAppLike): string {
+  return PROD_DEFAULT;
+}
+
+function buildUrl(app: ElectronAppLike): string {
+  const url = new URL(`${apiBase(app)}/config/client`);
+  url.searchParams.set('region', region());
+  return url.toString();
+}
+
+function applyPayload(body: Record<string, unknown>, etag: string): boolean {
+  const result = clientConfig.applyServerPayload(body, etag);
+  if (result.updated) {
+    log.info('client config updated', {
+      config_hash: result.config_hash,
+      immediateChanged: result.immediateChanged,
+      restartChanged: result.restartChanged,
+    });
+  }
+  return result.updated;
+}
+
+function activeConfigOwner(): string | null {
+  try {
+    return hasActiveUser() ? getActiveUserId() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadElectronRuntime(): Promise<{
+  app: ElectronAppLike;
+  powerMonitor: ElectronPowerMonitorLike;
+}> {
+  const mod = await import('electron');
+  return {
+    app: mod.app as unknown as ElectronAppLike,
+    powerMonitor: mod.powerMonitor as unknown as ElectronPowerMonitorLike,
+  };
+}
+
+export async function refresh(
+  reason: ConfigRefreshReason = 'manual',
+  options: { force?: boolean } = {},
+): Promise<ConfigRefreshResult> {
+  // Personal autonomous ZI-Orkas build: never poll orkas.ai for remote config
+  // overrides or provider kill-switches (allow explicit E2E test override only).
+  if (!String(process.env.ORKAS_CLIENT_CONFIG_API_BASE || '').trim()) {
+    return { updated: false, skipped: true };
+  }
+  if (!options.force && !clientConfig.shouldRefresh(REFRESH_INTERVAL_MS)) {
+    return { updated: false, skipped: true };
+  }
+  if (inFlight) return inFlight;
+
+  inFlight = (async () => {
+    const requestOwner = activeConfigOwner();
+    const current = clientConfig.readCache();
+    clientConfig.markRefreshAttempt();
+    try {
+      const { app } = runtimeApp ? { app: runtimeApp } : await loadElectronRuntime();
+      const headers: Record<string, string> = withCommonHeaders();
+      if (current.etag) headers['If-None-Match'] = current.etag;
+      const { response: res, body: parsed } = await fetchAndReadWithRetry(
+        'client-config:refresh', buildUrl(app), { method: 'GET', headers },
+        async (response, signal) => {
+          if (!response.ok) return { ok: true, body: {} as Record<string, unknown> } as const;
+          try { return { ok: true, body: await response.json() as Record<string, unknown> } as const; }
+          catch (error) {
+            if (signal?.aborted) throw error;
+            // Keep malformed-body failures outside transport retries.
+            return { ok: false, error } as const;
+          }
+        },
+        { timeoutMs: CLIENT_CONFIG_REFRESH_TIMEOUT_MS },
+      );
+      const etag = res.headers.get('etag') || '';
+      if (activeConfigOwner() !== requestOwner) {
+        log.info('stale client config response ignored after account switch', { reason });
+        return { updated: false, skipped: true, stale: true };
+      }
+      if (res.status === 304) {
+        clientConfig.markNotModified(etag || current.etag || '');
+        log.debug('client config not modified', { reason });
+        return { updated: false, notModified: true };
+      }
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+      if (!parsed.ok) throw parsed.error;
+      const body = parsed.body;
+      if (body.code !== 0) throw new Error(String(body.msg || body.code || 'client config error'));
+      return { updated: applyPayload(body, etag) };
+    } catch (err) {
+      const error = (err as Error)?.message || String(err);
+      log.warn('client config refresh failed', { diagnostic_id: 'D301', reason, error: configFailureDiagnostic(err) });
+      return { updated: false, error };
+    }
+  })();
+  // Publish the promise before cleanup can run, including synchronous setup
+  // failures before the request's first await.
+  const pending = inFlight;
+  try {
+    return await pending;
+  } finally {
+    if (inFlight === pending) inFlight = null;
+  }
+}
+
+function onReturnToApp(): void {
+  void refresh('return');
+}
+
+export function start(opts: ClientConfigStartOptions = {}): void {
+  if (started) return;
+  started = true;
+  const startupDelayMs = Number.isFinite(opts.startupDelayMs) ? Math.max(0, Number(opts.startupDelayMs)) : 0;
+  const forceStartupRefresh = opts.forceStartupRefresh !== false;
+  void loadElectronRuntime().then(({ app, powerMonitor }) => {
+    runtimeApp = app;
+    runtimePowerMonitor = powerMonitor;
+    try {
+      if (clientConfig.promotePendingRestart()) {
+        log.info('promoted pending restart config');
+      }
+    } catch (err) {
+      log.warn('promote pending restart config failed', { diagnostic_id: 'D303', error: configFailureDiagnostic(err) });
+    }
+    const runStartupRefresh = (): void => { void refresh('startup', { force: forceStartupRefresh }); };
+    if (startupDelayMs > 0) {
+      const timer = setTimeout(runStartupRefresh, startupDelayMs);
+      timer.unref?.();
+    } else {
+      setImmediate(runStartupRefresh);
+    }
+    app.on('browser-window-focus', onReturnToApp);
+    app.on('activate', onReturnToApp);
+    powerMonitor.on('resume', onReturnToApp);
+  }).catch((err) => {
+    started = false;
+    log.warn('client config start failed', { diagnostic_id: 'D304', error: configFailureDiagnostic(err) });
+  });
+}
+
+export function stop(): void {
+  started = false;
+  runtimeApp?.off('browser-window-focus', onReturnToApp);
+  runtimeApp?.off('activate', onReturnToApp);
+  runtimePowerMonitor?.off('resume', onReturnToApp);
+  runtimeApp = null;
+  runtimePowerMonitor = null;
+}
+
+export interface ImageGenCapability {
+  model: string;
+  api: 'openai' | 'gemini' | 'doubao';
+  supportsEdit: boolean;
+}
+
+export interface ImageGenCapabilityOverride {
+  model?: string;
+  api?: 'openai' | 'gemini' | 'doubao';
+  supportsEdit?: boolean;
+}
+
+export type ConnectorSwitchState = 'enabled' | 'disabled' | 'visible_disabled';
+
+export interface GoogleConnectorsConfig {
+  google: ConnectorSwitchState;
+  gmail: ConnectorSwitchState;
+}
+
+export type DcrConnectorCategory =
+  | 'developer'
+  | 'productivity'
+  | 'communication'
+  | 'search'
+  | 'data'
+  | 'commerce';
+
+export type ServerConnectorCategory = DcrConnectorCategory;
+
+export interface ServerDcrConnectorConfig {
+  id: string;
+  display_name: string;
+  icon_svg?: string;
+  category: DcrConnectorCategory;
+  description_zh: string;
+  description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  description_es?: string;
+  description_fr?: string;
+  description_ko?: string;
+  description_de?: string;
+  description_ru?: string;
+  description_it?: string;
+  requires_credits?: boolean;
+  auth_mode: 'mcp_dcr';
+  transport_template: {
+    kind: 'streamable-http';
+    url: string;
+    oauth_header_key?: string;
+  };
+}
+
+export interface ServerComposioToolConfig {
+  slug: string;
+  name?: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+  policy?: {
+    risk: 'R' | 'W' | 'H' | 'D';
+    confirmation: 'none' | 'preview' | 'fresh' | 'destructive';
+    idempotency: 'required' | 'when_supported' | 'not_applicable';
+    max_batch_size: number;
+    sensitive_fields: string[];
+    sensitive_operation?: string;
+  };
+}
+
+export interface ServerComposioConnectorConfig {
+  id: string;
+  display_name: string;
+  icon_svg?: string;
+  category: ServerConnectorCategory;
+  description_zh: string;
+  description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  description_es?: string;
+  description_fr?: string;
+  description_ko?: string;
+  description_de?: string;
+  description_ru?: string;
+  description_it?: string;
+  requires_credits: true;
+  auth_mode: 'composio';
+  composio: {
+    toolkit: string;
+    auth_config_id: string;
+    tools?: ServerComposioToolConfig[];
+  };
+  transport_template: null;
+  usage_metering: {
+    provider: 'composio';
+    credits_milli_per_call: number;
+  };
+}
+
+export type ServerConnectorCatalogConfig = ServerDcrConnectorConfig | ServerComposioConnectorConfig;
+
+export interface AppUpdatePolicyConfig {
+  min_version: string;
+}
+
+export type QuickStartScenarioId =
+  | 'data'
+  | 'office'
+  | 'ppt'
+  | 'creation'
+  | 'ecommerce'
+  | 'video'
+  | 'image'
+  | 'ui_design'
+  | 'rnd'
+  | 'seo_geo';
+
+export interface QuickStartConfigEntry {
+  id: QuickStartScenarioId;
+  agent_id: string;
+}
+
+export type QuickStartConfigSource = 'pc_default' | 'server_config';
+
+export interface QuickStartConfigState {
+  items: QuickStartConfigEntry[];
+  source: QuickStartConfigSource;
+}
+
+interface ModelCatalogConfig {
+  providers: Record<string, ProviderModelEntry[]>;
+  openAICompatibleProviders: Record<string, OpenAICompatibleProviderConfig>;
+  imageGeneration: Record<string, ImageGenCapability>;
+}
+
+function cloneProviderModelEntry(model: ProviderModelEntry): ProviderModelEntry {
+  return {
+    ...model,
+    ...(model.includedModels ? { includedModels: [...model.includedModels] } : {}),
+  };
+}
+
+const VALID_IMAGE_APIS = new Set(['openai', 'gemini', 'doubao']);
+
+function cloneRetryErrorPolicyConfig(config: RetryErrorPolicyConfig): RetryErrorPolicyConfig {
+  return {
+    permanent_statuses: [...config.permanent_statuses],
+    permanent_message_patterns: [...config.permanent_message_patterns],
+    permanent_code_patterns: [...config.permanent_code_patterns],
+  };
+}
+
+export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
+
+export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
+  openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
+  google: { model: 'gemini-nano-banana-2.1', api: 'gemini', supportsEdit: true },
+  doubao: { model: 'doubao-seedream-5-0-flash-260915', api: 'doubao', supportsEdit: true },
+};
+
+/**
+ * First-paint fallback for the Commander home page. The Server may replace
+ * this ordered list through `commander.quick_start`, but it deliberately does
+ * not publish that key yet. Every referenced agent is either bundled with the
+ * desktop app or marked `default_install` in the marketplace.
+ */
+export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = [
+  { id: 'data', agent_id: '78900d8758bc' },
+  { id: 'ecommerce', agent_id: '5a1d43c2f28a' },
+  { id: 'ppt', agent_id: '7e91cb9ec9e9' },
+  { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'image', agent_id: '814b61b027f0' },
+  { id: 'video', agent_id: '79df9cc89f5f' },
+  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
+  { id: 'rnd', agent_id: 'a316881746f9' },
+  { id: 'seo_geo', agent_id: 'e064dca9e1bd' },
+];
+
+const QUICK_START_SCENARIO_IDS = new Set<QuickStartScenarioId>(
+  [...DEFAULT_QUICK_START_CONFIG.map((entry) => entry.id), 'creation'],
+);
+let lastInvalidQuickStartConfigHash = '';
+
+function normalizeQuickStartConfig(raw: unknown): QuickStartConfigEntry[] | null {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > QUICK_START_SCENARIO_IDS.size) return null;
+  const out: QuickStartConfigEntry[] = [];
+  const seen = new Set<QuickStartScenarioId>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() as QuickStartScenarioId : '' as QuickStartScenarioId;
+    const agentId = typeof record.agent_id === 'string' ? record.agent_id.trim() : '';
+    if (!QUICK_START_SCENARIO_IDS.has(id) || seen.has(id) || !/^[A-Za-z0-9_-]{3,64}$/.test(agentId)) return null;
+    seen.add(id);
+    out.push({ id, agent_id: agentId });
+  }
+  return out;
+}
+
+function mergeQuickStartConfig(baseRaw: unknown, overrideRaw: unknown): QuickStartConfigEntry[] {
+  const base = normalizeQuickStartConfig(baseRaw)
+    || DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry }));
+  const override = normalizeQuickStartConfig(overrideRaw);
+  return (override || base).map((entry) => ({ ...entry }));
+}
+
+function emptyModelCatalog(): ModelCatalogConfig {
+  return { providers: {}, openAICompatibleProviders: {}, imageGeneration: {} };
+}
+
+function normalizeProviderModels(value: unknown, providerId: string): ProviderModelEntry[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: ProviderModelEntry[] = [];
+  const seenIds = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const r = item as Record<string, unknown>;
+    const id = typeof r.id === 'string' ? r.id.trim() : '';
+    if (!id || id.length > 200 || seenIds.has(id)) return null;
+    seenIds.add(id);
+    const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : id;
+    if (name.length > 200) return null;
+    const description = typeof r.description === 'string' ? r.description.trim() : undefined;
+    if (r.description !== undefined && (!description || description.length > 500)) return null;
+    const recommended = r.recommended === true;
+    const hiddenFromPicker = typeof r.hiddenFromPicker === 'boolean' ? r.hiddenFromPicker : undefined;
+    if (r.hiddenFromPicker !== undefined && hiddenFromPicker === undefined) return null;
+    const template = typeof r.template === 'string' && r.template.trim() ? r.template.trim() : undefined;
+    const contextWindow = normalizePositiveInteger(r.contextWindow);
+    const maxTokens = normalizePositiveInteger(r.maxTokens);
+    const maxInputImages = normalizeNonNegativeInteger(r.maxInputImages);
+    const supportsVision = typeof r.supportsVision === 'boolean' ? r.supportsVision : undefined;
+    if (r.supportsVision !== undefined && supportsVision === undefined) return null;
+    if (r.maxInputImages !== undefined && maxInputImages === undefined) return null;
+    if (
+      (supportsVision === false && typeof maxInputImages === 'number' && maxInputImages > 0)
+      || (supportsVision === true && maxInputImages === 0)
+    ) return null;
+    const includedModels = normalizeIncludedModels(r.includedModels);
+    if (r.includedModels !== undefined && includedModels === null) return null;
+    out.push({
+      id,
+      name,
+      ...(description ? { description } : {}),
+      ...(recommended ? { recommended: true } : {}),
+      ...(hiddenFromPicker !== undefined ? { hiddenFromPicker } : {}),
+      ...(includedModels ? { includedModels } : {}),
+      ...(template ? { template } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(maxTokens ? { maxTokens } : {}),
+      ...(supportsVision !== undefined ? { supportsVision } : {}),
+      ...(maxInputImages !== undefined ? { maxInputImages } : {}),
+    });
+  }
+  return out.length ? out : null;
+}
+
+function normalizeIncludedModels(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 12) return null;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') return null;
+    const label = item.trim();
+    if (!label || label.length > 80) return null;
+    if (seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out.length ? out : null;
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const n = Math.floor(value);
+  return n > 0 ? n : undefined;
+}
+
+function normalizeNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return undefined;
+  return value >= 0 ? value : undefined;
+}
+
+function normalizeImageGenCapability(value: unknown): ImageGenCapability | null {
+  if (!value || typeof value !== 'object') return null;
+  const r = value as Record<string, unknown>;
+  const model = typeof r.model === 'string' ? r.model.trim() : '';
+  const api = typeof r.api === 'string' && VALID_IMAGE_APIS.has(r.api)
+    ? r.api as ImageGenCapability['api']
+    : '';
+  if (!model || !api) return null;
+  return { model, api, supportsEdit: r.supports_edit === true };
+}
+
+function mergeProviderSection(target: Record<string, ProviderModelEntry[]>, value: unknown): void {
+  if (!value || typeof value !== 'object') return;
+  for (const [rawKey, rawModels] of Object.entries(value as Record<string, unknown>)) {
+    const key = normalizeKey(rawKey);
+    if (!key) continue;
+    const models = normalizeProviderModels(rawModels, key);
+    if (models) target[key] = models;
+  }
+}
+
+function mergeImageGenerationSection(target: Record<string, ImageGenCapability>, value: unknown): void {
+  if (!value || typeof value !== 'object') return;
+  for (const [rawKey, rawCapability] of Object.entries(value as Record<string, unknown>)) {
+    const key = normalizeKey(rawKey);
+    if (!key) continue;
+    const capability = normalizeImageGenCapability(rawCapability);
+    if (capability) target[key] = capability;
+  }
+}
+
+function normalizeModelCatalogConfig(raw: unknown): ModelCatalogConfig {
+  const out = emptyModelCatalog();
+  if (!raw || typeof raw !== 'object') return out;
+  const r = raw as Record<string, unknown>;
+  mergeProviderSection(out.providers, r.providers);
+  mergeOpenAICompatibleProviderSection(
+    out.openAICompatibleProviders,
+    r.openai_compatible_providers,
+  );
+  mergeImageGenerationSection(out.imageGeneration, r.image_generation);
+  return out;
+}
+
+const CONNECTOR_SWITCH_STATES = new Set<ConnectorSwitchState>(['enabled', 'disabled', 'visible_disabled']);
+
+function normalizeConnectorSwitchState(value: unknown): ConnectorSwitchState | null {
+  if (value === true) return 'enabled';
+  if (value === false) return 'disabled';
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (normalized === 'visible_disabled' || normalized === 'disabled_visible' || normalized === 'show_disabled') {
+    return 'visible_disabled';
+  }
+  return CONNECTOR_SWITCH_STATES.has(normalized as ConnectorSwitchState)
+    ? normalized as ConnectorSwitchState
+    : null;
+}
+
+function normalizeGoogleConnectorsConfig(raw: unknown): Partial<GoogleConnectorsConfig> {
+  const direct = normalizeConnectorSwitchState(raw);
+  if (direct) return { google: direct, gmail: direct };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const google = normalizeConnectorSwitchState(r.google ?? r.all ?? r.enabled);
+  const gmail = normalizeConnectorSwitchState(r.gmail);
+  return {
+    ...(google ? { google } : {}),
+    ...(gmail ? { gmail } : {}),
+  };
+}
+
+function mergeGoogleConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): GoogleConnectorsConfig {
+  const base = normalizeGoogleConnectorsConfig(baseRaw);
+  const override = normalizeGoogleConnectorsConfig(overrideRaw);
+  return {
+    google: override.google || base.google || 'enabled',
+    gmail: override.gmail || base.gmail || 'enabled',
+  };
+}
+
+const DCR_CONNECTOR_CATEGORIES = new Set<DcrConnectorCategory>([
+  'developer',
+  'productivity',
+  'communication',
+  'search',
+  'data',
+  'commerce',
+]);
+
+function normalizeServerDcrConnectorConfig(raw: unknown): ServerDcrConnectorConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === 'string' ? r.id.trim().toLowerCase() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id)) return null;
+  if (r.auth_mode !== 'mcp_dcr') return null;
+  const categoryRaw = typeof r.category === 'string' ? r.category.trim() : '';
+  const category = categoryRaw as DcrConnectorCategory;
+  if (!DCR_CONNECTOR_CATEGORIES.has(category)) return null;
+  const transport = r.transport_template as Record<string, unknown> | null;
+  if (!transport || transport.kind !== 'streamable-http') return null;
+  const url = typeof transport.url === 'string' ? transport.url.trim() : '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return null;
+  } catch {
+    return null;
+  }
+  const displayName = typeof r.display_name === 'string' && r.display_name.trim() ? r.display_name.trim() : id;
+  const iconSvg = typeof r.icon_svg === 'string' && r.icon_svg.trim() ? r.icon_svg.trim() : undefined;
+  const oauthHeaderKey = typeof transport.oauth_header_key === 'string' && transport.oauth_header_key.trim()
+    ? transport.oauth_header_key.trim()
+    : undefined;
+  return {
+    id,
+    display_name: displayName,
+    ...(iconSvg ? { icon_svg: iconSvg } : {}),
+    category,
+    description_zh: typeof r.description_zh === 'string' ? r.description_zh.trim() : '',
+    description_en: typeof r.description_en === 'string' ? r.description_en.trim() : '',
+    description_ja: typeof r.description_ja === 'string' ? r.description_ja.trim() : '',
+    description_pt: typeof r.description_pt === 'string' ? r.description_pt.trim() : '',
+    description_es: typeof r.description_es === 'string' ? r.description_es.trim() : '',
+    description_fr: typeof r.description_fr === 'string' ? r.description_fr.trim() : '',
+    description_ko: typeof r.description_ko === 'string' ? r.description_ko.trim() : '',
+    description_de: typeof r.description_de === 'string' ? r.description_de.trim() : '',
+    description_ru: typeof r.description_ru === 'string' ? r.description_ru.trim() : '',
+    description_it: typeof r.description_it === 'string' ? r.description_it.trim() : '',
+    ...(typeof r.requires_credits === 'boolean' ? { requires_credits: r.requires_credits } : {}),
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url,
+      ...(oauthHeaderKey ? { oauth_header_key: oauthHeaderKey } : {}),
+    },
+  };
+}
+
+function normalizeServerDcrConnectorsConfig(raw: unknown): ServerDcrConnectorConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ServerDcrConnectorConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const entry = normalizeServerDcrConnectorConfig(item);
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+function mergeServerDcrConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): ServerDcrConnectorConfig[] {
+  const byId = new Map<string, ServerDcrConnectorConfig>();
+  for (const entry of normalizeServerDcrConnectorsConfig(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerDcrConnectorsConfig(overrideRaw)) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
+
+function normalizeComposioToolConfig(raw: unknown): ServerComposioToolConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const slug = typeof r.slug === 'string' ? r.slug.trim() : '';
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(slug)) return null;
+  const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : undefined;
+  const description = typeof r.description === 'string' && r.description.trim() ? r.description.trim() : undefined;
+  const inputSchema = r.input_schema && typeof r.input_schema === 'object' && !Array.isArray(r.input_schema)
+    ? r.input_schema as Record<string, unknown>
+    : undefined;
+  const rawPolicy = r.policy && typeof r.policy === 'object' && !Array.isArray(r.policy)
+    ? r.policy as Record<string, unknown>
+    : null;
+  const risk = String(rawPolicy?.risk || '') as 'R' | 'W' | 'H' | 'D';
+  const confirmation = String(rawPolicy?.confirmation || '') as 'none' | 'preview' | 'fresh' | 'destructive';
+  const idempotency = String(rawPolicy?.idempotency || '') as 'required' | 'when_supported' | 'not_applicable';
+  const sensitiveFields = Array.isArray(rawPolicy?.sensitive_fields)
+    ? rawPolicy.sensitive_fields.filter((field): field is string => typeof field === 'string' && !!field.trim())
+    : [];
+  const hasPolicy = !!rawPolicy
+    && ['R', 'W', 'H', 'D'].includes(risk)
+    && ['none', 'preview', 'fresh', 'destructive'].includes(confirmation)
+    && ['required', 'when_supported', 'not_applicable'].includes(idempotency)
+    && typeof rawPolicy.max_batch_size === 'number'
+    && Number.isInteger(rawPolicy.max_batch_size)
+    && rawPolicy.max_batch_size > 0
+    && sensitiveFields.length === (Array.isArray(rawPolicy.sensitive_fields) ? rawPolicy.sensitive_fields.length : -1);
+  return {
+    slug,
+    ...(name ? { name } : {}),
+    ...(description ? { description } : {}),
+    ...(inputSchema ? { input_schema: inputSchema } : {}),
+    ...(hasPolicy ? {
+      policy: {
+        risk,
+        confirmation,
+        idempotency,
+        max_batch_size: rawPolicy!.max_batch_size as number,
+        sensitive_fields: sensitiveFields.map((field) => field.trim()),
+        ...(typeof rawPolicy?.sensitive_operation === 'string' && rawPolicy.sensitive_operation.trim()
+          ? { sensitive_operation: rawPolicy.sensitive_operation.trim() }
+          : {}),
+      },
+    } : {}),
+  };
+}
+
+function normalizeServerComposioConnectorConfig(raw: unknown): ServerComposioConnectorConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === 'string' ? r.id.trim().toLowerCase() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id)) return null;
+  if (r.auth_mode !== 'composio') return null;
+  const categoryRaw = typeof r.category === 'string' ? r.category.trim() : '';
+  const category = categoryRaw as ServerConnectorCategory;
+  if (!DCR_CONNECTOR_CATEGORIES.has(category)) return null;
+  const composio = r.composio && typeof r.composio === 'object' && !Array.isArray(r.composio)
+    ? r.composio as Record<string, unknown>
+    : r;
+  const toolkit = typeof composio.toolkit === 'string' ? composio.toolkit.trim().toLowerCase() : '';
+  const authConfigId = typeof composio.auth_config_id === 'string' ? composio.auth_config_id.trim() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) return null;
+  const metering = r.usage_metering as Record<string, unknown> | null | undefined;
+  const tariff = metering?.provider === 'composio' ? metering.credits_milli_per_call : undefined;
+  const toolsRaw = Array.isArray(composio.tools) ? composio.tools : [];
+  const tools = toolsRaw
+    .map((tool) => normalizeComposioToolConfig(tool))
+    .filter((tool): tool is ServerComposioToolConfig => !!tool);
+  const displayName = typeof r.display_name === 'string' && r.display_name.trim() ? r.display_name.trim() : id;
+  const iconSvg = typeof r.icon_svg === 'string' && r.icon_svg.trim() ? r.icon_svg.trim() : undefined;
+  return {
+    id,
+    display_name: displayName,
+    ...(iconSvg ? { icon_svg: iconSvg } : {}),
+    category,
+    description_zh: typeof r.description_zh === 'string' ? r.description_zh.trim() : '',
+    description_en: typeof r.description_en === 'string' ? r.description_en.trim() : '',
+    description_ja: typeof r.description_ja === 'string' ? r.description_ja.trim() : '',
+    description_pt: typeof r.description_pt === 'string' ? r.description_pt.trim() : '',
+    description_es: typeof r.description_es === 'string' ? r.description_es.trim() : '',
+    description_fr: typeof r.description_fr === 'string' ? r.description_fr.trim() : '',
+    description_ko: typeof r.description_ko === 'string' ? r.description_ko.trim() : '',
+    description_de: typeof r.description_de === 'string' ? r.description_de.trim() : '',
+    description_ru: typeof r.description_ru === 'string' ? r.description_ru.trim() : '',
+    description_it: typeof r.description_it === 'string' ? r.description_it.trim() : '',
+    requires_credits: true,
+    auth_mode: 'composio',
+    composio: {
+      toolkit,
+      auth_config_id: authConfigId,
+      ...(tools.length ? { tools } : {}),
+    },
+    transport_template: null,
+    usage_metering: {
+      provider: 'composio',
+      credits_milli_per_call: typeof tariff === 'number' && Number.isSafeInteger(tariff) && tariff > 0
+        ? tariff : 420,
+    },
+  };
+}
+
+function normalizeServerConnectorCatalogConfig(raw: unknown): ServerConnectorCatalogConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ServerConnectorCatalogConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const entry = normalizeServerDcrConnectorConfig(item) || normalizeServerComposioConnectorConfig(item);
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+function mergeServerConnectorCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ServerConnectorCatalogConfig[] {
+  const byId = new Map<string, ServerConnectorCatalogConfig>();
+  for (const entry of normalizeServerConnectorCatalogConfig(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerConnectorCatalogConfig(overrideRaw)) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
+
+function normalizeAppUpdatePolicyConfig(raw: unknown): Partial<AppUpdatePolicyConfig> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const min = r.min_version;
+  return typeof min === 'string' ? { min_version: min.trim() } : {};
+}
+
+function mergeAppUpdatePolicyConfig(baseRaw: unknown, overrideRaw: unknown): AppUpdatePolicyConfig {
+  const base = normalizeAppUpdatePolicyConfig(baseRaw);
+  const override = normalizeAppUpdatePolicyConfig(overrideRaw);
+  return {
+    min_version: override.min_version ?? base.min_version ?? '',
+  };
+}
+
+function normalizeStringPatternList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter(Boolean);
+}
+
+function normalizeStatusList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const item of value) {
+    const n = typeof item === 'number' ? item : Number(item);
+    if (!Number.isInteger(n) || n < 100 || n > 599 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function normalizeRetryErrorPolicyConfig(raw: unknown): Partial<RetryErrorPolicyConfig> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const permanentStatuses = normalizeStatusList(r.permanent_statuses);
+  const permanentMessagePatterns = normalizeStringPatternList(r.permanent_message_patterns);
+  const permanentCodePatterns = normalizeStringPatternList(r.permanent_code_patterns);
+
+  return {
+    ...(permanentStatuses !== undefined ? { permanent_statuses: permanentStatuses } : {}),
+    ...(permanentMessagePatterns !== undefined ? { permanent_message_patterns: permanentMessagePatterns } : {}),
+    ...(permanentCodePatterns !== undefined ? { permanent_code_patterns: permanentCodePatterns } : {}),
+  };
+}
+
+function mergeRetryErrorPolicyConfig(baseRaw: unknown, overrideRaw: unknown): RetryErrorPolicyConfig {
+  const base = normalizeRetryErrorPolicyConfig(baseRaw);
+  const override = normalizeRetryErrorPolicyConfig(overrideRaw);
+  return {
+    permanent_statuses: override.permanent_statuses !== undefined
+      ? [...override.permanent_statuses]
+      : base.permanent_statuses !== undefined
+        ? [...base.permanent_statuses]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_statuses],
+    permanent_message_patterns: override.permanent_message_patterns !== undefined
+      ? [...override.permanent_message_patterns]
+      : base.permanent_message_patterns !== undefined
+        ? [...base.permanent_message_patterns]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_message_patterns],
+    permanent_code_patterns: override.permanent_code_patterns !== undefined
+      ? [...override.permanent_code_patterns]
+      : base.permanent_code_patterns !== undefined
+        ? [...base.permanent_code_patterns]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_code_patterns],
+  };
+}
+
+function mergeModelCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ModelCatalogConfig {
+  const base = normalizeModelCatalogConfig(baseRaw);
+  const override = normalizeModelCatalogConfig(overrideRaw);
+  return {
+    providers: {
+      ...base.providers,
+      ...override.providers,
+    },
+    openAICompatibleProviders: {
+      ...base.openAICompatibleProviders,
+      ...override.openAICompatibleProviders,
+    },
+    imageGeneration: {
+      ...base.imageGeneration,
+      ...override.imageGeneration,
+    },
+  };
+}
+
+const DEFAULT_MODEL_CATALOG: ModelCatalogConfig = {
+  providers: Object.fromEntries(
+    Object.entries(DEFAULT_PROVIDER_MODELS).map(([providerId, models]) => [
+      providerId,
+      models.map(cloneProviderModelEntry),
+    ]),
+  ),
+  openAICompatibleProviders: {},
+  imageGeneration: Object.fromEntries(
+    Object.entries(DEFAULT_IMAGE_GEN_BY_PROVIDER).map(([providerId, capability]) => [
+      providerId,
+      { ...capability },
+    ]),
+  ),
+};
+
+clientConfig.registerDefault<ModelCatalogConfig>('model_catalog', DEFAULT_MODEL_CATALOG, {
+  effect: 'immediate',
+  merge: mergeModelCatalogConfig,
+});
+
+const DEFAULT_GOOGLE_CONNECTORS_CONFIG: GoogleConnectorsConfig = {
+  google: 'disabled',
+  gmail: 'disabled',
+};
+
+clientConfig.registerDefault<GoogleConnectorsConfig>('google_connectors', DEFAULT_GOOGLE_CONNECTORS_CONFIG, {
+  effect: 'immediate',
+  merge: mergeGoogleConnectorsConfig,
+});
+
+clientConfig.registerDefault<ServerDcrConnectorConfig[]>('connectors.dcr_catalog', [], {
+  effect: 'immediate',
+  merge: mergeServerDcrConnectorsConfig,
+});
+
+clientConfig.registerDefault<ServerConnectorCatalogConfig[]>('connectors.catalog', [], {
+  effect: 'immediate',
+  merge: mergeServerConnectorCatalogConfig,
+});
+
+clientConfig.registerDefault<boolean>('model.deepseek.enabled', true, {
+  effect: 'immediate',
+});
+
+clientConfig.registerDefault<AppUpdatePolicyConfig>('app_update', { min_version: '' }, {
+  effect: 'immediate',
+  merge: mergeAppUpdatePolicyConfig,
+});
+
+clientConfig.registerDefault<QuickStartConfigEntry[]>('commander.quick_start', () => (
+  DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry }))
+), {
+  effect: 'immediate',
+  merge: mergeQuickStartConfig,
+});
+
+clientConfig.registerDefault<RetryErrorPolicyConfig>(
+  'model.retry_error_policy',
+  cloneRetryErrorPolicyConfig(DEFAULT_RETRY_ERROR_POLICY),
+  {
+    effect: 'immediate',
+    merge: mergeRetryErrorPolicyConfig,
+  },
+);
+
+function loadModelCatalog(): ModelCatalogConfig {
+  const cfg = clientConfig.get<ModelCatalogConfig>('model_catalog', DEFAULT_MODEL_CATALOG);
+  if (!cfg || typeof cfg !== 'object') return DEFAULT_MODEL_CATALOG;
+  return {
+    providers: cfg.providers && typeof cfg.providers === 'object' ? cfg.providers : DEFAULT_MODEL_CATALOG.providers,
+    openAICompatibleProviders: cfg.openAICompatibleProviders
+      && typeof cfg.openAICompatibleProviders === 'object'
+      ? cfg.openAICompatibleProviders
+      : DEFAULT_MODEL_CATALOG.openAICompatibleProviders,
+    imageGeneration: cfg.imageGeneration && typeof cfg.imageGeneration === 'object'
+      ? cfg.imageGeneration
+      : DEFAULT_MODEL_CATALOG.imageGeneration,
+  };
+}
+
+export function getConfiguredProviderModels(providerId: string): { models: ProviderModelEntry[] } | null {
+  const id = normalizeKey(providerId);
+  if (!id) return null;
+  const cfg = loadModelCatalog();
+  if (!Object.prototype.hasOwnProperty.call(cfg.providers, id)) return null;
+  return {
+    models: cfg.providers[id].map(cloneProviderModelEntry),
+  };
+}
+
+export function getConfiguredImageGenCapability(providerId: string): ImageGenCapabilityOverride | null {
+  const id = normalizeKey(providerId);
+  if (!id) return null;
+  const cfg = loadModelCatalog();
+  const capability = cfg.imageGeneration[id];
+  if (!capability) return null;
+  return { ...capability };
+}
+
+export function getGoogleConnectorsConfig(): GoogleConnectorsConfig {
+  return mergeGoogleConnectorsConfig(
+    DEFAULT_GOOGLE_CONNECTORS_CONFIG,
+    clientConfig.get('google_connectors', DEFAULT_GOOGLE_CONNECTORS_CONFIG),
+  );
+}
+
+export function getServerDcrConnectorCatalogConfig(): ServerDcrConnectorConfig[] {
+  return mergeServerDcrConnectorsConfig([], clientConfig.get('connectors.dcr_catalog', []));
+}
+
+export function getServerConnectorCatalogConfig(): ServerConnectorCatalogConfig[] {
+  const unified = mergeServerConnectorCatalogConfig([], clientConfig.get('connectors.catalog', []));
+  const legacyDcr = getServerDcrConnectorCatalogConfig();
+  const byId = new Map<string, ServerConnectorCatalogConfig>();
+  for (const entry of legacyDcr) byId.set(entry.id, entry);
+  for (const entry of unified) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
+
+export function isDeepSeekModelConfigEnabled(): boolean {
+  return clientConfig.get<boolean>('model.deepseek.enabled', true) !== false;
+}
+
+export function getMinimumAppVersion(): string {
+  const policy = mergeAppUpdatePolicyConfig(
+    { min_version: '' },
+    clientConfig.get('app_update', { min_version: '' }),
+  );
+  return policy.min_version.trim();
+}
+
+export function getQuickStartConfig(): QuickStartConfigEntry[] {
+  return getQuickStartConfigState().items;
+}
+
+export function getQuickStartConfigState(): QuickStartConfigState {
+  const raw = clientConfig.getServerValue('commander.quick_start');
+  if (raw !== undefined) {
+    const serverItems = normalizeQuickStartConfig(raw);
+    if (serverItems) {
+      lastInvalidQuickStartConfigHash = '';
+      return {
+        items: serverItems.map((entry) => ({ ...entry })),
+        source: 'server_config',
+      };
+    }
+    const cache = clientConfig.readCache();
+    const configHash = String(cache.config_hash || 'server-config-without-hash');
+    if (lastInvalidQuickStartConfigHash !== configHash) {
+      lastInvalidQuickStartConfigHash = configHash;
+      log.warn('invalid Commander quick-start config; using open defaults', {
+        config_hash: cache.config_hash || '',
+      });
+    }
+  }
+  return {
+    items: DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry })),
+    source: 'pc_default',
+  };
+}
+
+export function getRetryErrorPolicyConfig(): RetryErrorPolicyConfig {
+  const fallback = cloneRetryErrorPolicyConfig(DEFAULT_RETRY_ERROR_POLICY);
+  return mergeRetryErrorPolicyConfig(
+    DEFAULT_RETRY_ERROR_POLICY,
+    clientConfig.get('model.retry_error_policy', fallback),
+  );
+}
+
+export interface OpenAICompatibleProviderConfig {
+  id: string;
+  label: string;
+  baseUrl: string;
+  docsUrl?: string;
+}
+
+const CONFIGURED_PROVIDER_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
+
+function normalizePublicHttpsUrl(
+  raw: unknown,
+  options: { baseUrl: boolean },
+): string | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value || value.length > 2048) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (
+    url.protocol !== 'https:'
+    || !!url.username
+    || !!url.password
+    || !hostname
+    || !hostname.includes('.')
+    || hostname === 'localhost'
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.local')
+    || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname)
+    || hostname.includes(':')
+  ) return null;
+  if (options.baseUrl && (url.search || url.hash)) return null;
+  return options.baseUrl
+    ? url.toString().replace(/\/+$/, '')
+    : url.toString();
+}
+
+function normalizeOpenAICompatibleProvider(
+  rawId: string,
+  value: unknown,
+): OpenAICompatibleProviderConfig | null {
+  const id = normalizeKey(rawId).toLowerCase();
+  if (!CONFIGURED_PROVIDER_ID_RE.test(id)) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const label = typeof record.label === 'string' ? record.label.trim() : '';
+  if (!label || label.length > 80) return null;
+  const baseUrl = normalizePublicHttpsUrl(record.baseUrl, { baseUrl: true });
+  if (!baseUrl) return null;
+  const docsUrl = record.docsUrl === undefined
+    ? undefined
+    : normalizePublicHttpsUrl(record.docsUrl, { baseUrl: false });
+  if (record.docsUrl !== undefined && !docsUrl) return null;
+  return {
+    id,
+    label,
+    baseUrl,
+    ...(docsUrl ? { docsUrl } : {}),
+  };
+}
+
+function mergeOpenAICompatibleProviderSection(
+  target: Record<string, OpenAICompatibleProviderConfig>,
+  value: unknown,
+): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  for (const [rawId, rawProvider] of Object.entries(value as Record<string, unknown>)) {
+    const provider = normalizeOpenAICompatibleProvider(rawId, rawProvider);
+    if (provider) target[provider.id] = provider;
+  }
+}
+
+export function getConfiguredOpenAICompatibleProviders(): OpenAICompatibleProviderConfig[] {
+  return Object.values(loadModelCatalog().openAICompatibleProviders).map((provider) => ({
+    ...provider,
+  }));
+}
+
+export function getConfiguredOpenAICompatibleProvider(
+  providerId: string,
+): OpenAICompatibleProviderConfig | null {
+  const id = normalizeKey(providerId).toLowerCase();
+  if (!id) return null;
+  const provider = loadModelCatalog().openAICompatibleProviders[id];
+  return provider ? { ...provider } : null;
+}

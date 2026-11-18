@@ -1,0 +1,2917 @@
+// ─── Utilities ───
+
+function _baseLang(lang) {
+  return (lang || '').split(/[-_]/)[0] || 'en';
+}
+
+function descriptionLocale(lang) {
+  return _baseLang(lang) === 'zh' ? 'zh' : 'en';
+}
+
+function normalizeDisplayText(value) {
+  return String(value || '')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\{2,}/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function pickLocalizedField(obj, base, lang, fallbackLang = 'en') {
+  if (!obj || !base) return '';
+  const tag = String(lang || '').trim().toLowerCase().replace(/_/g, '-');
+  const cur = ['zh-tw', 'pt-pt', 'es-419'].includes(tag) ? tag : _baseLang(tag);
+  const candidates = [
+    `${base}_${cur}`,
+    `${base}_${fallbackLang}`,
+    `${base}_en`,
+    `${base}_zh`,
+    base,
+  ];
+  const seen = new Set();
+  for (const key of candidates) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const v = obj[key];
+    if (v !== null && v !== undefined && String(v).trim()) return normalizeDisplayText(v);
+  }
+  return '';
+}
+
+function pickLocalizedName(obj, lang) {
+  return pickLocalizedField(obj, 'name', lang);
+}
+
+/** Pick a skill / agent description for the active UI language with cross-
+ *  language fallback. Mirrors `pickDescription` in core-agent's skills/types
+ *  — keep these two in sync if the fallback rule changes.
+ *
+ *  Description storage is intentionally still zh/en only: non-Chinese UI
+ *  languages use the English description first. Cross-fallback guarantees a
+ *  non-empty string whenever any side is filled. */
+function pickDesc(spec, lang) {
+  if (!spec) return '';
+  const primary = pickLocalizedField(spec, 'description', descriptionLocale(lang));
+  if (primary) return primary;
+  return pickLocalizedField(spec, 'description', lang);
+}
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// Safe resource-URI allow-list. Mirrors DOMPurify's default scheme regex plus the
+// app's own privileged schemes (chat-media / chat-app / kb-file, registered
+// in main/index.ts) and blob: (attachment object URLs), so media / artifact /
+// KB resources survive sanitization. Scheme-less (relative / anchor / path) refs
+// pass via the `[^a-z]` / trailing-non-scheme-char branches; javascript: /
+// data: / vbscript: / file: do NOT match and are dropped.
+const _SAFE_URI_RE = /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|chat-media|chat-app|kb-file|blob):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+
+// Clickable top-level links are intentionally narrower than resource URLs.
+// App-private/blob/relative paths may be valid iframe or media sources but
+// must never navigate the privileged renderer. Hash anchors stay in-page.
+const _SAFE_EXTERNAL_LINK_RE = /^(?:https?|mailto|tel|callto|sms|xmpp):/i;
+
+// Return the href if it is a supported external link or in-page anchor, else
+// '' (render as text). Main performs stricter per-protocol validation before
+// asking the OS to open any external application.
+function _safeHref(url) {
+  const u = String(url === null || url === undefined ? '' : url).trim();
+  if (!u || /[\u0000-\u001f\u007f]/.test(u)) return '';
+  if (u.charAt(0) === '#') return u;
+  return _SAFE_EXTERNAL_LINK_RE.test(u) ? u : '';
+}
+
+// XSS sanitizer for HTML that ends up in innerHTML and may carry untrusted
+// text (chat message bodies, LLM / relay / marketplace / skill / KB content).
+// DOMPurify (vendored, loaded before this module) strips scripts, event
+// handlers, and dangerous URL schemes while preserving the markdown
+// renderer's legitimate output: tables, lists, code, links, images, the
+// :::chart-bar / :::dashboard SVG, and the MathJax delimiters (typeset later
+// on the live DOM). Pure Node tests have no renderer DOM and preserve their
+// generated markup for inspection. In a real renderer, however, a missing
+// DOMPurify runtime fails closed by escaping the whole snippet as text.
+let _sanitizeHookInstalled = false;
+let _sanitizeMissingWarned = false;
+let _sanitizeSvgIconMissingWarned = false;
+function _domPurify() {
+  if (typeof window !== 'undefined' && window.DOMPurify) return window.DOMPurify;
+  if (typeof DOMPurify !== 'undefined') return DOMPurify; // eslint-disable-line no-undef
+  return null;
+}
+function _sanitizeHtmlWithoutPurifier(html) {
+  return escapeHtml(html === null || html === undefined ? '' : String(html));
+}
+function _domPurifyConfig(values) {
+  // A null-prototype config prevents unrelated Object.prototype pollution
+  // from silently enabling DOMPurify options. Custom elements stay disabled
+  // explicitly even if the runtime default changes.
+  const config = Object.assign(Object.create(null), values || {});
+  config.CUSTOM_ELEMENT_HANDLING = Object.freeze({
+    tagNameCheck: null,
+    attributeNameCheck: null,
+    allowCustomizedBuiltInElements: false,
+  });
+  return config;
+}
+function sanitizeHtml(html) {
+  const s = (html === null || html === undefined) ? '' : String(html);
+  const DP = _domPurify();
+  if (!DP || typeof DP.sanitize !== 'function') {
+    if (typeof window !== 'undefined' && !_sanitizeMissingWarned) {
+      _sanitizeMissingWarned = true;
+      try { console.error('[security] DOMPurify unavailable — rendering HTML as text'); } catch (_) {}
+    }
+    return typeof window === 'undefined' ? s : _sanitizeHtmlWithoutPurifier(s);
+  }
+  if (!_sanitizeHookInstalled && typeof DP.addHook === 'function') {
+    // Any link opening a new browsing context must carry rel=noopener noreferrer.
+    // Resource protocols remain valid for img/video/iframe attributes, but
+    // strip them from anchors so the UI never advertises a link that the
+    // top-level navigation boundary must reject.
+    DP.addHook('afterSanitizeAttributes', (node) => {
+      if (node.tagName === 'A' && node.getAttribute) {
+        const href = node.getAttribute('href');
+        if (href && !_safeHref(href)) node.removeAttribute('href');
+        if (node.getAttribute('target')) node.setAttribute('rel', 'noopener noreferrer');
+      }
+    });
+    _sanitizeHookInstalled = true;
+  }
+  return DP.sanitize(s, _domPurifyConfig({
+    ADD_ATTR: ['target'],
+    ALLOWED_URI_REGEXP: _SAFE_URI_RE,
+  }));
+}
+
+function sanitizeSvgIconHtml(svg) {
+  const dirty = (svg === null || svg === undefined) ? '' : String(svg).trim();
+  if (!dirty || !/^<svg(?:\s|>)/i.test(dirty)) return '';
+  const DP = _domPurify();
+  if (!DP || typeof DP.sanitize !== 'function') {
+    if (typeof window !== 'undefined' && !_sanitizeSvgIconMissingWarned) {
+      _sanitizeSvgIconMissingWarned = true;
+      try { console.error('[security] DOMPurify unavailable — connector SVG icons disabled'); } catch (_) {}
+    }
+    return '';
+  }
+  const clean = String(DP.sanitize(dirty, _domPurifyConfig({
+    USE_PROFILES: { svg: true, svgFilters: true },
+    ALLOWED_URI_REGEXP: _SAFE_URI_RE,
+    FORBID_TAGS: ['a', 'embed', 'foreignObject', 'foreignobject', 'iframe', 'image', 'object', 'script', 'style'],
+  })) || '').trim();
+  return /^<svg(?:\s|>)/i.test(clean) ? clean : '';
+}
+
+function normalizeCatalogSource(source) {
+  const s = String(source || '').trim().toLowerCase();
+  if (s === 'builtin' || s === 'platform') return 'marketplace';
+  if (s === 'custom') return 'custom';
+  return s;
+}
+
+function isCustomCatalogSource(source) {
+  return normalizeCatalogSource(source) === 'custom';
+}
+
+function isMarketplaceCatalogSource(source) {
+  return normalizeCatalogSource(source) === 'marketplace';
+}
+
+function sanitizeMathExpressionForMathJax(expr) {
+  return String(expr || '')
+    // `\boldsymbol` lives in a MathJax extension that our offline vendor
+    // bundle cannot lazy-load. Use base TeX bold instead so one macro does
+    // not make the whole bubble fall back to raw TeX.
+    .replace(/\\boldsymbol\b/g, '\\mathbf')
+    .replace(/(^|[^\\])_{2,}/g, (match, prefix) => {
+      const len = match.length - prefix.length;
+      const em = Math.max(1.5, Math.min(4, len * 0.5));
+      return `${prefix}\\underline{\\hspace{${em}em}}`;
+    });
+}
+
+function catalogSourceLabel(source, kind = 'agents') {
+  const normalized = normalizeCatalogSource(source);
+  const base = kind === 'skills' ? 'skills' : 'agents';
+  if (normalized === 'custom') return t(`${base}.source_custom`);
+  if (normalized === 'marketplace') return t(`${base}.source_marketplace`);
+  return source ? String(source) : '';
+}
+
+// Full markdown renderer (used for skill detail view and chat)
+// Save/restore around the whole pass: `:::dashboard` bodies recurse back into
+// here, and a throw inside phase 2 must not leak one message's embed set into
+// the next render.
+function renderMarkdownFull(md, blockCache) {
+  const prevEmbeddedMediaKeys = _mdEmbeddedMediaKeys;
+  try {
+    return _renderMarkdownFullInner(md, blockCache);
+  } finally {
+    _mdEmbeddedMediaKeys = prevEmbeddedMediaKeys;
+  }
+}
+
+// A stream owns one cache of its current document, never a history of growing
+// replies. The canonical parser still resolves cross-line syntax and media
+// deduplication before deciding which balanced output blocks can be reused.
+function renderMarkdownBlocks(md, cache) {
+  renderMarkdownFull(md, cache);
+  return cache.blocks;
+}
+
+function _renderMarkdownFullInner(md, blockCache) {
+  if (!md) {
+    if (blockCache) { blockCache.blocks = []; blockCache.inline = new Map(); blockCache.sanitized = new Map(); }
+    return '';
+  }
+
+  // Strip YAML frontmatter
+  md = md.replace(/^---[\s\S]*?---\n?/, '');
+
+  // ── Phase 1: protect code blocks & :::chart-bar directives ──
+  const protectedBlocks = [];
+  let protectedHtmlContext = false;
+  const protect = (html) => {
+    const idx = protectedBlocks.length;
+    protectedBlocks.push(html);
+    return `\x00BLOCK${idx}\x00`;
+  };
+
+  // Code blocks. Some models wrap a dashboard spec in ```json instead of the
+  // `:::dashboard` directive; render only high-confidence dashboard-shaped JSON
+  // and keep all other fenced code verbatim.
+  //
+  // The fence is length-aware and must open a line, both per CommonMark. A
+  // hardcoded three-backtick opener that could also start mid-sentence split
+  // ```` into "``` + a stray backtick", so one prose mention of a fence
+  // re-paired every later fence in the message: the table, headings and list
+  // items after it were swallowed into a `<pre>`, and the HTML sample inside
+  // the *next* real fence escaped its box and rendered as live DOM
+  // (2026-08-27, a reply that documented this renderer).
+  //
+  // Two deliberate divergences from CommonMark, both load-bearing for the
+  // dashboard recovery path in `utils-dashboard.test.ts`: the newline after the
+  // info string stays optional, and the closer may sit on the opening line.
+  // `>` counts as line-opening whitespace because fences are protected before
+  // blockquotes are parsed, and quoted history arrives as `> ```text` — 78 of
+  // the 100 non-line-start fences in this account's chat store are that shape,
+  // and all 22 of the rest are prose *about* fences, wrapped in inline code.
+  md = md.replace(/(^|\n)([ \t>]*)(`{3,})([^\n`]*)\n?([\s\S]*?)\3`*/g, (_, lead, indent, _fence, lang, code) => {
+    const dashboard = _renderDashboardFromJsonBlock(lang, code);
+    if (dashboard) return `${lead}${indent}${protect(dashboard)}`;
+    return `${lead}${indent}${protect(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`)}`;
+  });
+
+  // :::chart-bar directives
+  md = md.replace(/:::chart-bar\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
+    try {
+      const data = JSON.parse(body.trim());
+      // Legacy chart values are interpolated before the sanitizer (unlike
+      // labels/units). A nonnumeric value may carry raw HTML across blocks,
+      // including '<' decoded from a JSON unicode escape.
+      if (Array.isArray(data) && data.some(item => String(item?.value ?? '').includes('<'))) protectedHtmlContext = true;
+      return protect(renderChartBar(data));
+    } catch (e) {
+      return protect(`<pre class="code-view"><code>${escapeHtml(body.trim())}</code></pre>`);
+    }
+  });
+
+  // :::dashboard directives — JSON component tree → recursive HTML render.
+  // `_parseDashboardSpec` is strict-first, then attempts bounded repairs for
+  // the brace miscounts LLMs reliably produce. Anything it still can't parse
+  // falls back to a code-view block so the user sees the raw body instead of
+  // a silently-dropped section.
+  md = md.replace(/:::dashboard\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
+    const placeholder = _protectedDashboardPlaceholder(body, protectedBlocks);
+    if (placeholder) return placeholder;
+    const spec = _parseDashboardSpec(body);
+    if (spec !== undefined) return protect(_renderDashboardOrSource(spec, body));
+    return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
+  });
+
+  // Last-chance recovery for final answers that contain a dashboard JSON block
+  // directly in prose (no :::dashboard fence, no ```json fence).
+  md = _replaceStandaloneDashboardJsonBlocks(md, protect);
+
+  // Math blocks — protect so markdown phase 2 (emphasis, autolinking, html
+  // escapes) doesn't mangle LaTeX before MathJax sees it. Order matters:
+  //   1. `$$...$$` and `\[...\]` (display) — multi-line, must match first
+  //   2. `\(...\)` (inline, latex-native) — unambiguous, no `$` collision
+  //   3. `$...$` (inline, markdown-style) — single line, no nested `$`,
+  //      and we skip the case where the `$` is followed by a digit without
+  //      a space to avoid eating "$50 / $100" currency mentions. MathJax's
+  //      `processEscapes: true` also lets authors write `\$` for literal.
+  // We wrap the preserved delimiters in the output so MathJax can still
+  // locate them — we're only shielding the inner characters from markdown.
+  md = md.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => protect(`$$${sanitizeMathExpressionForMathJax(expr)}$$`));
+  md = md.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => protect(`\\[${sanitizeMathExpressionForMathJax(expr)}\\]`));
+  md = md.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => protect(`\\(${sanitizeMathExpressionForMathJax(expr)}\\)`));
+  md = md.replace(/(^|[^\\$])\$(?!\s|\d)([^\$\n]+?)\$(?!\d)/g,
+    (_, pre, expr) => pre + protect(`$${sanitizeMathExpressionForMathJax(expr)}$`));
+
+  // Inline code — protect from phase 2 transforms so autolinking / emphasis
+  // don't touch its contents. Delimiters pair on equal-length backtick runs
+  // (CommonMark), so a span can carry backticks of its own: `` ` `` and
+  // ```` ``` ```` are the only way to show a literal backtick or fence in
+  // prose, and a single-backtick-only rule rendered both as garbage.
+  md = md.replace(/(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/g, (_, _ticks, raw) => {
+    // CommonMark strips one leading and one trailing space when both are
+    // present and the content is not all spaces — that padding is what keeps
+    // the delimiters apart from the backticks being shown.
+    const content = (raw.length >= 2 && raw.startsWith(' ') && raw.endsWith(' ') && raw.trim())
+      ? raw.slice(1, -1)
+      : raw;
+    return protect(`<code>${escapeHtml(content)}</code>`);
+  });
+
+  // Visualization content references are a standalone structured protocol.
+  // Parse after shielding code examples, then protect the generated mount
+  // from Markdown transforms just like the existing dashboard blocks.
+  md = md.replace(/^[ \t]*\uE200visualize\uE202([^\uE200\uE201\uE202\r\n]*)\uE201[ \t]*\r?$/gm, (source, body) => {
+    const html = _markdownVisualizationHtml(body);
+    return html ? protect(html) : source;
+  });
+
+  // ── Phase 2: line-by-line parsing ──
+  // Collected after phase 1 so a fenced or inline-code `![](…)` sample — now a
+  // placeholder — is not mistaken for an embed this message actually shows.
+  _mdEmbeddedMediaKeys = _collectEmbeddedMediaKeys(md);
+  // Raw HTML (including '<' preserved inside TeX) can carry parser context
+  // across blocks. Generated code/dashboard HTML starts with a tag and is
+  // self-contained; plain protected TeX is not HTML-escaped by this renderer.
+  // Keep the canonical whole-document sanitize context for those inputs.
+  const splitBlocks = blockCache && !protectedHtmlContext && !md.includes('<')
+    && !protectedBlocks.some(block => !block.startsWith('<') && block.includes('<'));
+  const previousInline = blockCache?.inline;
+  const nextInline = blockCache ? new Map() : null;
+  const formatInline = (text) => {
+    // Media/link rendering can depend on whole-message deduplication and UI
+    // locale. Re-evaluate those lines; ordinary prose/code tokens are pure.
+    if (!nextInline || text.includes('[')) return inlineFormat(text);
+    const html = nextInline.get(text) ?? previousInline?.get(text) ?? inlineFormat(text);
+    nextInline.set(text, html);
+    return html;
+  };
+  const lines = md.split('\n');
+  const out = [];
+  const blockEnds = [];
+  let blockStart = 0;
+  const endBlock = () => {
+    if (!splitBlocks || out.length === blockStart) return;
+    blockEnds.push(out.length);
+    blockStart = out.length;
+  };
+  // Stack of open lists: { type:'ul'|'ol', indent:number,
+  //   siblingOpen:boolean }. Indent is measured in spaces (tabs → 2 spaces).
+  const listStack = [];
+  let inBlockquote = false;
+  let tableRows = [];
+
+  const closeList = (top) => {
+    if (top.siblingOpen) out.push('</li>');
+    out.push(`</${top.type}>`);
+  };
+  const flushList = () => {
+    const hadList = listStack.length > 0;
+    while (listStack.length) {
+      const top = listStack.pop();
+      closeList(top);
+      if (listStack.length) {
+        out.push('</li>');
+        listStack[listStack.length - 1].siblingOpen = false;
+      }
+    }
+    if (hadList) endBlock();
+  };
+  const flushBQ = () => { if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; endBlock(); } };
+  const flushTable = () => {
+    if (!tableRows.length) return;
+    out.push(buildTable(tableRows, formatInline));
+    tableRows = [];
+    endBlock();
+  };
+  const openList = (type, indent, orderedStart) => {
+    const start = type === 'ol' ? Number.parseInt(orderedStart || '1', 10) : 1;
+    const startAttr = Number.isSafeInteger(start) && start !== 1 ? ` start="${start}"` : '';
+    out.push(`<${type}${startAttr}>`);
+    listStack.push({ type, indent, siblingOpen: false });
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!listStack.length && !inBlockquote && !tableRows.length) endBlock();
+    const line = lines[i];
+
+    // Table: detect rows starting and ending with |
+    if (/^\|(.+)\|$/.test(line.trim())) {
+      flushList(); flushBQ();
+      tableRows.push(line.trim());
+      continue;
+    } else {
+      flushTable();
+    }
+
+    // Headings
+    const hm = line.match(/^(#{1,6})\s+(.*)/);
+    if (hm) {
+      flushList(); flushBQ();
+      out.push(`<h${hm[1].length}>${formatInline(hm[2])}</h${hm[1].length}>`);
+      continue;
+    }
+    // Horizontal rule
+    if (/^[-*_]{3,}\s*$/.test(line)) {
+      flushList(); flushBQ();
+      out.push('<hr>');
+      continue;
+    }
+    // Blockquote
+    const bqm = line.match(/^>\s?(.*)/);
+    if (bqm) {
+      flushList();
+      if (!inBlockquote) { out.push('<blockquote>'); inBlockquote = true; }
+      out.push(`<p>${formatInline(bqm[1])}</p>`);
+      continue;
+    } else { flushBQ(); }
+
+    // List line (ul or ol) — indent-aware, nested
+    const ulm = line.match(/^(\s*)[-*+]\s+(.*)$/);
+    const olm = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+    if (ulm || olm) {
+      const raw = ulm || olm;
+      const indent = raw[1].replace(/\t/g, '  ').length;
+      const type = ulm ? 'ul' : 'ol';
+      const orderedStart = olm ? olm[2] : null;
+      let content = ulm ? ulm[2] : olm[3];
+
+      // Task list checkbox prefix
+      const tm = content.match(/^\[([ xX])\]\s+(.*)$/);
+      let taskHtml = '';
+      let liClass = '';
+      if (tm) {
+        const checked = tm[1].toLowerCase() === 'x';
+        taskHtml = `<input type="checkbox" disabled${checked ? ' checked' : ''}> `;
+        liClass = ' class="task-item"';
+        content = tm[2];
+      }
+
+      // Close any lists that are deeper than this line's indent
+      while (listStack.length && listStack[listStack.length - 1].indent > indent) {
+        const top = listStack.pop();
+        closeList(top);
+        if (listStack.length) {
+          out.push('</li>');
+          listStack[listStack.length - 1].siblingOpen = false;
+        }
+      }
+      // Same indent but different list type → close and reopen
+      if (listStack.length &&
+          listStack[listStack.length - 1].indent === indent &&
+          listStack[listStack.length - 1].type !== type) {
+        const top = listStack.pop();
+        closeList(top);
+      }
+      // Open a new list if none at this indent
+      if (!listStack.length || listStack[listStack.length - 1].indent < indent) {
+        openList(type, indent, orderedStart);
+      }
+
+      // Close previous sibling <li> at this level before starting new one
+      const top = listStack[listStack.length - 1];
+      if (top.siblingOpen) out.push('</li>');
+
+      out.push(`<li${liClass}>${taskHtml}${formatInline(content)}`);
+      top.siblingOpen = true;
+      continue;
+    }
+
+    // Blank line inside a list: treat as soft break — keep list open but
+    // close the current item so the next sibling starts cleanly.
+    if (!line.trim() && listStack.length) {
+      out.push('');
+      continue;
+    }
+
+    flushList();
+    if (!line.trim()) { out.push(''); continue; }
+    const inline = formatInline(line);
+    // A line that held nothing but a dropped duplicate media link renders to
+    // nothing; emitting `<p></p>` would leave its vertical margin as a gap
+    // where the second copy of the image used to be.
+    if (!inline.trim()) continue;
+    out.push(`<p>${inline}</p>`);
+  }
+  flushList(); flushBQ(); flushTable();
+  endBlock();
+
+  if (blockCache) {
+    if (!splitBlocks) blockEnds.push(out.length);
+    const sanitized = new Map();
+    let start = 0;
+    blockCache.blocks = blockEnds.map(end => {
+      const raw = _restoreMarkdownBlocks((start ? '\n' : '') + out.slice(start, end).join('\n'), protectedBlocks);
+      start = end;
+      const html = sanitized.get(raw) ?? blockCache.sanitized?.get(raw) ?? sanitizeHtml(raw);
+      sanitized.set(raw, html);
+      return html;
+    });
+    blockCache.inline = nextInline;
+    blockCache.sanitized = sanitized;
+    return blockCache.blocks.join('');
+  }
+
+  // Every path sanitizes after restoring code/chart/math placeholders.
+  return sanitizeHtml(_restoreMarkdownBlocks(out.join('\n'), protectedBlocks));
+}
+
+function _restoreMarkdownBlocks(html, protectedBlocks) {
+  // Restore protected blocks
+  // Loop until all placeholders are resolved. A placeholder created late
+  // can wrap an earlier-created one (e.g. inline code `$y$` wraps the math
+  // placeholder for $y$); a single forward pass would miss the inner. Also
+  // use function replacement so `$$` / `$1` / `$&` in the replacement string
+  // aren't interpreted (breaks `$$...$$` display math otherwise).
+  for (let guard = 0; guard < 16 && html.includes('\x00BLOCK'); guard++) {
+    let changed = false;
+    // Scan once per nesting level, not once per code/math block. Repeated
+    // whole-output searches become quadratic in long, code-heavy replies.
+    html = html.replace(/\x00BLOCK(0|[1-9]\d*)\x00/g, (token, index) => {
+      const block = protectedBlocks[Number(index)];
+      if (block === undefined) return token;
+      changed = true;
+      return block;
+    });
+    if (!changed) break;
+  }
+  return html;
+}
+
+// ── Table builder ──
+function buildTable(rows, formatInline = inlineFormat) {
+  // rows[0] = header, rows[1] = separator (---|---), rows[2..] = data
+  const parseCells = (row) =>
+    row.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+
+  if (rows.length < 2) {
+    return rows.map(r => `<p>${formatInline(escapeHtml(r))}</p>`).join('\n');
+  }
+
+  const headerCells = parseCells(rows[0]);
+
+  // Check if rows[1] is a separator line (all cells are dashes/colons)
+  const sep = parseCells(rows[1]);
+  const isSep = sep.every(c => /^:?-+:?$/.test(c));
+  const dataStart = isSep ? 2 : 1;
+
+  // Detect alignment from separator
+  const aligns = isSep ? sep.map(c => {
+    if (c.startsWith(':') && c.endsWith(':')) return 'center';
+    if (c.endsWith(':')) return 'right';
+    return 'left';
+  }) : [];
+
+  let html = '<table><thead><tr>';
+  headerCells.forEach((cell, ci) => {
+    const a = aligns[ci] ? ` style="text-align:${aligns[ci]}"` : '';
+    html += `<th${a}>${formatInline(cell)}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  for (let i = dataStart; i < rows.length; i++) {
+    const cells = parseCells(rows[i]);
+    html += '<tr>';
+    cells.forEach((cell, ci) => {
+      const a = aligns[ci] ? ` style="text-align:${aligns[ci]}"` : '';
+      html += `<td${a}>${formatInline(cell)}</td>`;
+    });
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+// ── Chart bar renderer ──
+function renderChartBar(data) {
+  if (!Array.isArray(data) || !data.length) return '';
+  const maxVal = Math.max(...data.map(d => d.value || 0), 1);
+  let html = '<div class="chart-bar-container">';
+  for (const item of data) {
+    const pct = Math.round(((item.value || 0) / maxVal) * 100);
+    const label = escapeHtml(item.label || '');
+    const val = item.value ?? '';
+    const unit = escapeHtml(item.unit || '');
+    html += `<div class="chart-bar-row">
+      <div class="chart-bar-label">${label}</div>
+      <div class="chart-bar-track"><div class="chart-bar-fill" style="width:${pct}%"></div></div>
+      <div class="chart-bar-value">${val}${unit}</div>
+    </div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+// Base64 for IPC file uploads (to-do and automation attachments). Chunked so
+// `String.fromCharCode.apply` never sees a large file in one call.
+function _arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf || new ArrayBuffer(0));
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+// ─── Dashboard renderer (`:::dashboard` directive) ────────────────────────
+// Recursive component tree → HTML. Components live in two tiers:
+//   • Layout primitives  : Stack / Grid / Card / Separator (no semantics)
+//   • Content components : Metric / Chart / Table / Alert / Timeline /
+//                          Code / Markdown / Image
+// Unknown `type` and missing props render an empty container instead of
+// throwing — keeps the surrounding bubble alive when the model produces a
+// partially-formed tree. Props are enum-coerced via _dbEnum(); raw px / hex
+// values are intentionally NOT accepted (consistency over flexibility).
+//
+// Cross-file note: the model-facing schema reference lives in
+// `chat_shared_rules.md` "Output formats". Component names and enum values
+// must match that doc — adding a component or a new prop value requires
+// updating both sides in the same patch.
+
+const _DB_GAP = { sm: 'sm', md: 'md', lg: 'lg' };
+const _DB_TONE = { positive: 'positive', negative: 'negative', neutral: 'neutral', warning: 'warning' };
+const _DB_LEVEL = { info: 'info', success: 'success', warning: 'warning', error: 'error' };
+const _DB_CHART_KIND = { line: 'line', bar: 'bar', area: 'area', pie: 'pie' };
+const _DB_COMPONENT_TYPES = {
+  Stack: true, Grid: true, Card: true, Separator: true,
+  Metric: true, Chart: true, Table: true, Alert: true, Timeline: true,
+  Code: true, Markdown: true, Image: true,
+};
+const _DB_JSON_FENCE_LANGS = { '': true, json: true, dashboard: true, jsonc: true };
+
+function _dbEnum(table, val, dflt) {
+  return (val && Object.prototype.hasOwnProperty.call(table, val)) ? table[val] : dflt;
+}
+
+function _tryParseDashboardJson(text) {
+  try { return JSON.parse(text); } catch (_) { return undefined; }
+}
+
+function _dashboardFenceLang(lang) {
+  return String(lang || '').trim().split(/\s+/)[0].toLowerCase();
+}
+
+function _isDashboardJsonFenceLang(lang) {
+  const key = _dashboardFenceLang(lang);
+  return Object.prototype.hasOwnProperty.call(_DB_JSON_FENCE_LANGS, key);
+}
+
+function _dashboardJsonFenceCandidate(lang, code) {
+  const rawLang = String(lang || '');
+  const rawCode = String(code == null ? '' : code);
+  if (_isDashboardJsonFenceLang(rawLang)) return rawCode;
+
+  const info = rawLang.trimStart();
+  const namedInline = info.match(/^(jsonc?|dashboard)\b([\s\S]*)$/i);
+  if (namedInline) {
+    const inline = String(namedInline[2] || '').trimStart();
+    if (inline.startsWith('{') || inline.startsWith('[')) {
+      return inline + (rawCode ? `\n${rawCode}` : '');
+    }
+  }
+  if (info.startsWith('{') || info.startsWith('[')) {
+    return info + (rawCode ? `\n${rawCode}` : '');
+  }
+  return null;
+}
+
+function _unwrapDashboardSpecBody(body) {
+  const text = String(body == null ? '' : body).trim();
+  if (!text) return '';
+  const fenced = text.match(/^(```|~~~)([^\n`]*)\n([\s\S]*?)\n?\1\s*$/);
+  if (fenced && _isDashboardJsonFenceLang(fenced[2])) return fenced[3].trim();
+  return text;
+}
+
+function _isDashboardNode(node) {
+  return !!(
+    node && typeof node === 'object' && !Array.isArray(node)
+    && typeof node.type === 'string'
+    && Object.prototype.hasOwnProperty.call(_DB_COMPONENT_TYPES, node.type)
+  );
+}
+
+function _looksLikeDashboardSpec(spec) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return false;
+  const hasRoot = Object.prototype.hasOwnProperty.call(spec, 'root');
+  if (!hasRoot) return false;
+  if (spec.root == null) return spec.schema_version != null;
+  return _isDashboardNode(spec.root);
+}
+
+function _renderDashboardFromJsonBlock(lang, code) {
+  const body = _dashboardJsonFenceCandidate(lang, code);
+  if (body == null) return '';
+  const spec = _parseDashboardSpec(body);
+  if (!_looksLikeDashboardSpec(spec)) return '';
+  return _renderDashboardOrSource(spec, body);
+}
+
+function _protectedDashboardPlaceholder(body, protectedBlocks) {
+  const m = String(body || '').trim().match(/^\x00BLOCK(\d+)\x00$/);
+  if (!m) return '';
+  const html = protectedBlocks[Number(m[1])] || '';
+  return /^<div class="dashboard"(?:\s|>)/.test(html) ? m[0] : '';
+}
+
+function _findJsonRootEnd(text, start) {
+  let inString = false;
+  let escaped = false;
+  let opened = false;
+  const stack = [];
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') { stack.push(c); opened = true; continue; }
+    if (c === '}' || c === ']') {
+      if (!stack.length) return -1;
+      const open = stack.pop();
+      if ((open === '{' && c !== '}') || (open === '[' && c !== ']')) return -1;
+      if (opened && stack.length === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+function _replaceStandaloneDashboardJsonBlocks(md, protect) {
+  const text = String(md || '');
+  if (text.indexOf('"root"') < 0 || text.indexOf('{') < 0) return text;
+  const startRe = /(^|\n)([ \t]*)\{/g;
+  let out = '';
+  let cursor = 0;
+  let m;
+  while ((m = startRe.exec(text)) !== null) {
+    const start = m.index + m[1].length + m[2].length;
+    if (start < cursor) continue;
+    const end = _findJsonRootEnd(text, start);
+    if (end < 0) continue;
+    const tail = text.slice(end);
+    if (!/^[ \t]*(?:\r?\n|$)/.test(tail)) {
+      startRe.lastIndex = start + 1;
+      continue;
+    }
+    const candidate = text.slice(start, end);
+    const spec = _parseDashboardSpec(candidate);
+    if (!_looksLikeDashboardSpec(spec)) {
+      startRe.lastIndex = start + 1;
+      continue;
+    }
+    out += text.slice(cursor, start) + protect(_renderDashboardOrSource(spec, candidate));
+    cursor = end;
+    startRe.lastIndex = end;
+  }
+  return out + text.slice(cursor);
+}
+
+function _escapeLikelyUnescapedStringQuotes(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!inString) {
+      out += c;
+      if (c === '"') { inString = true; escaped = false; }
+      continue;
+    }
+    if (escaped) {
+      out += c;
+      escaped = false;
+      continue;
+    }
+    if (c === '\\') {
+      out += c;
+      escaped = true;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      const next = text[j] || '';
+      if (next === ':' || next === ',' || next === '}' || next === ']' || next === '') {
+        out += c;
+        inString = false;
+      } else {
+        out += '\\"';
+        changed = true;
+      }
+      continue;
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _repairDashboardJsonTail(text) {
+  let inString = false;
+  let escaped = false;
+  let opened = false;
+  let balancedEnd = -1;
+  const stack = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') { stack.push(c); opened = true; }
+    else if (c === '}' || c === ']') {
+      if (stack.length) stack.pop();
+      // First time the root value closes: everything after is trailing tail.
+      if (opened && stack.length === 0) { balancedEnd = i + 1; break; }
+    }
+  }
+
+  // Repair 1: a complete root value followed by trailing garbage (extra `}`).
+  if (balancedEnd > 0 && balancedEnd < text.length) {
+    const parsed = _tryParseDashboardJson(text.slice(0, balancedEnd));
+    if (parsed !== undefined) return parsed;
+  }
+  // Repair 2: unclosed tree — append the closers it still needs, innermost first.
+  if (opened && stack.length && !inString) {
+    const closers = stack.reverse().map((c) => (c === '{' ? '}' : ']')).join('');
+    const parsed = _tryParseDashboardJson(text + closers);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
+function _repairDashboardJsonMismatchedClosers(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+  const stack = [];
+  const closeFor = (c) => (c === '{' ? '}' : ']');
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { out += c; inString = true; continue; }
+    if (c === '{' || c === '[') { out += c; stack.push(closeFor(c)); continue; }
+    if (c === '}' || c === ']') {
+      if (stack[stack.length - 1] === c) {
+        stack.pop();
+        out += c;
+        continue;
+      }
+      const parentIdx = stack.lastIndexOf(c);
+      if (parentIdx >= 0) {
+        while (stack.length - 1 > parentIdx) {
+          out += stack.pop();
+          changed = true;
+        }
+        stack.pop();
+      }
+      out += c;
+      continue;
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _nextNonWhitespaceChar(text, pos) {
+  let i = pos + 1;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  return text[i] || '';
+}
+
+function _repairDashboardJsonExtraClosers(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+  const stack = [];
+  const closeFor = (c) => (c === '{' ? '}' : ']');
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { out += c; inString = true; continue; }
+    if (c === '{' || c === '[') { out += c; stack.push(closeFor(c)); continue; }
+    if (c === '}' || c === ']') {
+      if (stack[stack.length - 1] === c) {
+        stack.pop();
+        out += c;
+        continue;
+      }
+      // Common model slip inside children/rows arrays: it closes a sibling
+      // node one brace too far (`] } } }, { "type": ...`). If the next real
+      // token is a comma, the array/object is still continuing, so this closer
+      // is extra rather than a missing-inner-closer case.
+      const next = _nextNonWhitespaceChar(text, i);
+      if (stack.length && (next === ',' || next === stack[stack.length - 1])) {
+        changed = true;
+        continue;
+      }
+      if (!stack.includes(c)) {
+        changed = true;
+        continue;
+      }
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _tryDashboardRepairVariants(text) {
+  const strict = _tryParseDashboardJson(text);
+  if (strict !== undefined) return strict;
+
+  const extraCloserRepaired = _repairDashboardJsonExtraClosers(text);
+  if (extraCloserRepaired !== text) {
+    const parsed = _tryParseDashboardJson(extraCloserRepaired);
+    if (parsed !== undefined) return parsed;
+    const mismatchAfterExtra = _repairDashboardJsonMismatchedClosers(extraCloserRepaired);
+    if (mismatchAfterExtra !== extraCloserRepaired) {
+      const afterMismatch = _tryParseDashboardJson(mismatchAfterExtra);
+      if (afterMismatch !== undefined) return afterMismatch;
+      const tailAfterMismatch = _repairDashboardJsonTail(mismatchAfterExtra);
+      if (tailAfterMismatch !== undefined) return tailAfterMismatch;
+    }
+    const tailAfterExtra = _repairDashboardJsonTail(extraCloserRepaired);
+    if (tailAfterExtra !== undefined) return tailAfterExtra;
+  }
+
+  const mismatchRepaired = _repairDashboardJsonMismatchedClosers(text);
+  if (mismatchRepaired !== text) {
+    const parsed = _tryParseDashboardJson(mismatchRepaired);
+    if (parsed !== undefined) return parsed;
+    const tailAfterMismatch = _repairDashboardJsonTail(mismatchRepaired);
+    if (tailAfterMismatch !== undefined) return tailAfterMismatch;
+  }
+
+  return _repairDashboardJsonTail(text);
+}
+
+// Tolerant parse for a `:::dashboard` JSON body. LLMs (DeepSeek especially,
+// when hand-writing a deeply-nested tree) reliably produce small JSON defects:
+// unescaped double quotes inside string values, a single extra `}` after the
+// root close, trailing prose, a truncated tail with closers missing, or a child
+// object missing its close before the parent array/object closes. Strict
+// `JSON.parse` rejects all of these and the whole dashboard collapses to a raw
+// code-view block. We retry with bounded repairs before giving up:
+//   1. escape likely-unescaped `"` characters inside string values
+//   2. insert missing child closers immediately before a matching parent close
+//   3. drop trailing garbage after the root value's balanced close
+//      (the common "one extra }" / trailing-prose case)
+//   4. append the missing closers for an unclosed (truncated) tree
+// Returns the parsed spec, or `undefined` if nothing parses — the caller then
+// shows the parse-error fallback so the raw body is never silently dropped.
+// The scan is string-aware: brackets inside string values (e.g. an Alert body
+// containing `}`) never shift the depth count, and we never trim leading
+// garbage (over-repair risk) — only the trailing tail is dropped.
+function _parseDashboardSpec(body) {
+  const text = _unwrapDashboardSpecBody(body);
+  if (!text) return undefined;
+  const repaired = _tryDashboardRepairVariants(text);
+  if (repaired !== undefined) return repaired;
+
+  const quoteRepaired = _escapeLikelyUnescapedStringQuotes(text);
+  if (quoteRepaired !== text) {
+    const parsed = _tryDashboardRepairVariants(quoteRepaired);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
+function renderDashboard(spec) {
+  if (!spec || typeof spec !== 'object') return '';
+  const theme = spec.theme || {};
+  const themeColor = _dbEnum({ neutral: 'neutral', brand: 'brand', success: 'success', warning: 'warning', danger: 'danger' }, theme.color, 'neutral');
+  const themeStyle = _dbEnum({ minimal: 'minimal', card: 'card' }, theme.style, 'minimal');
+  const inner = _renderDbNode(spec.root);
+  return `<div class="dashboard" data-theme-color="${themeColor}" data-theme-style="${themeStyle}">${inner}</div>`;
+}
+
+function _renderDashboardOrSource(spec, source) {
+  try {
+    return renderDashboard(spec);
+  } catch (error) {
+    if (!(error instanceof RangeError || error instanceof TypeError)) throw error;
+    // Deep trees and uncoercible JSON props can fail during rendering. Retain
+    // their complete source, as with parse failures, without losing the reply.
+    return `<pre class="code-view dashboard-render-error"><code>${escapeHtml(source.trim())}</code></pre>`;
+  }
+}
+
+function _renderDbNode(node) {
+  if (!node || typeof node !== 'object') return '';
+  const props = (node.props && typeof node.props === 'object') ? node.props : {};
+  // Children belong at the node level (sibling of `props`), but many models
+  // nest them React-style under `props.children`. Without this fallback those
+  // subtrees vanish and the container renders empty — accept either shape.
+  const children = Array.isArray(node.children)
+    ? node.children
+    : (Array.isArray(props.children) ? props.children : []);
+  switch (node.type) {
+    // ── Layout ────────────────────────────────────────────────────────
+    case 'Stack':     return _dbStack(props, children);
+    case 'Grid':      return _dbGrid(props, children);
+    case 'Card':      return _dbCard(props, children);
+    case 'Separator': return '<hr class="db-separator">';
+    // ── Content ───────────────────────────────────────────────────────
+    case 'Metric':    return _dbMetric(props);
+    case 'Chart':     return _dbChart(props);
+    case 'Table':     return _dbTable(props);
+    case 'Alert':     return _dbAlert(props, children);
+    case 'Timeline':  return _dbTimeline(props);
+    case 'Code':      return _dbCode(props);
+    case 'Markdown':  return _dbMarkdown(props);
+    case 'Image':     return _dbImage(props);
+    default:          return `<div class="db-unknown" data-type="${escapeHtml(String(node.type || ''))}"></div>`;
+  }
+}
+
+function _dbChildren(children) {
+  return children.map(_renderDbNode).join('');
+}
+
+// ── Layout primitives ──────────────────────────────────────────────────
+
+function _dbStack(props, children) {
+  const dir = props.direction === 'horizontal' ? 'horizontal' : 'vertical';
+  const gap = _dbEnum(_DB_GAP, props.gap, 'md');
+  return `<div class="db-stack" data-direction="${dir}" data-gap="${gap}">${_dbChildren(children)}</div>`;
+}
+
+function _dbGrid(props, children) {
+  const cols = Math.min(4, Math.max(1, Number(props.columns) || 2));
+  const gap = _dbEnum(_DB_GAP, props.gap, 'md');
+  return `<div class="db-grid" data-columns="${cols}" data-gap="${gap}">${_dbChildren(children)}</div>`;
+}
+
+function _dbCard(props, children) {
+  const tone = _dbEnum(_DB_TONE, props.tone, 'neutral');
+  const title = props.title ? `<div class="db-card-title">${escapeHtml(props.title)}</div>` : '';
+  return `<section class="db-card" data-tone="${tone}">${title}<div class="db-card-body">${_dbChildren(children)}</div></section>`;
+}
+
+// ── Content components ────────────────────────────────────────────────
+
+function _dbMetric(props) {
+  const label = escapeHtml(props.label || '');
+  const value = escapeHtml(String(props.value == null ? '' : props.value));
+  const tone = _dbEnum(_DB_TONE, props.tone, 'neutral');
+  const delta = props.delta != null
+    ? `<div class="db-metric-delta" data-tone="${tone}">${escapeHtml(String(props.delta))}</div>` : '';
+  return `<div class="db-metric" data-tone="${tone}">
+    <div class="db-metric-label">${label}</div>
+    <div class="db-metric-value">${value}</div>
+    ${delta}
+  </div>`;
+}
+
+function _dbAlert(props, children = []) {
+  const level = _dbEnum(_DB_LEVEL, props.level, 'info');
+  const titleRaw = props.title ?? props.heading ?? props.label ?? props.name;
+  const bodyRaw = props.body ?? props.message ?? props.text ?? props.content ?? props.description;
+  const titleText = String(titleRaw == null ? '' : titleRaw);
+  const bodyText = String(bodyRaw == null ? '' : bodyRaw);
+  // Fallback: some models put the alert copy in child nodes (e.g. a nested
+  // Markdown) instead of a text prop. Render those as the body so the alert
+  // body is retained even when a title is supplied. Explicit body text wins.
+  const childHtml = (!bodyText && children.length) ? _dbChildren(children) : '';
+  if (!titleText && !bodyText && !childHtml) return '';
+  const content = childHtml
+    ? `${titleText ? `<div class="db-alert-title">${escapeHtml(titleText)}</div>` : ''}<div class="db-alert-body">${childHtml}</div>`
+    : `<div class="db-alert-title">${escapeHtml(titleText || bodyText)}</div>${
+        titleText && bodyText ? `<div class="db-alert-body">${escapeHtml(bodyText)}</div>` : ''}`;
+  return `<div class="db-alert" data-level="${level}" role="status">
+    <span class="db-alert-icon" aria-hidden="true"></span>
+    <div class="db-alert-content">${content}</div>
+  </div>`;
+}
+
+function _dbTable(props) {
+  const cols = Array.isArray(props.columns) ? props.columns : [];
+  const rows = Array.isArray(props.rows) ? props.rows : [];
+  if (!cols.length) return '<div class="db-table-empty"></div>';
+  const head = cols.map(c => {
+    const numeric = c && c.numeric ? ' data-numeric="1"' : '';
+    return `<th${numeric}>${escapeHtml((c && (c.label || c.key)) || '')}</th>`;
+  }).join('');
+  const body = rows.map(r => {
+    const cells = cols.map(c => {
+      const k = c && c.key;
+      const v = (k && r && Object.prototype.hasOwnProperty.call(r, k)) ? r[k] : '';
+      const numeric = c && c.numeric ? ' data-numeric="1"' : '';
+      return `<td${numeric}>${escapeHtml(String(v == null ? '' : v))}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+  return `<div class="db-table-wrap"><table class="db-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function _dbTimeline(props) {
+  const items = Array.isArray(props.items) ? props.items : [];
+  if (!items.length) return '<div class="db-timeline-empty"></div>';
+  const lis = items.map(it => {
+    const time = escapeHtml((it && it.time) || '');
+    const label = escapeHtml((it && it.label) || '');
+    const body = it && it.body ? `<div class="db-timeline-body">${escapeHtml(it.body)}</div>` : '';
+    return `<li class="db-timeline-item">
+      <div class="db-timeline-time">${time}</div>
+      <div class="db-timeline-label">${label}</div>
+      ${body}
+    </li>`;
+  }).join('');
+  return `<ol class="db-timeline">${lis}</ol>`;
+}
+
+function _dbCode(props) {
+  const lang = escapeHtml(props.lang || '');
+  const code = escapeHtml(String(props.code == null ? '' : props.code));
+  const langAttr = lang ? ` data-lang="${lang}"` : '';
+  return `<pre class="db-code"${langAttr}><code>${code}</code></pre>`;
+}
+
+function _dbMarkdown(props) {
+  // Accept `text` (schema name) or `content` (common model guess) — without
+  // this alias the model's `{ Markdown: { content: "..." } }` silently
+  // collapses to an empty bubble and the section disappears.
+  const raw = props.text != null ? props.text : props.content;
+  const text = String(raw == null ? '' : raw);
+  // Recursive call back into renderMarkdownFull keeps the same feature set
+  // (tables / lists / inline code / autolinks); strip leading `:::dashboard`
+  // re-entry to prevent an infinite-render loop if the model nests one.
+  const cleaned = text.replace(/:::dashboard[\s\S]*?:::/g, '');
+  return `<div class="db-markdown">${renderMarkdownFull(cleaned)}</div>`;
+}
+
+function _dbImage(props) {
+  const src = String(props.src || '');
+  if (!src) return '';
+  const alt = escapeHtml(props.alt || '');
+  const caption = props.caption
+    ? `<figcaption class="db-image-caption">${escapeHtml(props.caption)}</figcaption>` : '';
+  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}">${caption}</figure>`;
+}
+
+// ── Chart (minimal inline SVG; line/bar/area/pie) ─────────────────────
+
+function _dbChart(props) {
+  const kind = _dbEnum(_DB_CHART_KIND, props.kind, 'bar');
+  const data = Array.isArray(props.data) ? props.data : [];
+  if (!data.length) return '<div class="db-chart-empty"></div>';
+  if (kind === 'pie') return _dbPie(data);
+  return _dbXyChart(kind, data);
+}
+
+function _dbPie(data) {
+  // data: [{label, value}, ...]
+  const items = data.filter(d => d && Number.isFinite(Number(d.value)) && Number(d.value) > 0);
+  const total = items.reduce((a, d) => a + Number(d.value), 0);
+  if (!total) return '<div class="db-chart-empty"></div>';
+  const cx = 50, cy = 50, r = 45;
+  let acc = 0;
+  const segs = items.map((d, i) => {
+    const v = Number(d.value);
+    const startAngle = (acc / total) * Math.PI * 2 - Math.PI / 2;
+    acc += v;
+    const endAngle = (acc / total) * Math.PI * 2 - Math.PI / 2;
+    const large = (v / total) > 0.5 ? 1 : 0;
+    const x1 = cx + r * Math.cos(startAngle), y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle),   y2 = cy + r * Math.sin(endAngle);
+    // A full turn has coincident endpoints; SVG needs two arcs to paint it.
+    if (items.length === 1) {
+      return `<path d="M${cx},${cy - r} A${r},${r} 0 1 1 ${cx},${cy + r} A${r},${r} 0 1 1 ${cx},${cy - r} Z" class="db-chart-slice" data-idx="0"></path>`;
+    }
+    return `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" class="db-chart-slice" data-idx="${i % 6}"></path>`;
+  }).join('');
+  const legend = items.map((d, i) =>
+    `<li data-idx="${i % 6}"><span class="db-chart-swatch"></span>${escapeHtml(d.label || '')} <span class="db-chart-val">${escapeHtml(String(d.value))}</span></li>`
+  ).join('');
+  return `<div class="db-chart" data-kind="pie">
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="db-chart-svg">${segs}</svg>
+    <ol class="db-chart-legend">${legend}</ol>
+  </div>`;
+}
+
+function _dbXyChart(kind, data) {
+  // data: [{x, y}, ...] — x is label (string), y is numeric.
+  const points = data.map(d => ({ x: String((d && d.x) ?? ''), y: Number((d && d.y) ?? 0) }))
+    .filter(p => Number.isFinite(p.y));
+  if (!points.length) return '<div class="db-chart-empty"></div>';
+  const W = 320, H = 140, padL = 32, padR = 16, padT = 8, padB = 22;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxY = Math.max(...points.map(p => p.y), 0);
+  const minY = Math.min(...points.map(p => p.y), 0);
+  const span = (maxY - minY) || 1;
+  // Bars occupy bands, while line/area points span the plot endpoints. Center
+  // each bar inside its band so the first/last bar cannot cover the axis or
+  // extend outside the SVG. Values and the y scale are unchanged.
+  const xOf = (i) => padL + (kind === 'bar'
+    ? ((i + 0.5) / points.length) * innerW
+    : (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW));
+  const yOf = (y) => padT + innerH - ((y - minY) / span) * innerH;
+  const yTicks = [0, 0.5, 1].map((ratio) => {
+    const y = padT + innerH - ratio * innerH;
+    const val = minY + ratio * span;
+    const label = Math.abs(val) >= 10 ? Math.round(val) : Number(val.toFixed(1));
+    return `<line x1="${padL}" y1="${y.toFixed(2)}" x2="${W - padR}" y2="${y.toFixed(2)}" class="db-chart-gridline"></line>` +
+      `<text x="${(padL - 6).toFixed(2)}" y="${(y + 3).toFixed(2)}" class="db-chart-ylabel" text-anchor="end">${escapeHtml(String(label))}</text>`;
+  }).join('');
+  const axis = `<line x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}" class="db-chart-axis"></line>`;
+  let body = '';
+  if (kind === 'bar') {
+    const barW = innerW / points.length * 0.6;
+    body = points.map((p, i) => {
+      const x = xOf(i) - barW / 2;
+      const y = yOf(Math.max(p.y, 0));
+      const h = Math.abs(yOf(p.y) - yOf(0));
+      return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" rx="3" class="db-chart-bar-rect" data-idx="${i % 6}"></rect>`;
+    }).join('');
+  } else {
+    const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(2)},${yOf(p.y).toFixed(2)}`).join(' ');
+    if (kind === 'area') {
+      const area = `M${xOf(0).toFixed(2)},${yOf(minY).toFixed(2)} ` +
+        points.map((p, i) => `L${xOf(i).toFixed(2)},${yOf(p.y).toFixed(2)}`).join(' ') +
+        ` L${xOf(points.length - 1).toFixed(2)},${yOf(minY).toFixed(2)} Z`;
+      body = `<path d="${area}" class="db-chart-area"></path><path d="${path}" class="db-chart-line"></path>`;
+    } else {
+      body = `<path d="${path}" class="db-chart-line"></path>` +
+        points.map((p, i) => `<circle cx="${xOf(i).toFixed(2)}" cy="${yOf(p.y).toFixed(2)}" r="2.5" class="db-chart-dot" data-idx="${i % 6}"></circle>`).join('');
+    }
+  }
+  const labels = points.map((p, i) => {
+    if (points.length > 8 && i % Math.ceil(points.length / 6) !== 0 && i !== points.length - 1) return '';
+    return `<text x="${xOf(i).toFixed(2)}" y="${(H - 6).toFixed(2)}" class="db-chart-xlabel" text-anchor="middle">${escapeHtml(p.x)}</text>`;
+  }).join('');
+  return `<div class="db-chart" data-kind="${kind}">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="db-chart-svg">
+      ${yTicks}${axis}${body}${labels}
+    </svg>
+  </div>`;
+}
+
+// Detect renderable media src by extension. Dispatches markdown ![](src) /
+// [text](src) to an inline image or native player instead of a generic link
+// — covers chat-media://local/...png, https://..../clip.webm, local .mp3
+// outputs, and user-authored markdown pointing at a media file. The match is
+// against the last extension-looking segment so query strings / fragments
+// don't defeat it.
+const _IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|svg)(?:[?#].*)?$/i;
+const _VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i;
+const _AUDIO_EXT_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac)(?:[?#].*)?$/i;
+const _HTML_EXT_RE = /\.html?$/i;
+function _isImageSrc(src) {
+  return _IMAGE_EXT_RE.test(String(src || ''));
+}
+function _isVideoSrc(src) {
+  return _VIDEO_EXT_RE.test(String(src || ''));
+}
+function _isAudioSrc(src) {
+  return _AUDIO_EXT_RE.test(String(src || ''));
+}
+function _isHtmlSrc(src) {
+  const raw = String(src || '');
+  const query = raw.indexOf('?');
+  const fragment = raw.indexOf('#');
+  const end = Math.min(
+    query < 0 ? raw.length : query,
+    fragment < 0 ? raw.length : fragment,
+  );
+  return _HTML_EXT_RE.test(raw.slice(0, end));
+}
+
+function _chatMediaLocalPathFromUrl(src) {
+  const raw = String(src || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'chat-media:' || u.hostname.toLowerCase() !== 'local') return '';
+    const decoded = decodeURIComponent(u.pathname || '');
+    if (/^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+    return decoded;
+  } catch (_) {
+    return '';
+  }
+}
+
+// The still-encoded path of a chat-media://local link whose path cannot be decoded. A model
+// copying a long link can break one segment's encoding (2026-11-07: a Chinese folder name cut
+// mid-character); the link then names no file and can never load.
+function _undecodableChatMediaLocalPath(src) {
+  try {
+    const u = new URL(String(src || '').trim());
+    if (u.protocol !== 'chat-media:' || u.hostname.toLowerCase() !== 'local') return '';
+    try {
+      decodeURIComponent(u.pathname || '');
+      return '';
+    } catch (_) {
+      return u.pathname || '';
+    }
+  } catch (_) {
+    return '';
+  }
+}
+
+// A markdown media src that names a local file the app can serve, rewritten to
+// the protocol that actually serves it. Models write the path they were handed,
+// sometimes under a convention from their own training (`sandbox:/abs/path`) or
+// as a bare absolute path, and the media branches below dispatch on the file
+// extension alone — so an unservable scheme became a <video> that Chromium
+// could not load: controls, 0:00, a black frame, and no request reaching the
+// main process at all. `_safeHref` is no fallback here, since it allows only
+// http(s)/mailto/tel, so those srcs rendered as bare text instead of a player.
+// 2026-08-09: a finished 62s video reached the user this way; the same shape
+// sits in two earlier conversations, so it is a recurring habit, not a fluke.
+//
+// This widens nothing: the main-side `chat-media://local` handler still
+// enforces the active user, the path scope, and the extension whitelist, so an
+// out-of-scope path is refused exactly as before. A relative path is left
+// alone — the renderer has no base directory to resolve it against.
+function _normalizeLocalMediaSrc(src) {
+  const raw = String(src === null || src === undefined ? '' : src).trim();
+  if (!raw) return raw;
+  if (/^(?:chat-media|https?|data|blob|kb-file|chat-app):/i.test(raw)) return raw;
+
+  let abs = '';
+  if (/^file:/i.test(raw)) {
+    try {
+      const decoded = decodeURIComponent(new URL(raw).pathname || '');
+      abs = /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded;
+    } catch (_) { return raw; }
+  } else {
+    // `sandbox:` carries a plain path, not a URL — take everything after it.
+    const bare = raw.replace(/^sandbox:/i, '');
+    if (bare.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bare)) abs = bare;
+  }
+  if (!abs) return raw;
+
+  let p = abs.includes('\\') ? abs.replace(/\\/g, '/') : abs;
+  if (p.startsWith('/')) p = p.slice(1);
+  const encoded = p.split('/').map((segment, index) => (
+    index === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)
+  )).join('/');
+  return `chat-media://local/${encoded}`;
+}
+
+function _markdownVideoOpenFloatingLabel() {
+  const key = 'chat.video_open_floating_title';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Fullscreen';
+}
+
+function _markdownVideoOpenIconHtml() {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml('maximize', 'ui-icon chat-md-video-float-svg');
+  }
+  return '';
+}
+
+function _parseOrkasMediaTitle(title) {
+  const match = /^orkas-media-v1:(image|video):(.+)$/.exec(String(title || ''));
+  if (!match) return null;
+  let remoteSrc = '';
+  try { remoteSrc = decodeURIComponent(match[2]); }
+  catch (_) { return null; }
+  if (!/^https?:\/\//i.test(remoteSrc) || /[\u0000-\u001f\u007f]/.test(remoteSrc)) return null;
+  return { kind: match[1], remoteSrc };
+}
+
+function _markdownVideoHtml(src, label, title) {
+  const mediaMeta = _parseOrkasMediaTitle(title);
+  const visibleTitle = mediaMeta ? '' : title;
+  const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
+  // Historical messages may contain an internal remote-media marker whose
+  // primary URL was the provider URL. Keep its media kind for rendering, but
+  // make that source inert: remote media may enter the renderer only after the
+  // main process has validated and materialized it into chat-media://.
+  const renderedSrc = mediaMeta && !managedLocalSrc ? 'data:,' : src;
+  const materializationAttrs = mediaMeta && managedLocalSrc
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}" data-orkas-local-src="${escapeHtml(managedLocalSrc)}"`
+    : '';
+  const openLabel = _markdownVideoOpenFloatingLabel();
+  const openButton = localPath
+    ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
+    : '';
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(renderedSrc)}"${t}${materializationAttrs} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
+}
+
+function _markdownMediaLabel(src, label, fallback) {
+  const explicit = String(label || '').trim();
+  if (explicit) return explicit;
+  const clean = String(src || '').split(/[?#]/)[0];
+  const base = clean.split('/').filter(Boolean).pop() || '';
+  try { return decodeURIComponent(base) || fallback; }
+  catch (_) { return base || fallback; }
+}
+
+function _markdownAudioIconHtml(label) {
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') {
+    return window.fileKindIconHtml(label || 'audio.mp3', 'audio');
+  }
+  return '<svg class="chat-file-kind-icon is-audio" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V6l9-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="15.5" cy="16" r="2.5"></circle></svg>';
+}
+
+function _markdownAudioLocalPath(src) {
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  if (!localPath || /[\u0000-\u001f\u007f]/.test(localPath)) return '';
+  try {
+    const url = new URL(src);
+    return url.username || url.password || url.port ? '' : localPath;
+  } catch (_) { return ''; }
+}
+
+function _markdownAudioHtml(src, label, title) {
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+  const name = _markdownMediaLabel(src, label, 'audio');
+  const menuLabel = typeof t === 'function' ? t('contexts.menu.more_actions') : 'More actions';
+  const menuIcon = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+    ? window.uiIconHtml('more-horizontal') : '';
+  const menuButton = _markdownAudioLocalPath(src)
+    ? `<button type="button" class="chat-msg-produced-menu-btn" data-chat-md-audio-menu="1" data-audio-src="${escapeHtml(src)}" data-i18n-title="contexts.menu.more_actions" data-i18n-aria-label="contexts.menu.more_actions" title="${escapeHtml(menuLabel)}" aria-label="${escapeHtml(menuLabel)}" aria-haspopup="menu" aria-expanded="false">${menuIcon}</button>`
+    : '';
+  return `<span class="chat-md-audio-card"${titleAttr} role="group" aria-label="${escapeHtml(name)}">
+    <span class="chat-md-audio-icon">${_markdownAudioIconHtml(name)}</span>
+    <span class="chat-md-audio-header"><span class="chat-md-audio-name">${escapeHtml(name)}</span>${menuButton}</span>
+    <audio class="chat-md-audio" controls controlslist="nodownload noplaybackrate noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}"></audio>
+  </span>`;
+}
+
+async function _openMarkdownAudioMenu(button) {
+  if (button.disabled) return;
+  const localPath = _markdownAudioLocalPath(button.getAttribute('data-audio-src') || '');
+  if (!localPath || typeof window.ConversationInfo?.openFileMenu !== 'function') return;
+  const card = button.closest('.chat-md-audio-card');
+  const name = localPath.split(/[\\/]/).pop() || localPath;
+  button.disabled = true;
+  try {
+    await window.ConversationInfo.openFileMenu(button, localPath, name, {
+      cid: typeof currentCid !== 'undefined' ? currentCid || '' : '',
+      onDeleted: () => {
+        const audio = card?.querySelector('audio');
+        if (audio) {
+          audio.pause();
+          audio.removeAttribute('src');
+          audio.load();
+        }
+        if (!audio || !_dropFailedProducedPreview(audio)) card?.remove();
+      },
+    });
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function _markdownFileReferencePath(rawSrc) {
+  // Source locations are Markdown reference metadata, not filename bytes.
+  // Strip before URL decoding so an encoded literal colon/hash stays a filename.
+  // Keep this suffix grammar aligned with chat-media-url.ts document links.
+  return String(rawSrc || '').trim().replace(/(?::[1-9]\d*(?::[1-9]\d*)?|#L[1-9]\d*(?:C[1-9]\d*)?(?:-L[1-9]\d*(?:C[1-9]\d*)?)?)$/, '');
+}
+
+// Local file links are preview actions, never top-level navigation or evidence
+// of a produced file. Main's existing viewer IPC owns existence and scope checks.
+function _markdownFileLinkHtml(rawSrc, label, title) {
+  const raw = _markdownFileReferencePath(rawSrc);
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw) || raw.startsWith('//')) return '';
+  if (/^file:/i.test(raw)) {
+    try {
+      const url = new URL(raw);
+      if (url.hostname) return '';
+    } catch (_) { return ''; }
+  }
+  const src = _normalizeLocalMediaSrc(raw);
+  const absPath = _chatMediaLocalPathFromUrl(src);
+  if (!absPath || /[\u0000-\u001f\u007f]/.test(absPath)) return '';
+  try {
+    const url = new URL(src);
+    if (url.username || url.password || url.port) return '';
+  } catch (_) { return ''; }
+  const name = absPath.split(/[\\/]/).pop() || absPath;
+  const icon = typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function'
+    ? window.fileKindIconHtml(name) : '';
+  return `<button type="button" class="chat-attach-chip is-inline chat-attach-preview" data-chat-md-file-open="1" data-file-src="${escapeHtml(src)}" title="${escapeHtml(title || _markdownHtmlPreviewLabel())}"><span class="chat-attach-icon">${icon}</span><span class="chat-attach-label">${escapeHtml(label || name)}</span></button>`;
+}
+
+function _markdownHtmlPreviewLabel() {
+  const key = 'chat.produced_preview_title';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Preview';
+}
+
+function _markdownVisualizationHtml(body) {
+  // Bound JSON work; paths are literal executor-side filenames, never URLs.
+  // Unknown shapes remain visible source rather than being guessed/repaired.
+  if (body.length > 16_384) return '';
+  try {
+    const spec = JSON.parse(body);
+    if (!spec || Array.isArray(spec) || typeof spec !== 'object'
+        || !Object.hasOwn(spec, 'path')
+        || Object.keys(spec).some(key => key !== 'path' && key !== 'mode' && key !== 'title')
+        || (Object.hasOwn(spec, 'mode') && spec.mode !== 'wide')
+        || (Object.hasOwn(spec, 'title') && typeof spec.title !== 'string')
+        || typeof spec.path !== 'string'
+        || !/^(?:\/(?!\/)|[A-Za-z]:[\\/])/.test(spec.path)
+        || /[\u0000-\u001f\u007f]/.test(spec.path)
+        || !_HTML_EXT_RE.test(spec.path)) return '';
+    // Both default and wide references fit the existing chat preview surface.
+    // Hydration and main's normal HTML resolver retain the sandbox boundary.
+    return _markdownHtmlEmbedHtml(_normalizeLocalMediaSrc(spec.path), spec.title || '');
+  } catch (_) {
+    return '';
+  }
+}
+
+// Markdown image syntax occasionally carries an HTML deliverable when an
+// agent means "show the preview". An <img> cannot decode HTML. Emit only a
+// sanitizer-safe mount point here; `_hydrateMarkdownHtmlEmbeds` creates the
+// iframe after DOM insertion and re-validates the source. This avoids adding
+// arbitrary iframe support to the untrusted Markdown sanitizer.
+function _markdownHtmlEmbedHtml(src, label, title) {
+  const absPath = _chatMediaLocalPathFromUrl(src);
+  const pathName = absPath ? (absPath.split(/[\\/]/).pop() || 'preview.html') : '';
+  const name = _markdownMediaLabel(src, label, pathName || 'HTML');
+  const previewLabel = _markdownHtmlPreviewLabel();
+  const ariaLabel = `${previewLabel}: ${name}`;
+  const tooltip = title || ariaLabel;
+
+  if (!absPath || !_isHtmlSrc(src)) {
+    const href = _safeHref(src);
+    if (!href) return escapeHtml(name);
+    return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(tooltip)}">${escapeHtml(name)}</a>`;
+  }
+
+  return `<span class="chat-md-html-embed is-loading" data-chat-md-html-embed="1" data-html-src="${escapeHtml(src)}" data-html-title="${escapeHtml(tooltip)}" aria-label="${escapeHtml(ariaLabel)}">
+    <span class="chat-md-html-embed-loading" role="status">${escapeHtml(ariaLabel)}</span>
+  </span>`;
+}
+
+// Mount only local HTML/HTM resources. The frame intentionally matches the
+// existing chat-file-viewer security contract: scripts are allowed for
+// self-contained generated visuals, while same-origin access, forms, popups,
+// downloads and top navigation remain unavailable. `loading=lazy` keeps a
+// message containing several HTML outputs from loading every frame at once.
+function _markdownHtmlLayoutDimensions(layout) {
+  if (!layout || layout.kind !== 'fixed-canvas') return null;
+  const width = Number(layout.width);
+  const height = Number(layout.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height)
+      || width < 16 || width > 7680 || height < 16 || height > 7680
+      || width * height > 16_777_216) return null;
+  return { width, height };
+}
+
+function _fitMarkdownHtmlCanvas(host, frame, layout) {
+  const availableWidth = Number(host?.clientWidth || 0);
+  if (!host || !frame || !layout || !(availableWidth > 0)) return;
+  const scale = Math.min(1, availableWidth / layout.width);
+  if (!frame.style) return;
+  frame.style.width = `${layout.width}px`;
+  frame.style.height = `${layout.height}px`;
+  frame.style.transformOrigin = 'top left';
+  frame.style.transform = `scale(${scale})`;
+}
+
+async function _sizeMarkdownHtmlEmbed(host, frame, src, absPath) {
+  if (typeof window === 'undefined' || !window.orkas || typeof window.orkas.invoke !== 'function') return;
+  try {
+    const payload = { path: absPath, htmlPreviewLayoutOnly: true };
+    const cid = (typeof currentCid === 'string' && currentCid) ? currentCid : '';
+    if (cid) payload.cid = cid;
+    const res = await window.orkas.invoke('produced.readText', payload);
+    if (host.dataset?.htmlEmbedHydrated !== '1' || host.getAttribute?.('data-html-src') !== src) return;
+    const layout = _markdownHtmlLayoutDimensions(res && res.layout);
+    if (!layout || !host.style?.setProperty) return;
+    host.style.setProperty('--chat-html-aspect-ratio', `${layout.width} / ${layout.height}`);
+    host.style.setProperty('--chat-html-source-width', `${layout.width}px`);
+    host.style.setProperty('--chat-html-source-height', `${layout.height}px`);
+    host.dataset.htmlEmbedLayout = `${layout.width}x${layout.height}`;
+    _fitMarkdownHtmlCanvas(host, frame, layout);
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => {
+        if (host.isConnected === false) {
+          observer.disconnect();
+          return;
+        }
+        _fitMarkdownHtmlCanvas(host, frame, layout);
+      });
+      observer.observe(host);
+      host._chatHtmlResizeObserver = observer;
+    }
+    _notifyChatImageSettled(host);
+  } catch (_) { /* the default visual-output ratio remains usable */ }
+}
+
+function _hydrateMarkdownHtmlEmbeds(root) {
+  if (!root || typeof document === 'undefined' || typeof document.createElement !== 'function') return;
+  const selector = '[data-chat-md-html-embed="1"]';
+  const hosts = [];
+  if (typeof root.matches === 'function' && root.matches(selector)) hosts.push(root);
+  if (typeof root.querySelectorAll === 'function') {
+    root.querySelectorAll(selector).forEach((host) => hosts.push(host));
+  }
+  for (const host of hosts) {
+    if (!host || host.dataset?.htmlEmbedHydrated === '1') continue;
+    const src = host.getAttribute?.('data-html-src') || '';
+    const absPath = _chatMediaLocalPathFromUrl(src);
+    if (!absPath || !_isHtmlSrc(src)) {
+      host.classList?.remove('is-loading');
+      host.classList?.add('is-error');
+      continue;
+    }
+    const title = host.getAttribute?.('data-html-title') || absPath.split(/[\\/]/).pop() || 'HTML';
+    const frame = document.createElement('iframe');
+    frame.className = 'chat-md-html-frame';
+    frame.setAttribute('sandbox', 'allow-scripts');
+    frame.setAttribute('loading', 'lazy');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('title', title);
+    frame.setAttribute('src', src);
+    frame.addEventListener('load', () => {
+      host.classList?.remove('is-loading', 'is-error');
+      host.classList?.add('is-loaded');
+      _notifyChatImageSettled(frame);
+    });
+    frame.addEventListener('error', () => {
+      host.classList?.remove('is-loading', 'is-loaded');
+      host.classList?.add('is-error');
+      _notifyChatImageSettled(frame);
+    });
+    host.dataset.htmlEmbedHydrated = '1';
+    host.replaceChildren(frame);
+    _sizeMarkdownHtmlEmbed(host, frame, src, absPath);
+  }
+}
+
+function _markdownImageHtml(src, alt, title) {
+  const mediaMeta = _parseOrkasMediaTitle(title);
+  const visibleTitle = mediaMeta ? '' : title;
+  const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
+  const renderedSrc = mediaMeta && !managedLocalSrc ? 'data:,' : src;
+  const materializationAttrs = mediaMeta && managedLocalSrc
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}" data-orkas-local-src="${escapeHtml(managedLocalSrc)}"`
+    : '';
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(renderedSrc)}" alt="${escapeHtml(alt)}"${t}${materializationAttrs}></span>`;
+}
+
+function _notifyChatImageSettled(node) {
+  if (!node || typeof CustomEvent === 'undefined') return;
+  node.dispatchEvent(new CustomEvent('chat-image-settled', { bubbles: true }));
+}
+
+function _chatImageIntrinsicStyle(rawWidth, rawHeight) {
+  const width = Number(rawWidth || 0);
+  const height = Number(rawHeight || 0);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  return {
+    naturalWidth: `${width}px`,
+    aspectRatio: `${width} / ${height}`,
+  };
+}
+
+function _applyChatImageIntrinsicLayout(img) {
+  const layout = _chatImageIntrinsicStyle(img?.naturalWidth, img?.naturalHeight);
+  if (!layout) return;
+  const shell = img.closest?.('.chat-md-img-shell');
+  if (!shell?.style?.setProperty) return;
+  shell.style.setProperty('--chat-image-natural-width', layout.naturalWidth);
+  shell.style.setProperty('--chat-image-aspect-ratio', layout.aspectRatio);
+}
+
+function _settleChatImageLayout(img, state = 'loaded') {
+  if (!img || !img.classList) return;
+  if (state !== 'error') _applyChatImageIntrinsicLayout(img);
+  const shell = img.closest?.('.chat-image-shell');
+  if (shell) {
+    shell.classList.remove('is-loading');
+    shell.classList.toggle('is-error', state === 'error');
+    shell.classList.toggle('is-loaded', state !== 'error');
+  }
+  _notifyChatImageSettled(img);
+}
+
+function _missingMarkdownImageLabel() {
+  const key = 'chat.image_missing_placeholder';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Image missing';
+}
+
+function _missingMarkdownVideoLabel() {
+  const key = 'chat.video_missing_placeholder';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Video missing';
+}
+
+function _markdownVideoLoadFailedLabel() {
+  const key = 'chat.video_load_failed';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Video could not be loaded';
+}
+
+function _retryLabel() {
+  const key = 'chat.retry_btn';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Retry';
+}
+
+function _replaceMissingMarkdownImage(img) {
+  if (!img || !img.parentNode || img.dataset?.missingImageHandled === '1') return;
+  if (img.dataset) img.dataset.missingImageHandled = '1';
+  const label = _missingMarkdownImageLabel();
+  const alt = String(img.getAttribute('alt') || '').trim();
+  const title = alt ? `${label}: ${alt}` : label;
+  const chip = document.createElement('span');
+  chip.className = 'chat-md-img-missing';
+  chip.setAttribute('role', 'img');
+  chip.setAttribute('aria-label', title);
+  chip.setAttribute('title', title);
+
+  const icon = document.createElement('span');
+  icon.className = 'chat-md-img-missing-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    icon.innerHTML = window.uiIconHtml('image', 'ui-icon chat-md-img-missing-svg');
+  }
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-img-missing-text';
+  text.textContent = label;
+
+  chip.appendChild(icon);
+  chip.appendChild(text);
+  const shell = img.closest?.('.chat-md-img-shell');
+  if (shell && img.getAttribute?.('data-orkas-local-src')) {
+    img.hidden = true;
+    shell.classList?.remove('is-loading', 'is-loaded');
+    shell.classList?.add('is-error');
+    shell.appendChild(chip);
+  } else {
+    (shell || img).replaceWith(chip);
+  }
+  _notifyChatImageSettled(chip);
+}
+
+function _replaceMissingMarkdownVideo(video) {
+  if (!video || !video.parentNode || video.dataset?.missingVideoHandled === '1') return;
+  if (video.getAttribute?.('data-orkas-local-src')) {
+    _showMarkdownVideoLoadFailure(video);
+    return;
+  }
+  if (video.dataset) video.dataset.missingVideoHandled = '1';
+  const label = _missingMarkdownVideoLabel();
+  const alt = String(video.getAttribute('aria-label') || '').trim();
+  const title = alt ? `${label}: ${alt}` : label;
+  const chip = document.createElement('span');
+  chip.className = 'chat-md-video-missing';
+  chip.setAttribute('role', 'img');
+  chip.setAttribute('aria-label', title);
+  chip.setAttribute('title', title);
+
+  const icon = document.createElement('span');
+  icon.className = 'chat-md-video-missing-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') {
+    icon.innerHTML = window.fileKindIconHtml('video.mp4', 'video');
+  } else if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    icon.innerHTML = window.uiIconHtml('play-triangle', 'ui-icon chat-md-video-missing-svg');
+  }
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-video-missing-text';
+  text.textContent = label;
+
+  chip.appendChild(icon);
+  chip.appendChild(text);
+  // The chip replaces the player's black frame too, as a missing image's chip replaces its shell.
+  (video.closest?.('.chat-md-video-shell') || video).replaceWith(chip);
+}
+
+function _clearMarkdownVideoLoadFailure(video) {
+  if (!video) return;
+  const shell = video.closest?.('.chat-md-video-shell');
+  shell?.classList?.remove('is-load-failed');
+  const failure = shell?.querySelector?.('[data-chat-md-video-load-failure="1"]');
+  failure?.remove?.();
+  if (video.dataset) {
+    delete video.dataset.videoErrorHandled;
+    delete video.dataset.videoErrorDiagnosis;
+  }
+}
+
+function _applyMaterializedMarkdownMedia(payload, root) {
+  const remoteSrc = String(payload?.remote_url || '');
+  const localSrc = String(payload?.local_url || '');
+  const kind = String(payload?.media_kind || '');
+  const scope = root || (typeof document !== 'undefined' ? document : null);
+  if (!scope || !remoteSrc || !/^chat-media:\/\/cid\//i.test(localSrc)) return 0;
+  if (kind !== 'image' && kind !== 'video') return 0;
+  const nodes = scope.querySelectorAll?.('[data-orkas-remote-src]') || [];
+  let updated = 0;
+  for (const media of nodes) {
+    if (media.getAttribute?.('data-orkas-remote-src') !== remoteSrc) continue;
+    if ((kind === 'video') !== (media.tagName === 'VIDEO')) continue;
+    if ((kind === 'image') !== (media.tagName === 'IMG')) continue;
+    media.setAttribute('data-orkas-local-src', localSrc);
+    media.setAttribute('src', localSrc);
+    if (media.dataset) {
+      delete media.dataset.orkasRemoteFallbackAttempted;
+      delete media.dataset.missingImageHandled;
+      delete media.dataset.missingVideoHandled;
+    }
+    if (kind === 'image') {
+      media.hidden = false;
+      const shell = media.closest?.('.chat-md-img-shell');
+      shell?.querySelector?.('.chat-md-img-missing')?.remove?.();
+      shell?.classList?.remove('is-error', 'is-loaded');
+      shell?.classList?.add('is-loading');
+    } else {
+      _clearMarkdownVideoLoadFailure(media);
+      const button = media.closest?.('.chat-md-video-shell')?.querySelector?.('[data-chat-md-video-open="1"]');
+      if (button) {
+        button.hidden = false;
+        button.setAttribute('data-video-src', localSrc);
+      }
+      try { media.load(); } catch (_) { /* the normal error path remains available */ }
+    }
+    updated += 1;
+  }
+  return updated;
+}
+
+function _showMarkdownVideoLoadFailure(video) {
+  if (!video || !video.parentNode) return;
+  const shell = video.closest?.('.chat-md-video-shell');
+  if (!shell || shell.querySelector?.('[data-chat-md-video-load-failure="1"]')) return;
+  const label = _markdownVideoLoadFailedLabel();
+  const retryLabel = _retryLabel();
+  shell.classList?.add('is-load-failed');
+  if (video.dataset) video.dataset.videoErrorDiagnosis = 'load_failed';
+
+  const failure = document.createElement('span');
+  failure.className = 'chat-md-video-load-failure';
+  failure.setAttribute('data-chat-md-video-load-failure', '1');
+  failure.setAttribute('role', 'status');
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-video-load-failure-text';
+  text.textContent = label;
+
+  const retry = document.createElement('button');
+  retry.className = 'chat-md-video-retry';
+  retry.setAttribute('type', 'button');
+  retry.setAttribute('data-chat-md-video-retry', '1');
+  retry.setAttribute('aria-label', retryLabel);
+  retry.textContent = retryLabel;
+
+  failure.appendChild(text);
+  failure.appendChild(retry);
+  shell.appendChild(failure);
+}
+
+function _diagnoseMarkdownVideoError(video) {
+  if (!video || !video.parentNode || video.dataset?.videoErrorHandled === '1') return;
+  if (video.dataset) video.dataset.videoErrorHandled = '1';
+  const rawUrl = String(video.currentSrc || video.getAttribute?.('src') || '');
+  const invoke = typeof window !== 'undefined' && window.orkas && typeof window.orkas.invoke === 'function'
+    ? window.orkas.invoke.bind(window.orkas)
+    : null;
+  if (!invoke) {
+    _showMarkdownVideoLoadFailure(video);
+    return;
+  }
+  Promise.resolve(invoke('media.diagnose', { url: rawUrl }))
+    .then((result) => {
+      if (!video.parentNode) return;
+      const diagnosis = String(result?.diagnosis || '').toLowerCase();
+      if (diagnosis === 'not_found' || diagnosis === 'source_not_found') {
+        _replaceMissingMarkdownVideo(video);
+        return;
+      }
+      _showMarkdownVideoLoadFailure(video);
+    })
+    .catch(() => {
+      if (video.parentNode) _showMarkdownVideoLoadFailure(video);
+    });
+}
+
+if (typeof document !== 'undefined') document.addEventListener('load', (e) => {
+  const target = e.target;
+  if (!target || target.nodeType !== 1 || target.tagName !== 'IMG') return;
+  if (target.classList?.contains('chat-md-img')) {
+    _settleChatImageLayout(target);
+  }
+}, true);
+
+if (typeof document !== 'undefined') document.addEventListener('loadedmetadata', (e) => {
+  const target = e.target;
+  if (target?.nodeType === 1 && target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
+    _clearMarkdownVideoLoadFailure(target);
+  }
+}, true);
+
+/**
+ * Host-rendered produced-media previews (`.chat-msg-produced-media`, built by
+ * conversation.js) are a convenience layer sitting directly above the
+ * deliverable chip row. The chip is the durable record and already reports a
+ * deleted file when clicked, so a preview whose bytes are gone is removed
+ * rather than replaced with a "missing" placeholder — otherwise reopening an
+ * old conversation whose workspace was since cleaned would grow one tombstone
+ * per generated file where previously there was none.
+ *
+ * Media the model wrote into its own prose stays on the authored failure path:
+ * the surrounding text refers to it, so its absence normally has to remain
+ * visible. The narrow stale-duplicate exception is handled separately below.
+ */
+function _dropFailedProducedPreview(el) {
+  const host = el?.closest?.('.chat-msg-produced-media');
+  if (!host) return false;
+  const blockSelector = '.chat-image-shell, .chat-md-video-shell, .chat-md-audio-card';
+  (el.closest(blockSelector) || el).remove();
+  if (!host.querySelector(blockSelector)) host.remove();
+  return true;
+}
+
+// Return a basename only for media references that claim to be local. Remote
+// URLs with a coincidentally equal basename must never be folded into a file
+// produced by this turn.
+function _localMediaReferenceBasename(src) {
+  const raw = String(src || '').trim();
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return '';
+  // A broken segment elsewhere in a local link leaves its file name readable.
+  let local = _chatMediaLocalPathFromUrl(raw) || _undecodableChatMediaLocalPath(raw);
+  if (!local) {
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(raw)) return '';
+    local = raw.split(/[?#]/, 1)[0];
+  }
+  let base = String(local).split(/[\\/]/).filter(Boolean).pop() || '';
+  try { base = decodeURIComponent(base); } catch (_) { return ''; }
+  return base && !/[\u0000-\u001f\u007f]/.test(base) ? base : '';
+}
+
+/**
+ * A failed model-authored media reference normally stays visible so the user
+ * can see that the surrounding prose points at something missing. There is
+ * one stronger recovery signal: the same bubble already contains the host's
+ * produced-file preview with the same local basename and media kind. In that
+ * case the failed card is only a stale duplicate (for example an earlier
+ * narration audition path), while the produced preview is the usable result.
+ */
+function _dropFailedDuplicateMarkdownPreview(el) {
+  if (!el || el.closest?.('.chat-msg-produced-media')) return false;
+  const bubble = el.closest?.('.chat-bubble');
+  const base = _localMediaReferenceBasename(el.getAttribute?.('src'));
+  if (!bubble || !base || typeof bubble.querySelectorAll !== 'function') return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  if (tag !== 'img' && tag !== 'video' && tag !== 'audio') return false;
+  const candidates = bubble.querySelectorAll(`.chat-msg-produced-media ${tag}[src]`);
+  const duplicate = Array.from(candidates).some((candidate) => (
+    _localMediaReferenceBasename(candidate.getAttribute?.('src')) === base
+  ));
+  if (!duplicate) return false;
+  const blockSelector = '.chat-image-shell, .chat-md-video-shell, .chat-md-audio-card';
+  (el.closest(blockSelector) || el).remove();
+  return true;
+}
+
+if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
+  const target = e.target;
+  if (!target || target.nodeType !== 1) return;
+  const isChatMedia = (target.tagName === 'IMG' && target.classList?.contains('chat-md-img'))
+    || (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video'))
+    || (target.tagName === 'AUDIO' && target.classList?.contains('chat-md-audio'));
+  if (!isChatMedia) return;
+  if (_dropFailedProducedPreview(target)) return;
+  if (_dropFailedDuplicateMarkdownPreview(target)) return;
+  if (target.tagName === 'IMG') {
+    _replaceMissingMarkdownImage(target);
+    return;
+  }
+  // A link that names no file can never play, so it gets no player and no retry.
+  const unreadable = !!_undecodableChatMediaLocalPath(target.getAttribute?.('src') || target.currentSrc);
+  if (target.tagName === 'VIDEO') {
+    if (unreadable) _replaceMissingMarkdownVideo(target);
+    else _diagnoseMarkdownVideoError(target);
+    return;
+  }
+  if (unreadable) (target.closest?.('.chat-md-audio-card') || target).remove();
+}, true);
+
+const _CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX = 56;
+
+// Chromium retargets clicks from the closed native media-controls shadow DOM
+// to the <video> element. Reserve the row and its volume popup so native
+// control clicks are not turned into a second surface toggle.
+function _chatVideoNativeControlsHit(clientY, rectTop, rectBottom, clientX, rectRight) {
+  const y = Number(clientY);
+  const top = Number(rectTop);
+  const bottom = Number(rectBottom);
+  if (!Number.isFinite(y) || !Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= top) return false;
+  const guard = Math.min(_CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX, bottom - top);
+  if (y >= bottom - guard && y <= bottom) return true;
+  const x = Number(clientX);
+  const right = Number(rectRight);
+  return Number.isFinite(x) && Number.isFinite(right)
+    && y >= Math.max(top, bottom - 88) && y < bottom - guard
+    && x >= right - 160 && x <= right - 48;
+}
+
+function _chatVideoClickHitsNativeControls(e, video) {
+  if (!e || !video || e.target !== video || !video.controls || typeof video.getBoundingClientRect !== 'function') return false;
+  const rect = video.getBoundingClientRect();
+  return _chatVideoNativeControlsHit(e.clientY, rect.top, rect.bottom, e.clientX, rect.right);
+}
+
+function _toggleChatVideoFromSurface(e, surface) {
+  if (!e || !surface || typeof surface.querySelector !== 'function') return false;
+  const video = surface.querySelector('video');
+  if (!video || _chatVideoClickHitsNativeControls(e, video)) return false;
+
+  const target = e.target;
+  const interactive = target && target.closest
+    ? target.closest('a, button, input, select, textarea, label, [role="button"], [contenteditable="true"]')
+    : null;
+  if (interactive) return false;
+
+  const shouldPlay = !!(video.paused || video.ended);
+  e.preventDefault();
+  e.stopPropagation();
+  if (shouldPlay) {
+    if (video.ended) {
+      try { video.currentTime = 0; } catch (_) {}
+    }
+    try {
+      const promise = video.play();
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+    } catch (_) { /* user can still use the native controls */ }
+  } else {
+    try { video.pause(); } catch (_) {}
+  }
+  return true;
+}
+
+if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
+  const target = e.target;
+  const audioMenu = target && target.closest ? target.closest('[data-chat-md-audio-menu="1"]') : null;
+  if (audioMenu) {
+    e.preventDefault();
+    e.stopPropagation();
+    return _openMarkdownAudioMenu(audioMenu);
+  }
+  const file = target && target.closest ? target.closest('[data-chat-md-file-open="1"]') : null;
+  if (file) {
+    e.preventDefault();
+    e.stopPropagation();
+    const absPath = _chatMediaLocalPathFromUrl(file.getAttribute('data-file-src') || '');
+    if (!absPath || /[\u0000-\u001f\u007f]/.test(absPath) || typeof openChatFileViewer !== 'function') return;
+    const name = absPath.split(/[\\/]/).pop() || absPath;
+    openChatFileViewer(absPath, name, {
+      cid: typeof currentCid !== 'undefined' ? currentCid || null : null,
+      sourceElement: file,
+    });
+    return;
+  }
+  const retry = target && target.closest ? target.closest('[data-chat-md-video-retry="1"]') : null;
+  if (retry) {
+    e.preventDefault();
+    e.stopPropagation();
+    const shell = retry.closest('.chat-md-video-shell');
+    const video = shell?.querySelector?.('video.chat-md-video');
+    if (!video) return;
+    _clearMarkdownVideoLoadFailure(video);
+    try { video.load(); } catch (_) { /* a later error restores the retry state */ }
+    return;
+  }
+  const btn = target && target.closest ? target.closest('[data-chat-md-video-open="1"]') : null;
+  if (btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    const src = btn.getAttribute('data-video-src') || '';
+    const absPath = _chatMediaLocalPathFromUrl(src);
+    if (!absPath || typeof openChatFileViewer !== 'function') return;
+    const name = absPath.split(/[\\/]/).pop() || 'video';
+    const shell = btn.closest('.chat-md-video-shell');
+    const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video') : null;
+    const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+    const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
+    const ended = !!(video && video.ended);
+    const playbackOpts = { autoplay: true, startTime, duration, ended };
+    try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
+    if (typeof openChatVideoUrlViewer === 'function') {
+      openChatVideoUrlViewer(src, name, playbackOpts);
+      return;
+    }
+    openChatFileViewer(absPath, name, playbackOpts);
+    return;
+  }
+
+  const surface = target && target.closest ? target.closest('[data-chat-video-playback-surface]') : null;
+  if (surface) _toggleChatVideoFromSurface(e, surface);
+}, true);
+
+// Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK
+// ideographs / kana / hangul / CJK punctuation never appear in a real URL
+// (IRIs encode the host as punycode and the path as percent-encoded UTF-8).
+// Without these ranges in the regex's negated char class, a URL embedded
+// in a CJK sentence is matched through the trailing CJK run and the link
+// visually swallows the prose. Reported case: a fullwidth comma after a
+// URL pulled the rest of the Chinese sentence into the anchor.
+const _URL_NON_TERMINATOR =
+  '\u4e00-\u9fff' +   // CJK Unified Ideographs
+  '\u3000-\u303f' +   // CJK Symbols and Punctuation
+  '\uff00-\uffef' +   // Halfwidth and Fullwidth Forms (incl. fullwidth ASCII punct)
+  '\u3040-\u309f' +   // Hiragana
+  '\u30a0-\u30ff' +   // Katakana
+  '\uac00-\ud7af';    // Hangul Syllables
+
+// Bare URL autolink. Negative lookbehind keeps us out of:
+//   1) URLs already inside an HTML attr (preceded by `"` / `'` / `=`) from
+//      earlier phases (markdown links / image src / `<url>` autolinks) —
+//      must NOT double-wrap;
+//   2) mid-string positions (preceded by URL-internal chars) that look
+//      like the tail of a longer URL.
+// Termination set excludes ASCII URL-incompatible chars + the CJK ranges
+// so the URL ends at the first non-URL boundary.
+const _BARE_URL_RE = new RegExp(
+  '(?<![a-zA-Z0-9._\\-:/?=&#%+"\'>])' +
+  '(https?:\\/\\/[^\\s<>"\'`)\\]' + _URL_NON_TERMINATOR + ']+)',
+  'g'
+);
+
+const _BARE_EMAIL_RE = new RegExp(
+  '(?<![a-zA-Z0-9._\\-:/?=&#%+"\'>])' +
+  '([\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,})',
+  'g'
+);
+
+// Replace bare http(s) URLs with `<a>` tags. Trailing ASCII sentence punct
+// (`.,;:!?)`) is trimmed off the link and emitted as plain text after it,
+// so "see https://x.com." renders with the period outside the link.
+function _linkifyBareUrls(text) {
+  return text.replace(_BARE_URL_RE, (_, url) => {
+    const trail = (url.match(/[.,;:!?)]+$/) || [''])[0];
+    const clean = trail ? url.slice(0, -trail.length) : url;
+    return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>${trail}`;
+  });
+}
+
+function _linkifyBareEmails(text) {
+  return text.replace(_BARE_EMAIL_RE, (_, email) => `<a href="mailto:${email}">${email}</a>`);
+}
+
+// One comparable identity per media reference, so two spellings of the same
+// file collapse. Local media keys on the decoded absolute path, which drops the
+// `?v=<mtime>-<ctime>-<size>` cache token `versionedChatMediaLocalUrl`
+// (main/util/chat-media-url.ts) appends and the percent-encoding differences
+// between a main-generated URL and `_normalizeLocalMediaSrc`. Anything else
+// keys on the normalized src itself — exact string equality, no false pairs.
+function _mediaDedupKey(src) {
+  const normalized = _normalizeLocalMediaSrc(String(src === null || src === undefined ? '' : src).trim());
+  if (!normalized) return '';
+  const local = _chatMediaLocalPathFromUrl(normalized);
+  return local ? local.replace(/\\/g, '/') : normalized;
+}
+
+// Media this message already presents through an explicit `![](…)` embed.
+// Populated per `renderMarkdownFull` pass because the duplicate pair sits on
+// two different lines and `inlineFormat` only ever sees one of them.
+let _mdEmbeddedMediaKeys = null;
+
+function _collectEmbeddedMediaKeys(md) {
+  const keys = new Set();
+  String(md || '').replace(/!\[[^\]]*\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g, (_, rawSrc) => {
+    const src = _normalizeLocalMediaSrc(rawSrc.startsWith('<') ? rawSrc.slice(1, -1) : rawSrc);
+    if (_isImageSrc(src) || _isVideoSrc(src) || _isAudioSrc(src)) {
+      const key = _mediaDedupKey(src);
+      if (key) keys.add(key);
+    }
+    return '';
+  });
+  return keys;
+}
+
+function inlineFormat(text) {
+  // Phase 1: media + markdown links + `<url>` / `<email>` autolinks + emphasis.
+  const phase1 = text
+    // Media: ![alt](src) — dispatch to <video> when src looks like a video
+    // file, else <img>. Must run before link syntax.
+    .replace(/!\[([^\]]*)\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"([^"]*)")?\)/g,
+      (_, alt, rawSrc, title) => {
+        const src = _normalizeLocalMediaSrc(rawSrc.startsWith('<') ? rawSrc.slice(1, -1) : rawSrc);
+        const mediaMeta = _parseOrkasMediaTitle(title);
+        if (_isHtmlSrc(src)) return _markdownHtmlEmbedHtml(src, alt, title);
+        if (mediaMeta ? mediaMeta.kind === 'video' : _isVideoSrc(src)) {
+          // `preload=metadata` so listings don't auto-fetch the whole file;
+          // controls visible so user can play/seek.
+          return _markdownVideoHtml(src, alt, title);
+        }
+        if (_isAudioSrc(src)) return _markdownAudioHtml(src, alt, title);
+        return _markdownImageHtml(src, alt, title);
+      })
+    // Markdown links: [text](url "title")
+    .replace(/\[([^\]]+)\]\((<[^<>\r\n]+>|[^)\s]+)(?:\s+"([^"]*)")?\)/g,
+      (_, txt, rawUrl, title) => {
+        if (rawUrl.startsWith('<')) rawUrl = rawUrl.slice(1, -1);
+        // Media links get the same rewrite as `![](…)`: an agent delivering a
+        // finished file writes `[视频成片](<path>)` as often as an embed.
+        const url = _isImageSrc(rawUrl) || _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
+          ? _normalizeLocalMediaSrc(rawUrl)
+          : rawUrl;
+        // …but an agent also writes both: a download link *and* the embed for
+        // one file, which rendered that file twice in the same bubble
+        // (2026-08-27, ImageStudio: `[下载卡片图](…png?v=…)` on one line and
+        // `![AI创业增量市场卡片图](…png?v=…)` on the next). The embed is the
+        // presentation the model was asked for (main/prompts/chat_shared_rules.md
+        // "File output + chat-media usage"), so it wins and the redundant link
+        // is dropped. Scoped to link-upgraded media only: two explicit embeds of
+        // one path still render twice, and a link with no matching embed still
+        // upgrades — that case is why the upgrade exists.
+        if (_mdEmbeddedMediaKeys
+          && (_isImageSrc(url) || _isVideoSrc(url) || _isAudioSrc(url))
+          && _mdEmbeddedMediaKeys.has(_mediaDedupKey(url))) return '';
+        if (_isImageSrc(url)) return _markdownImageHtml(url, txt, title);
+        if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
+        if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
+        const fileLink = _markdownFileLinkHtml(url, txt, title);
+        if (fileLink) return fileLink;
+        // href: scheme-checked + escaped (blocks javascript:/data: and quote
+        // breakout). text stays raw so nested image/emphasis still render;
+        // DOMPurify scrubs any raw HTML in the text at the output layer.
+        const href = _safeHref(url);
+        if (!href) {
+          // Main promotes only existing workspace-relative document links.
+          // Unresolved relative references remain filenames, without an action.
+          if (!/^(?:[a-z][a-z0-9+.-]*:|[\\/#?])/i.test(_markdownFileReferencePath(url))) {
+            const name = url.split(/[\\/]/).pop() || '';
+            if (/\.[^./\\\s]+/.test(name)) return escapeHtml(name);
+          }
+          return txt;
+        }
+        const target = href.charAt(0) === '#' ? '' : ' target="_blank" rel="noopener"';
+        return `<a href="${escapeHtml(href)}"${target}${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
+      })
+    // <url> and <email> autolinks
+    .replace(/<((?:https?:\/\/|mailto:)[^>\s]+)>/g,
+      (_, u) => `<a href="${escapeHtml(u)}" target="_blank" rel="noopener">${escapeHtml(u)}</a>`)
+    .replace(/<([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})>/g,
+      (_, e) => `<a href="mailto:${e}">${e}</a>`)
+    // Emphasis
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  // Phase 2: bare URL + bare email autolinks. Split out so set-A
+  // (real URLs in CJK / ASCII contexts must end at the right boundary) and
+  // set-B (URLs inside attrs / already-wrapped links must not be re-wrapped)
+  // are pinned by `test/renderer/utils-autolink.test.ts`.
+  return _linkifyBareEmails(_linkifyBareUrls(phase1));
+}
+
+// Unified entrypoint: all chat bubbles, skill detail pages, streaming finals
+// share the same full-featured Markdown renderer (tables, lists, code blocks,
+// :::chart-bar directives, etc). Call sites use `renderMarkdown(str)` without
+// caring about the level of support.
+const renderMarkdown = renderMarkdownFull;
+
+// Route supported external link clicks through main's strict validator +
+// shell.openExternal so they always land in the system handler regardless of
+// `target=` / Electron version /
+// rel=noopener quirks. Covers chat bubbles, KB viewer, skill detail, agent
+// workflow — anywhere renderMarkdown emits a supported external link. Main's
+// setWindowOpenHandler / will-navigate (see main/index.ts) is the safety net
+// for HTTP(S) clicks that arrive before this script evaluates.
+// Guarded for Node test env where `document` is undefined; the click router
+// is a renderer-only side effect and irrelevant to the autolink fixtures.
+if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
+  const a = e.target && e.target.closest && e.target.closest('a[href]');
+  if (!a) return;
+  const href = String(a.getAttribute('href') || '').trim();
+  if (href.charAt(0) === '#') {
+    e.preventDefault();
+    let id = '';
+    try { id = decodeURIComponent(href.slice(1)); } catch (_) { return; }
+    const target = id && (document.getElementById(id)
+      || (document.getElementsByName && document.getElementsByName(id)[0]));
+    if (target && typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'start' });
+    return;
+  }
+  if (!_SAFE_EXTERNAL_LINK_RE.test(href)) { e.preventDefault(); return; }
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') {
+    // The main navigation guard can still route HTTP(S). Never let a custom
+    // OS-handler scheme fall through without the stricter IPC validation.
+    if (!/^https?:\/\//i.test(href)) e.preventDefault();
+    return;
+  }
+  e.preventDefault();
+  window.orkas.invoke('auth.openExternal', { url: href }).catch(() => {});
+});
+
+/** Renderer-side mirror of `storage.ts::nowIso()` — local-time ISO8601
+ *  truncated to seconds, no TZ suffix. Optimistic / placeholder timestamps
+ *  must use this format so they sort identically with persisted ts strings
+ *  produced server-side. Mixing `new Date().toISOString()` (UTC + ms) with
+ *  the server's second-precision local-time string parses to a 0–999ms
+ *  drift that makes a same-second user msg test as "later than" the agent
+ *  reply, flipping bubble order in the chat (CLAUDE.md §8). */
+function nowIsoLocal() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Compose a sidebar title from arbitrary user-message text. Mirrors
+ *  backend `chats.ts::autoTitle` so the optimistic renderer-side title
+ *  and the backend-persisted title agree — without this match the new
+ *  conv first paints the optimistic value, then `loadConversations`
+ *  refreshes with backend's value and the sidebar entry visibly flips.
+ *  Empty input returns '' so the caller can fall back to its own
+ *  placeholder (`t('chat.new_conv_title')` for the conv list). */
+// `_autoTitle` + its regex constants live in `modules/auto-title.js` so the
+// regex set has a single renderer-side home and a clean target for the
+// `test/renderer/auto-title-parity.test.ts` parity check against
+// `src/main/util/auto-title.ts`. The new file is loaded before consumers
+// via `<script src="./modules/auto-title.js">` in index.html.
+
+function formatTime(iso) {
+  if (!iso) return '-';
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).replace('T', ' ').substring(0, 16);
+    const formatter = new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    });
+    const parts = formatter.formatToParts(d);
+    const map = {};
+    parts.forEach(p => map[p.type] = p.value);
+    return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}`;
+  } catch (e) {
+    return String(iso).replace('T', ' ').substring(0, 16);
+  }
+}
+
+// ─── Custom dropdown (AiSelect) ───────────────────────────────────────────
+// Native <select> renders OS-default chrome that looks dated next to the
+// rest of the app. AiSelect is a minimal styled replacement:
+//   - mount point: <div class="ai-select" id="...">
+//   - set options via _aiSelectMount(el, { options, value, placeholder,
+//                                          onChange })
+//   - reads current value via el.dataset.value (string)
+// Keyboard: Enter/Space toggles the popover, arrow keys to nav, Esc to close.
+
+const AI_SELECT_BASE_POPOVER_Z_INDEX = 14000;
+let _aiSelectIdSeq = 0;
+
+function _aiSelectNormalizeOptions(options) {
+  if (!Array.isArray(options)) return [];
+  const seen = new Set();
+  const normalized = [];
+  for (const raw of options) {
+    if (!raw || typeof raw !== 'object' || typeof raw.value !== 'string' || seen.has(raw.value)) continue;
+    seen.add(raw.value);
+    normalized.push({
+      ...raw,
+      label: raw.label === null || raw.label === undefined ? raw.value : String(raw.label),
+      hint: raw.hint === null || raw.hint === undefined ? '' : String(raw.hint),
+      iconName: raw.iconName === null || raw.iconName === undefined ? '' : String(raw.iconName),
+      ...(raw.disabled === true ? { disabled: true } : {}),
+    });
+  }
+  return normalized;
+}
+
+function _aiSelectNextZIndex(values, fallback = AI_SELECT_BASE_POPOVER_Z_INDEX) {
+  let z = fallback;
+  for (const raw of values || []) {
+    const n = Number.parseInt(String(raw || ''), 10);
+    if (Number.isFinite(n)) z = Math.max(z, n + 1);
+  }
+  return z;
+}
+
+function _aiSelectPopoverZIndexFor(el) {
+  const values = [];
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const raw = window.getComputedStyle(n).zIndex;
+    if (raw && raw !== 'auto') values.push(raw);
+  }
+  // Some modal systems put the high z-index on a sibling/backdrop instead
+  // of an ancestor of the select. Include visible app overlays so a body-
+  // portaled dropdown still paints above the current dialog layer.
+  if (typeof document !== 'undefined' && document.body) {
+    const layerSelector = [
+      '.modal-overlay.open',
+      '.ui-dialog-overlay.open',
+      '[role="dialog"][aria-modal="true"]',
+    ].join(',');
+    for (const n of document.querySelectorAll(layerSelector)) {
+      if (!n || n === el || n.hidden) continue;
+      const style = window.getComputedStyle(n);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (style.zIndex && style.zIndex !== 'auto') values.push(style.zIndex);
+    }
+  }
+  return _aiSelectNextZIndex(values);
+}
+
+function _aiSelectMount(el, config) {
+  if (!el) return null;
+  const state = {
+    options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?}]
+    value: '',
+    allowMultiple: false,
+    multiple: false,
+    values: [],
+    placeholder: (t('ai_select.placeholder')),
+    onChange: () => {},
+    open: false,
+    activeIdx: -1,
+  };
+  Object.assign(state, config || {});
+  state.options = _aiSelectNormalizeOptions(state.options);
+  state.value = typeof state.value === 'string' ? state.value : '';
+  state.placeholder = String(state.placeholder || t('ai_select.placeholder'));
+  if (state.value && !state.options.some(
+    option => option.value === state.value && !option.disabled && typeof option.action !== 'function',
+  )) state.value = '';
+
+  state.multiple = state.allowMultiple && state.multiple === true;
+  const disabled = option => option.disabled || (state.multiple && option.singleOnly);
+  const normalizeValues = values => state.options
+    .filter(option => !disabled(option) && typeof option.action !== 'function' && values.includes(option.value)).map(option => option.value);
+  state.values = state.multiple ? normalizeValues(state.values) : (state.value ? [state.value] : []);
+
+  const caretIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('chevron-down', 'ai-select-caret')
+    : '';
+
+  el.classList.add('ai-select');
+  const controlId = el.id || `ai-select-${++_aiSelectIdSeq}`;
+  const triggerId = `${controlId}-trigger`;
+  const listboxId = `${controlId}-listbox`;
+  const accessibleName = () => String(
+    state.ariaLabel
+    || el.getAttribute?.('aria-label')
+    || state.placeholder,
+  );
+  el.innerHTML = `
+    <button type="button" class="ai-select-trigger" id="${escapeHtml(triggerId)}" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="${escapeHtml(listboxId)}" aria-label="${escapeHtml(accessibleName())}">
+      <span class="ai-select-label"></span>
+      ${caretIcon}
+    </button>
+    <div class="ai-select-popover" id="${escapeHtml(listboxId)}" role="listbox" aria-labelledby="${escapeHtml(triggerId)}" hidden></div>
+  `;
+
+  const trigger = el.querySelector('.ai-select-trigger');
+  const labelEl = el.querySelector('.ai-select-label');
+  const popover = el.querySelector('.ai-select-popover');
+
+  const renderOptionLabel = (target, opt) => {
+    target.innerHTML = '';
+    if (opt && opt.avatar && typeof renderAvatarHtml === 'function') {
+      const avatar = document.createElement('span');
+      avatar.className = 'ai-select-option-icon';
+      avatar.setAttribute('aria-hidden', 'true');
+      avatar.innerHTML = renderAvatarHtml(opt.avatar.icon, opt.avatar.color, {
+        size: 18, seed: opt.avatar.seed,
+      });
+      target.appendChild(avatar);
+    } else if (opt && opt.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+      const iconWrap = document.createElement('span');
+      iconWrap.className = 'ai-select-option-icon';
+      iconWrap.innerHTML = window.uiIconHtml(opt.iconName, 'ui-icon ai-select-svg-icon');
+      target.appendChild(iconWrap);
+    }
+    const text = document.createElement('span');
+    text.textContent = opt ? opt.label : state.placeholder;
+    target.appendChild(text);
+  };
+
+  const renderTrigger = () => {
+    trigger.setAttribute('aria-label', accessibleName());
+    const selected = state.multiple ? state.options.filter(o => state.values.includes(o.value)) : [];
+    const opt = state.multiple
+      ? (selected.length ? { label: selected.map(o => o.label).join(t('ai_select.separator')) } : null)
+      : state.options.find(o => o.value === state.value);
+    if (opt) {
+      renderOptionLabel(labelEl, opt);
+      labelEl.classList.remove('placeholder');
+    } else {
+      renderOptionLabel(labelEl, null);
+      labelEl.classList.add('placeholder');
+    }
+    el.dataset.value = state.value || '';
+    if (state.allowMultiple) {
+      el.dataset.values = JSON.stringify(state.values);
+      trigger.title = opt ? opt.label : '';
+      trigger.setAttribute('aria-label', opt ? accessibleName() + ': ' + opt.label : accessibleName());
+    }
+  };
+
+  const renderPopover = () => {
+    const scrollTop = popover.scrollTop;
+    popover.innerHTML = '';
+    popover.setAttribute('aria-multiselectable', String(state.multiple));
+    if (state.allowMultiple) {
+      const header = document.createElement('label');
+      header.className = 'ai-select-multiple-row';
+      header.textContent = t('ai_select.multiple');
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.className = 'ai-select-multiple-toggle';
+      toggle.setAttribute('role', 'switch');
+      toggle.checked = state.multiple;
+      toggle.addEventListener('change', () => {
+        api.setMultiple(toggle.checked);
+        state.onChange(state.multiple ? [...state.values] : state.value);
+        popover.querySelector('.ai-select-multiple-toggle')?.focus();
+      });
+      header.appendChild(toggle);
+      popover.appendChild(header);
+    }
+    if (state.options.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'ai-select-empty';
+      empty.textContent = t('ai_select.empty');
+      popover.appendChild(empty);
+      return;
+    }
+    state.options.forEach((opt, idx) => {
+      const item = document.createElement('div');
+      item.className = 'ai-select-item' + (typeof opt.action === 'function' ? ' is-action' : '');
+      item.id = `${listboxId}-option-${idx}`;
+      item.dataset.value = opt.value;
+      item.setAttribute('role', 'option');
+      const selected = state.multiple ? state.values.includes(opt.value) : opt.value === state.value;
+      item.setAttribute('aria-selected', selected ? 'true' : 'false');
+      item.setAttribute('aria-disabled', disabled(opt) ? 'true' : 'false');
+      if (selected) item.classList.add('active');
+      if (disabled(opt)) item.classList.add('disabled');
+      if (idx === state.activeIdx) item.classList.add('hover');
+      const main = document.createElement('div');
+      main.className = 'ai-select-item-label';
+      renderOptionLabel(main, opt);
+      item.appendChild(main);
+      if (state.multiple && selected) {
+        const check = document.createElement('span');
+        check.className = 'ai-select-check';
+        check.setAttribute('aria-hidden', 'true');
+        check.innerHTML = typeof window.uiIconHtml === 'function' ? window.uiIconHtml('check', 'ui-icon') : '\u2713';
+        main.appendChild(check);
+      }
+      if (opt.hint) {
+        const hint = document.createElement('div');
+        hint.className = 'ai-select-item-hint';
+        hint.textContent = opt.hint;
+        item.appendChild(hint);
+      }
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        if (disabled(opt)) return;
+        _aiSelectPick(api, opt.value);
+      });
+      item.addEventListener('mouseenter', () => {
+        if (disabled(opt)) return;
+        state.activeIdx = idx;
+        popover.querySelectorAll('.ai-select-item').forEach((n, i) => n.classList.toggle('hover', i === idx));
+      });
+      popover.appendChild(item);
+    });
+    if (state.allowMultiple) popover.scrollTop = scrollTop;
+    const active = state.activeIdx >= 0
+      ? popover.querySelectorAll('.ai-select-item')[state.activeIdx]
+      : null;
+    if (active) trigger.setAttribute('aria-activedescendant', active.id);
+    else trigger.removeAttribute('aria-activedescendant');
+  };
+
+  // Portal the popover to <body> while open so an ancestor with
+  // `overflow: auto / hidden` (modals, settings panes) can't clip it.
+  // We set `position: fixed` + viewport coords from the trigger's
+  // bounding rect; on scroll/resize we re-measure. This replaces the
+  // earlier "popover lives inside .ai-select" layout — the markup
+  // still renders the popover inside .ai-select for first paint, but
+  // open/close moves it back and forth.
+  let portalParent = null;
+  let portalNextSibling = null;
+  const reposition = () => {
+    if (!state.open) return;
+    // Establish the portal's final positioning before measuring. An absolute
+    // popover under body can temporarily add a scrollbar and shift a centered
+    // trigger; the scrollbar vanishes once the menu is positioned in view.
+    popover.style.position = 'fixed';
+    // The in-slot CSS sets both edges. With an explicit portal width, RTL
+    // resolves that overconstraint by ignoring left; release the opposite edge.
+    popover.style.right = 'auto';
+    popover.style.top = '0px';
+    const rect = trigger.getBoundingClientRect();
+    popover.dataset.uiOverlay = '';
+    popover.style.position = 'fixed';
+    // Release the in-slot opposite edge so RTL keeps the measured left anchor.
+    popover.style.right = 'auto';
+    popover.style.left = rect.left + 'px';
+    popover.style.width = rect.width + 'px';
+    popover.style.maxHeight = '';
+    const popH = popover.offsetHeight || 260;
+    // A reserved RTL scrollbar gutter can offset the fixed containing block
+    // from viewport coordinates. Correct from the rendered menu, retaining
+    // the shared trigger measurement and any app-owned CSS positioning.
+    const horizontalOffset = rect.left - popover.getBoundingClientRect().left;
+    if (horizontalOffset) popover.style.left = (rect.left + horizontalOffset) + 'px';
+    const placement = _dropdownVerticalPlacement(rect, popH, window.innerHeight, {
+      edge: 8,
+      gap: 4,
+    });
+    popover.style.top = placement.top + 'px';
+    popover.style.maxHeight = Math.min(260, placement.availableHeight) + 'px';
+    popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
+    popover.style.zIndex = String(_aiSelectPopoverZIndexFor(el));
+  };
+  const open = () => {
+    if (state.open) return;
+    state.open = true;
+    el.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');
+    popover.hidden = false;
+    portalParent = popover.parentNode;
+    portalNextSibling = popover.nextSibling;
+    document.body.appendChild(popover);
+    const selectedIdx = state.options.findIndex(o => (state.multiple ? state.values.includes(o.value) : o.value === state.value) && !disabled(o));
+    state.activeIdx = selectedIdx >= 0
+      ? selectedIdx
+      : state.options.findIndex(option => !disabled(option));
+    renderPopover();
+    reposition();
+    setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition, true);
+  };
+
+  const close = () => {
+    if (!state.open) return;
+    state.open = false;
+    el.classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.removeAttribute('aria-activedescendant');
+    popover.hidden = true;
+    popover.style.position = '';
+    popover.style.left = '';
+    popover.style.right = '';
+    popover.style.top = '';
+    popover.style.width = '';
+    popover.style.maxHeight = '';
+    popover.style.zIndex = '';
+    delete popover.dataset.placement;
+    // Restore popover to its original parent if that parent is still
+    // attached to the document. If the host widget got removed mid-open
+    // (e.g., the detail page re-rendered and replaced our slot), just
+    // detach the popover so it doesn't dangle on document.body.
+    if (portalParent) {
+      if (portalParent.isConnected) {
+        portalParent.insertBefore(popover, portalNextSibling);
+      } else if (popover.parentNode) {
+        popover.parentNode.removeChild(popover);
+      }
+      portalParent = null;
+      portalNextSibling = null;
+    }
+    document.removeEventListener('mousedown', onDocDown, true);
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('scroll', reposition, true);
+    window.removeEventListener('resize', reposition, true);
+  };
+
+  const onDocDown = (e) => {
+    if (!el.contains(e.target) && !popover.contains(e.target)) close();
+  };
+  const nextEnabledIndex = (start, step) => {
+    for (let idx = start; idx >= 0 && idx < state.options.length; idx += step) {
+      if (!disabled(state.options[idx])) return idx;
+    }
+    return state.activeIdx;
+  };
+  const onKey = (e) => {
+    // IME composition guard (CLAUDE.md §8): the popover keydown listener
+    // is on `document`, so a Chinese / Japanese / Korean composition in an
+    // adjacent input would otherwise commit its Enter into "pick the
+    // active option" of this select.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape') { close(); if (state.allowMultiple) trigger.focus(); e.preventDefault(); }
+    else if (state.allowMultiple && e.key === 'Tab') { close(); if (e.target !== trigger) trigger.focus(); }
+    else if (e.target.classList?.contains('ai-select-multiple-toggle')) return;
+    else if (e.key === 'ArrowDown') {
+      state.activeIdx = nextEnabledIndex(state.activeIdx + 1, 1);
+      renderPopover();
+      e.preventDefault();
+    } else if (e.key === 'ArrowUp') {
+      state.activeIdx = nextEnabledIndex(
+        state.activeIdx < 0 ? state.options.length - 1 : state.activeIdx - 1,
+        -1,
+      );
+      renderPopover();
+      e.preventDefault();
+    } else if (e.key === 'Enter' || (state.multiple && e.key === ' ')) {
+      if (
+        state.activeIdx >= 0
+        && state.activeIdx < state.options.length
+        && !disabled(state.options[state.activeIdx])
+      ) {
+        _aiSelectPick(api, state.options[state.activeIdx].value);
+        e.preventDefault();
+      }
+    }
+  };
+
+  trigger.addEventListener('click', () => state.open ? close() : open());
+
+  const api = {
+    el,
+    state,
+    setOptions(options, { value, placeholder } = {}) {
+      state.options = _aiSelectNormalizeOptions(options);
+      if (typeof value === 'string') state.value = value;
+      if (typeof placeholder === 'string') state.placeholder = placeholder;
+      // Normalize value if not in options
+      if (state.value && !state.options.some(
+        option => option.value === state.value && !option.disabled && typeof option.action !== 'function',
+      )) state.value = '';
+      if (
+        state.activeIdx >= state.options.length
+        || state.options[state.activeIdx]?.disabled
+      ) {
+        state.activeIdx = state.options.findIndex(option => !disabled(option));
+      }
+      if (state.multiple) state.values = normalizeValues(state.values);
+      else state.values = state.value ? [state.value] : [];
+      renderTrigger();
+      if (state.open) renderPopover();
+    },
+    setValue(value) {
+      state.value = typeof value === 'string' && state.options.some(
+        option => option.value === value && !option.disabled && typeof option.action !== 'function',
+      )
+        ? value
+        : '';
+      renderTrigger();
+    },
+    setSelection(values, multiple) {
+      state.multiple = state.allowMultiple && multiple === true;
+      state.values = normalizeValues(Array.isArray(values) ? values : []);
+      state.value = state.multiple ? '' : (state.values.length === 1 ? state.values[0] : '');
+      if (!state.multiple) state.values = state.value ? [state.value] : [];
+      renderTrigger();
+      if (state.open) { renderPopover(); reposition(); }
+    },
+    setMultiple(multiple) {
+      const values = state.multiple ? state.values : (state.value ? [state.value] : []);
+      const expanded = values.flatMap(value => {
+        const option = state.options.find(opt => opt.value === value);
+        return multiple && option?.singleOnly ? (option.multipleValues || []) : [value];
+      });
+      api.setSelection(expanded, multiple);
+    },
+    isMultiple() { return state.multiple; },
+    getValues() { return state.multiple ? [...state.values] : (state.value ? [state.value] : []); },
+    toggleValue(value) {
+      const next = state.options.find(option => option.value === value);
+      if (!next || disabled(next)) return;
+      const values = state.values.includes(value) ? state.values.filter(v => v !== value) : [...state.values, value];
+      api.setSelection(values, true);
+      state.onChange([...state.values]);
+    },
+    setAriaLabel(value) {
+      state.ariaLabel = value === null || value === undefined ? '' : String(value);
+      renderTrigger();
+    },
+    getValue() { return state.value; },
+    onChange(fn) { state.onChange = typeof fn === 'function' ? fn : () => {}; },
+    close,
+  };
+
+  renderTrigger();
+  return api;
+}
+
+function _aiSelectPick(api, value) {
+  const next = api.state.options.find(option => option.value === value);
+  if (!next || next.disabled || (api.state.multiple && next.singleOnly)) return;
+  if (typeof next.action === 'function') { api.close(); next.action(); return; }
+  if (api.state.multiple) { api.toggleValue(value); return; }
+  const prev = api.state.value;
+  api.state.value = value || '';
+  api.el.dataset.value = api.state.value;
+  api.close();
+  if (prev !== api.state.value) {
+    try { api.state.onChange(api.state.value); } catch (_) {}
+  }
+  api.setValue(api.state.value);
+}
+
+// Test bridge — guarded CommonJS export of pure helpers. No-op in the
+// browser (`module` undefined). Per PC/CLAUDE.md §9 only pure functions go
+// through this bridge; the rest of utils.js (DOM-coupled helpers like
+// `_aiSelectMount`) stays unexported.
+// Matching tests: `utils-autolink.test.ts`, `utils-ai-select.test.ts`.
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = {
+    formatTime,
+    _BARE_URL_RE,
+    _BARE_EMAIL_RE,
+    _linkifyBareUrls,
+    _linkifyBareEmails,
+    normalizeDisplayText,
+    pickDesc,
+    inlineFormat,
+    _markdownImageHtml,
+    _markdownVideoHtml,
+    _markdownAudioHtml,
+    _markdownHtmlEmbedHtml,
+    _isImageSrc,
+    _isHtmlSrc,
+    _markdownHtmlLayoutDimensions,
+    _chatImageIntrinsicStyle,
+    _chatMediaLocalPathFromUrl,
+    _normalizeLocalMediaSrc,
+    _mediaDedupKey,
+    _dropFailedProducedPreview,
+    _localMediaReferenceBasename,
+    _parseOrkasMediaTitle,
+    _chatVideoNativeControlsHit,
+    escapeHtml,
+    sanitizeHtml,
+    _sanitizeHtmlWithoutPurifier,
+    sanitizeSvgIconHtml,
+    _safeHref,
+    _SAFE_URI_RE,
+    _SAFE_EXTERNAL_LINK_RE,
+    renderMarkdown,
+    renderDashboard,
+    _parseDashboardSpec,
+    sanitizeMathExpressionForMathJax,
+    _aiSelectNextZIndex,
+    _aiSelectNormalizeOptions,
+    _arrayBufferToBase64,
+  };
+}

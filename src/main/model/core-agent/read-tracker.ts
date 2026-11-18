@@ -1,0 +1,139 @@
+/**
+ * Read-before-edit + optimistic concurrency control (OCC) for the file tools.
+ *
+ * `read_files` / `write_file` stamp the file's `{ mtimeMs, size, hash? }` into a
+ * run-scoped map; `edit_file` checks that stamp before it writes:
+ *   - read-before-edit — refuse to edit a file the model has not read this run
+ *     (its `old_string` would be a guess), and
+ *   - OCC — refuse to edit changed content, using hashes when both are known
+ *     and filesystem metadata otherwise. Rejections return current context
+ *     for a deliberate retry against the real current bytes.
+ *
+ * The map lives on `ctx.state[READ_FILE_STATE_KEY]`, injected once per run by
+ * core-agent's runner (so it survives across LLM rounds — read and edit are
+ * always different rounds). Enforcement is gated on the map's PRESENCE: when a
+ * host doesn't inject it (older runner, a unit test with `state: {}`) the file
+ * tools degrade to their pre-OCC behaviour rather than blocking every edit. The
+ * real runner always injects it, so production always enforces.
+ *
+ * Stamping from `read_files` is concurrency-safe even though `read_files` is
+ * `executionMode:'parallel'`: a keyed `Map.set(abs, …)` is atomic in JS, the
+ * key is the absolute path (concurrent reads of different files never collide),
+ * and same-file reads write an equivalent value. Each worker run has its OWN
+ * ctx.state, so cross-worker safety rests on the filesystem lock + OCC, not on
+ * this map.
+ */
+
+import type * as fs from 'node:fs';
+import { fileSystemForPath } from '../../util/user-file-fs';
+import type { ToolContext } from '#core-agent';
+
+/** ctx.state key the runner injects the run-scoped read-state map under.
+ *  Mirrored as the literal `'readFileState'` in core-agent's runner — keep the
+ *  two in sync (same contract as `'sandboxEnv'`). */
+export const READ_FILE_STATE_KEY = 'readFileState';
+
+/** Baseline captured when a file is read; compared on edit. */
+export type ReadStamp = { mtimeMs: number; size: number; hash?: string };
+
+/** Shared by enforcement and diagnostics. Matching content hashes make a
+ * timestamp-only update irrelevant; missing hashes retain metadata protection. */
+export function readStampChanged(seen: ReadStamp, st: fs.Stats, currentHash?: string): boolean {
+  if (seen.hash && currentHash) return seen.hash !== currentHash;
+  return seen.mtimeMs !== st.mtimeMs || seen.size !== st.size;
+}
+
+/** Return the run-scoped read-state map, or null when the host didn't inject
+ *  one (→ callers skip read-before-edit/OCC enforcement). */
+export function getReadState(ctx: ToolContext): Map<string, ReadStamp> | null {
+  // `state` is required by the type, but tolerate its absence: some call sites
+  // (older hosts, direct unit tests) pass a ctx without it. No state → no map.
+  const state = ctx.state as Record<string, unknown> | undefined;
+  const m = state?.[READ_FILE_STATE_KEY];
+  return m instanceof Map ? (m as Map<string, ReadStamp>) : null;
+}
+
+function stampFromStats(st: fs.Stats, hash?: string): ReadStamp {
+  return { mtimeMs: st.mtimeMs, size: st.size, ...(hash ? { hash } : {}) };
+}
+
+/** The stamp a host seeds for a file whose complete decoded text it put in
+ *  front of the model itself (see `AgentRunParams.initialReadFileState`).
+ *  `hash` must be the same `sha256:` digest of the UTF-8 re-encoded text
+ *  that `edit_file` computes, so a later edit compares content, not only
+ *  metadata. */
+export function readStampFromStats(st: fs.Stats, hash: string): ReadStamp {
+  return stampFromStats(st, hash);
+}
+
+/** Record that `abs` was read (or written) at its current on-disk state, so a
+ *  later `edit_file` accepts an edit built on these bytes. Best-effort: a stat
+ *  failure is swallowed (the edit path re-stats and will reject if needed).
+ *  Pass `st` to reuse a stat the caller already took. No-op when no map. */
+export function recordRead(ctx: ToolContext, abs: string, st?: fs.Stats, hash?: string): void {
+  const rs = getReadState(ctx);
+  if (!rs) return;
+  try {
+    const stat = st ?? fileSystemForPath(abs).statSync(abs);
+    rs.set(abs, stampFromStats(stat, hash));
+  } catch {
+    // File vanished between read and stamp — leave it unstamped; the edit
+    // path will surface E_NOT_FOUND on its own.
+  }
+}
+
+/** Drop the baseline after a successful delete or move. A later file at the
+ * same path must be read again instead of inheriting stale edit authority. */
+export function forgetRead(ctx: ToolContext, abs: string): void {
+  getReadState(ctx)?.delete(abs);
+}
+
+/** A reason an edit is blocked; the model-facing error code + message. */
+export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
+
+/**
+ * Decide whether `edit_file` may proceed on `abs`, given its current stat.
+ * Returns null when the edit is allowed (or when the run-scoped map is absent,
+ * i.e. the host opted out — see module header), otherwise the block reason:
+ *   - never read this run            → E_NOT_READ
+ *   - content changed, or metadata changed without comparable hashes → E_STALE
+ *
+ * Message contract: every consumer (edit_file, apply_patch) appends a
+ * recovery block with the current bytes and a fresh file_hash, and refreshes
+ * the read baseline on rejection — so the messages steer the model at that
+ * returned context first. A bare "call read_files again" here made models pay
+ * a full re-read round the trailer had already made unnecessary
+ * (2026-08-16 latency review P0-4).
+ */
+export function checkEditFreshness(
+  ctx: ToolContext,
+  abs: string,
+  st: fs.Stats,
+  opts: { expectedHash?: string; currentHash?: string } = {},
+): EditBlock | null {
+  const rs = getReadState(ctx);
+  if (opts.expectedHash) {
+    if (opts.expectedHash !== opts.currentHash) {
+      return {
+        code: 'E_STALE',
+        msg: `${abs}: expected_hash no longer matches the current file. Retry only against the returned current file_hash and context.`,
+      };
+    }
+    return null;
+  }
+  if (!rs) return null; // host opted out of enforcement
+  const seen = rs.get(abs);
+  if (!seen) {
+    return {
+      code: 'E_NOT_READ',
+      msg: `${abs}: not read in this run, so old_string cannot be checked against the real current contents. Use the current context and file_hash returned below to retry (pass expected_hash); use one bounded range in read_files paths only if that window misses your target.`,
+    };
+  }
+  if (readStampChanged(seen, st, opts.currentHash)) {
+    return {
+      code: 'E_STALE',
+      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Retry against the current context and file_hash returned below (pass expected_hash); re-read only the affected region with a read_files paths range if that window is insufficient.`,
+    };
+  }
+  return null;
+}

@@ -1,0 +1,277 @@
+/**
+ * User preferences bag — `<uid>/cloud/config/preferences.json`.
+ *
+ * Cross-device user preferences (cloud-synced), including language,
+ * appearance, feature toggles, and notification preferences.
+ *
+ * History: the old `data/config/config.json` also held legacy
+ * `provider` / `model` fields (the default model pair written by
+ * `auth.saveConfig`). That fallback is deprecated — the default model
+ * is solely determined by the priority entries in
+ * `auth-profiles.json` (`auth.getConfig()` reads `entries[0]`). The
+ * migration drops those two fields.
+ *
+ * Writes merge into the existing file; explicit `undefined` values are
+ * ignored (equivalent to no-op).
+ */
+
+import { app } from 'electron';
+
+import { userPreferencesFile } from '../paths';
+import { readJsonSync, writeJsonSync } from '../storage';
+import { getActiveUserId } from './users';
+import {
+  type Lang,
+  SUPPORTED_LANGS,
+  isLang,
+  detectSystemLang,
+  setCurrentLang,
+} from '../i18n';
+
+export interface CommanderAvatar {
+  icon: string;
+  color: string;
+}
+
+export interface UserPreferences {
+  language?: Lang;
+  /** Local user's To-do page grouping. */
+  todo_grouping?: 'project' | 'status';
+  /** Per-user commander avatar (icon id + color id). Tokens come from
+   * `renderer/modules/avatar.js`. Missing → renderer falls back to the
+   * commander default (crown + gold). */
+  commander_avatar?: CommanderAvatar;
+  /** Metacognition-level agent self-evolution toggle. undefined / any
+   * non-false value → treated as enabled (preserving the historical
+   * default); explicit false → disabled. The env var
+   * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
+   * Reads go through `features/metacognition.isFeatureEnabled`. */
+  metacognition_enabled?: boolean;
+  /** Native task-terminal notifications. Defaults to enabled; explicit false
+   * suppresses every completion/failure/input-needed OS notification. */
+  task_notifications_enabled?: boolean;
+  /** Whether machine-global skill roots such as ~/.codex/skills are visible
+   * to commander open-tier skill search. Missing means enabled, preserving
+   * the historical open-source behavior. */
+  global_skill_roots_enabled?: boolean;
+  /** Per-field update clocks used by cloud-sync to merge independent
+   * preference changes without treating the whole JSON file as one blob. */
+  _field_updated_at?: Record<string, number>;
+  [key: string]: unknown;
+}
+
+// Avatar tokens reuse the same catalog (src/main/data/avatars.json).
+import { getCatalog, isKnownIcon, isKnownColor } from './avatars';
+
+function preferencesFile(): string {
+  return userPreferencesFile(getActiveUserId());
+}
+
+function systemLocales(): string | string[] {
+  try {
+    const preferred = app.getPreferredSystemLanguages();
+    if (Array.isArray(preferred) && preferred.length) return preferred;
+  } catch { /* older Electron or pre-ready/test host */ }
+  let locale = '';
+  try { locale = app.getLocale() || ''; } catch { /* pre-ready or test stub */ }
+  return locale;
+}
+
+function systemLanguage(): Lang {
+  return detectSystemLang(systemLocales());
+}
+
+export function readPreferences(): UserPreferences {
+  return readJsonSync<UserPreferences>(preferencesFile());
+}
+
+function readPreferencesForUser(userId: string): UserPreferences {
+  return readJsonSync<UserPreferences>(userPreferencesFile(userId));
+}
+
+/** Merge `partial` into the on-disk preferences and atomically rewrite. */
+export function writePreferences(partial: Partial<UserPreferences>, userId = getActiveUserId()): UserPreferences {
+  const current = readPreferencesForUser(userId);
+  const next: UserPreferences = { ...current };
+  const updatedKeys: string[] = [];
+  for (const [k, v] of Object.entries(partial)) {
+    if (v === undefined || k === '_field_updated_at') continue;
+    next[k] = v;
+    updatedKeys.push(k);
+  }
+  if (updatedKeys.length > 0) {
+    const prevClocks = (current._field_updated_at && typeof current._field_updated_at === 'object')
+      ? current._field_updated_at
+      : {};
+    const clocks: Record<string, number> = { ...prevClocks };
+    const maxExisting = Math.max(0, ...Object.values(clocks).map((v) => Number(v) || 0));
+    let ts = Math.max(Date.now(), maxExisting + 1);
+    for (const key of updatedKeys) {
+      clocks[key] = ts;
+      ts += 1;
+    }
+    next._field_updated_at = clocks;
+  }
+  writeJsonSync(userPreferencesFile(userId), next);
+  return next;
+}
+
+export function getTodoGrouping(userId: string): 'project' | 'status' {
+  return readPreferencesForUser(userId).todo_grouping === 'status' ? 'status' : 'project';
+}
+
+export function setTodoGrouping(userId: string, grouping: unknown): 'project' | 'status' {
+  if (grouping !== 'project' && grouping !== 'status') throw new Error('invalid todo grouping');
+  if (getTodoGrouping(userId) !== grouping) writePreferences({ todo_grouping: grouping }, userId);
+  return grouping;
+}
+
+// ── Back-compat aliases for older callers ────────────────────────────────
+// New code should use read/writePreferences directly. These aliases
+// remain for call sites that haven't been migrated yet.
+export const readConfig = readPreferences;
+export const writeConfig = writePreferences;
+export type AppConfig = UserPreferences;
+
+// ── Language ─────────────────────────────────────────────────────────────
+
+export function getLanguage(): Lang {
+  return getLanguageForUser(getActiveUserId());
+}
+
+/** Read one user's language without changing process-wide i18n state. */
+export function resolveLanguageForUser(uid: string): Lang {
+  const v = readPreferencesForUser(uid).language;
+  return isLang(v) ? v : systemLanguage();
+}
+
+/** Resolve one user's language and make it the active process language. */
+export function getLanguageForUser(uid: string): Lang {
+  const lang = resolveLanguageForUser(uid);
+  setCurrentLang(lang);
+  return lang;
+}
+
+export function setLanguage(lang: Lang): Lang {
+  if (!isLang(lang)) throw new Error(`unsupported language: ${String(lang)}`);
+  writePreferences({ language: lang });
+  setCurrentLang(lang);
+  return lang;
+}
+
+export function refreshCurrentLanguageFromPreferences(): Lang {
+  const lang = getLanguage();
+  setCurrentLang(lang);
+  return lang;
+}
+
+/**
+ * Boot-time language resolution:
+ *   - If preferences.json has a valid `language` → use it, sync to i18n.
+ *   - Otherwise detect from the given system-locale string, persist, and
+ *     sync to i18n.
+ *
+ * Takes `systemLocale` explicitly so tests can exercise the branches without
+ * pulling in Electron's `app`. Production caller is `initLanguageFromApp`.
+ */
+export function initLanguage(systemLocale: string | string[]): Lang {
+  const pref = readPreferences();
+  if (isLang(pref.language)) {
+    setCurrentLang(pref.language);
+    return pref.language;
+  }
+  const lang = detectSystemLang(systemLocale);
+  writePreferences({ language: lang });
+  setCurrentLang(lang);
+  return lang;
+}
+
+// ── Commander avatar ─────────────────────────────────────────────────────
+
+function commanderDefaultIcon(): string {
+  return getCatalog().commander_default.icon;
+}
+
+export function getCommanderAvatar(): CommanderAvatar | null {
+  const v = readPreferences().commander_avatar;
+  if (!v || typeof v !== 'object') return null;
+  const color = (v as CommanderAvatar).color;
+  if (!isKnownColor(color)) return null;
+  // Commander has a fixed visual identity in the renderer. Normalize older
+  // preferences that allowed another catalog icon while retaining the user's
+  // chosen color.
+  return { icon: commanderDefaultIcon(), color };
+}
+
+export function setCommanderAvatar(avatar: CommanderAvatar): CommanderAvatar {
+  const icon = avatar?.icon;
+  if (!isKnownIcon(icon)
+      || icon !== commanderDefaultIcon()
+      || !isKnownColor(avatar?.color)) {
+    throw new Error('invalid avatar tokens');
+  }
+  const next: CommanderAvatar = { icon, color: avatar.color };
+  writePreferences({ commander_avatar: next });
+  return next;
+}
+
+// ── Metacognition (self-evolution) toggle ────────────────────────────────
+// Defaults to ON: never-written = undefined → treated as true, matching
+// historical behavior. Only an explicit false disables it. Reads go
+// through features/metacognition.isFeatureEnabled, which additionally
+// layers the env `ORKAS_METACOGNITION='0'` kill switch on top.
+
+export function getMetacognitionEnabled(): boolean {
+  return getMetacognitionEnabledForUser(getActiveUserId());
+}
+
+/** Resolve the metacognition preference for a specific account.
+ *
+ * Background work must not use the active-user wrapper: an account switch
+ * can happen while an asynchronous reflection cycle is still unwinding. */
+export function getMetacognitionEnabledForUser(userId: string): boolean {
+  const v = readPreferencesForUser(userId).metacognition_enabled;
+  return v !== false;
+}
+
+export function setMetacognitionEnabled(enabled: boolean): boolean {
+  writePreferences({ metacognition_enabled: !!enabled });
+  return !!enabled;
+}
+
+export function getGlobalSkillRootsEnabled(): boolean {
+  return getGlobalSkillRootsEnabledForUser(getActiveUserId());
+}
+
+/** User-scoped form for background/model turns that must not consult a
+ * process-global active-user singleton after an account context changes. */
+export function getGlobalSkillRootsEnabledForUser(userId: string): boolean {
+  return readPreferencesForUser(userId).global_skill_roots_enabled !== false;
+}
+
+export function setGlobalSkillRootsEnabled(enabled: boolean): boolean {
+  writePreferences({ global_skill_roots_enabled: !!enabled });
+  return !!enabled;
+}
+
+
+// ── Native task notifications ───────────────────────────────────────────
+// Defaults to ON. Notification permission/support remain OS-owned; this is
+// the user's Orkas-level preference and gates the single notification outlet.
+
+export function getTaskNotificationsEnabled(): boolean {
+  return readPreferences().task_notifications_enabled !== false;
+}
+
+export function setTaskNotificationsEnabled(enabled: boolean): boolean {
+  writePreferences({ task_notifications_enabled: !!enabled });
+  return !!enabled;
+}
+
+/** Production wrapper: reads the system locale from Electron's `app`. */
+export function initLanguageFromApp(): Lang {
+  return initLanguage(systemLocales());
+}
+
+/** Re-export for callers that need it without pulling i18n directly. */
+export { SUPPORTED_LANGS, type Lang };
