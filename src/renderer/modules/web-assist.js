@@ -230,6 +230,7 @@
           <input class="web-assist-address-input" type="text" inputmode="search" autocomplete="off"
                  spellcheck="false">
         </form>
+        <button type="button" class="web-assist-arena-btn" data-act="arena">Arena</button>
         <button type="button" class="web-assist-icon-btn" data-act="permissions">${icon('settings')}</button>
         <button type="button" class="web-assist-icon-btn web-assist-external-btn" data-act="external">${icon('external')}</button>
       </div>
@@ -337,6 +338,10 @@
     forwardBtn.addEventListener('click', () => navigate('forward'));
     reloadBtn.addEventListener('click', () => navigate('reload'));
     externalBtn.addEventListener('click', openExternal);
+    // User-initiated navigation only; no login, page read or submission here.
+    shell.querySelector('[data-act="arena"]').addEventListener('click', () => {
+      void openForModel({ url: 'https://arena.ai/agent', label: 'Arena' });
+    });
     shell.querySelector('[data-act="permissions"]').addEventListener('click', async () => {
       const tab = selectedTab(); if (!tab) return;
       try { await window.orkas.invoke('webAssist.resetPermissions', { tabId: tab.tab_id }); }
@@ -406,6 +411,7 @@
     setButtonCopy(forwardBtn, 'web_assist.forward', 'Forward');
     setButtonCopy(reloadBtn, 'web_assist.reload', 'Reload');
     setButtonCopy(externalBtn, 'web_assist.open_external', 'Open in default browser');
+    setButtonCopy(shell.querySelector('[data-act="arena"]'), 'web_assist.open_arena', 'Open Arena in this browser');
     shell.querySelector('[data-act="handback"]').textContent = label('web_assist.handback', 'Let AI continue');
     setButtonCopy(shell.querySelector('[data-act="permissions"]'), 'web_assist.permissions', 'Reset site permissions');
     setButtonCopy(shell.querySelector('[data-act="add"]'), 'web_assist.add_tab', 'New tab');

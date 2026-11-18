@@ -3388,6 +3388,19 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   gap: 1px;
   flex: 0 0 auto;
 }
+.web-assist-arena-btn {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.web-assist-arena-btn:hover { border-color: var(--primary); }
 .web-assist-address-form {
   flex: 1 1 auto;
   min-width: 0;
