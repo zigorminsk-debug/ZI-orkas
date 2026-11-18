@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "ZI-Orkas — передать страницу",
+  "version": "0.1.0",
+  "description": "По запросу копирует текст активной страницы для вставки в чат Командира.",
+  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "action": { "default_title": "Передать страницу в ZI-Orkas", "default_popup": "popup.html" }
+}
