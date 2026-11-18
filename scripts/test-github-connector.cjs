@@ -48,6 +48,9 @@ test('PAT authorization, encrypted runtime, action lanes, API routes and failure
     await assert.rejects(mcp.callTool('execute_high_impact', { action: 'repos.create', parameters: { name: 'app' } }, env));
     await assert.rejects(mcp.callTool('execute_read', { action: 'files.get', parameters: { owner: 'octo', repo: 'app', path: '../secret' } }, env));
     await assert.rejects(mcp.callTool('execute_high_impact', { action: 'workflows.dispatch', parameters: { owner: 'octo', repo: 'app', workflow: 'build.yml', ref: 'main', inputs: { foo: 1 } } }, env));
+    const repos = await mcp.callTool('execute_read', { action: 'repos.list', parameters: {} }, env);
+    assert.equal(repos.result.value, '[redacted]');
+    assert.equal(calls.at(-1).url, 'https://api.github.com/user/repos?per_page=100&page=1&sort=updated');
     const read = await mcp.callTool('execute_read', { action: 'runs.get', parameters: { owner: 'octo', repo: 'app', run_id: 12 } }, env);
     assert.equal(read.result.value, '[redacted]');
     status = 401;
