@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "d977be9210677b2c10c8bcb47485f8dcfac982286b8ec25f55db0d9a02a4a2b8",
+  "content_tree_sha256": "b2309a4c084f08841ad8720c3edc1862b1d484100782d83f7abbba116312b022",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -118,6 +118,11 @@
       "sha256": "5542be39cd4b8451f07e2995eb0e03c8315d8516a79cbfc5b23486604e30971b"
     },
     {
+      "path": "marketplace/agents/0c02a1fa4202/agent.json",
+      "bytes": 2426,
+      "sha256": "1d6da8531d4108e70d8ad092d86d289990ecd05023d3e0001b6fa4ca73830a65"
+    },
+    {
       "path": "marketplace/agents/1040b336306f/agent.json",
       "bytes": 5184,
       "sha256": "e8a9a677acd8de2b23917ba123df2b778e36deae4a5a8420824eac02b441a756"
@@ -186,6 +191,11 @@
       "path": "marketplace/agents/173d4235a431/agent.json",
       "bytes": 4887,
       "sha256": "0bd6e956d318219b5a42ee7caabd4db9ab98dd14adeae45bc1ac55b7174e7ff2"
+    },
+    {
+      "path": "marketplace/agents/234c150750a6/agent.json",
+      "bytes": 2543,
+      "sha256": "28b8afb8a8f714abc34521691f2f7f25f2e4faf3f598a01d35fcdeb849053817"
     },
     {
       "path": "marketplace/agents/5a1d43c2f28a/agent.json",
@@ -261,6 +271,11 @@
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/SKILL.md",
       "bytes": 3178,
       "sha256": "02d0f8c39e6f508da10f370d15a17f36018b27d296ffdf7e04b62625905b9d9a"
+    },
+    {
+      "path": "marketplace/agents/6d85cedeaeee/agent.json",
+      "bytes": 2603,
+      "sha256": "684969206be9e02bd499e638e264fef6e5292184bf49ba530e5d09ef1f4aae42"
     },
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -593,6 +608,11 @@
       "sha256": "3d53a3bd94894c23930f36ac6c1786d4df281b3c55bdb0d3299aee4e34bb8e23"
     },
     {
+      "path": "marketplace/agents/80e8dec98bb8/agent.json",
+      "bytes": 2630,
+      "sha256": "89e01559e1c12ee84f8b0013ab87018d921153ec88608a34006f865e01685367"
+    },
+    {
       "path": "marketplace/agents/814b61b027f0/agent.json",
       "bytes": 4994,
       "sha256": "0f528d5dbb4f2e0e19dd6c511c6ad98b5dc48b95992413a60d5bccdfe23d1df8"
@@ -681,6 +701,16 @@
       "path": "marketplace/agents/814b61b027f0/skills/image-router/SKILL.md",
       "bytes": 11324,
       "sha256": "3bb0c7d5a8785f838b49661f7417bea4ec4df5666626c83b94be94a2121f6964"
+    },
+    {
+      "path": "marketplace/agents/81a182c9ce3c/agent.json",
+      "bytes": 2375,
+      "sha256": "0fad03ae768ca14374cafeba87555fa7724a1987d6bedf28b5f04137755cf087"
+    },
+    {
+      "path": "marketplace/agents/94de7fa43b66/agent.json",
+      "bytes": 2388,
+      "sha256": "580c6c74bb81b52d174bca72bdfddbe3cfa29826229ee98063918d2965f1a026"
     },
     {
       "path": "marketplace/agents/a19101ba698a/_meta.json",
@@ -2137,6 +2167,16 @@
     ],
     "marketplace_agents": [
       {
+        "id": "0c02a1fa4202",
+        "name": "GitHubAgent",
+        "version": "1.0.0",
+        "icon": "git-pull-request",
+        "color": "periwinkle",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
         "id": "1040b336306f",
         "name": "StockAnalyser",
         "version": "1.1.13",
@@ -2175,6 +2215,16 @@
         "embedded_skills": []
       },
       {
+        "id": "234c150750a6",
+        "name": "SecurityAgent",
+        "version": "1.0.0",
+        "icon": "activity",
+        "color": "rose",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
         "id": "5a1d43c2f28a",
         "name": "ECommerceResearcher",
         "version": "1.1.4",
@@ -2202,6 +2252,16 @@
         "embedded_skills": [
           "voice-project"
         ]
+      },
+      {
+        "id": "6d85cedeaeee",
+        "name": "Coder",
+        "version": "1.0.0",
+        "icon": "code",
+        "color": "sage",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
       },
       {
         "id": "78900d8758bc",
@@ -2264,6 +2324,16 @@
         ]
       },
       {
+        "id": "80e8dec98bb8",
+        "name": "Researcher",
+        "version": "1.0.0",
+        "icon": "search",
+        "color": "sky",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
         "id": "814b61b027f0",
         "name": "ImageStudio",
         "version": "1.3.71",
@@ -2286,6 +2356,26 @@
           "image-generate",
           "image-router"
         ]
+      },
+      {
+        "id": "81a182c9ce3c",
+        "name": "DocsAgent",
+        "version": "1.0.0",
+        "icon": "document",
+        "color": "butter",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "94de7fa43b66",
+        "name": "Tester",
+        "version": "1.0.0",
+        "icon": "clipboard",
+        "color": "sunshine",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
       },
       {
         "id": "a19101ba698a",
