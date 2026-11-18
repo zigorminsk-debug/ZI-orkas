@@ -1131,6 +1131,7 @@ async function* callNodeStream(
   opts: {
     signal?: AbortSignal;
     firstByteTimeoutMs: number;
+    idleTimeoutMs?: number;
     promptBridgeActive: boolean;
     allowedToolNames: Set<string>;
     omittedImages: number;
@@ -1150,14 +1151,13 @@ async function* callNodeStream(
     if (progressTimer) clearTimeout(progressTimer);
     progressTimer = null;
   };
-  const armProgressTimer = () => {
+  const armProgressTimer = (timeoutMs: number) => {
     clearProgressTimer();
     progressTimer = setTimeout(
-      () => ctrl.abort(new Error(`Timeout waiting for ${node.id}`)),
-      opts.firstByteTimeoutMs,
+      () => ctrl.abort(new Error(`Timeout waiting for ${node.id}`)), timeoutMs,
     );
   };
-  armProgressTimer();
+  armProgressTimer(opts.firstByteTimeoutMs);
 
   try {
     // Strictly NO Authorization header for keyless/local autonomous calls.
@@ -1346,7 +1346,7 @@ async function* callNodeStream(
           if (fullText.length > previousTextLength || evs.some(ev =>
             ev.type === 'thinking_delta' || ev.type === 'text_delta'
             || ev.type === 'tool_use_start' || ev.type === 'tool_use_delta')) {
-            armProgressTimer();
+            armProgressTimer(opts.idleTimeoutMs ?? opts.firstByteTimeoutMs);
           }
           for (const ev of evs) yield ev;
         }
@@ -1631,14 +1631,14 @@ function buildOfflineGuidanceMessage(localOnly: boolean): string {
   }
   return isRu
     ? [
-        '**Автономное ядро Командира не смогло достучаться до сети, а локальная модель на ПК не запущена.**',
+        '**ZI-Commander не получил ответ от доступных моделей.**',
         '',
-        'Проверьте подключение к интернету и повторите запрос — никаких API-ключей или токенов вводить не нужно. Для полностью офлайн-работы запустите **Ollama** (`ollama run qwen3:8b`) или **LM Studio** — Командир подключится к ним автоматически.',
+        'Проверьте подключение к интернету и повторите запрос. Если ошибка сохраняется, выберите другой настроенный провайдер модели или запустите локальную модель в **Ollama** / **LM Studio**. Сервисам могут требоваться ключи или действовать ограничения доступа.',
       ].join('\n')
     : [
-        '**Autonomous Commander could not reach the network and no local model is running on this computer.**',
+        '**ZI-Commander did not receive a response from available models.**',
         '',
-        'Check your internet connection and retry — no API keys or tokens are needed. For 100% offline operation, start **Ollama** (`ollama run qwen3:8b`) or **LM Studio** and Commander will connect automatically.',
+        'Check your connection and retry. If this persists, select another configured model provider or start a local model in **Ollama** / **LM Studio**. Services may require keys or restrict access.',
       ].join('\n');
 }
 
@@ -1687,6 +1687,10 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
     }
 
     const maxAttempts = Math.min(candidates.length, 10);
+    // In Auto mode, do not spend minutes silently trying unreachable remote nodes.
+    // Local models keep their longer cold-start allowance. Once a model starts
+    // producing content, only the separate stream-idle watchdog applies.
+    let remoteDeadline = 0;
     let lastError: Error | null = null;
 
     for (let idx = 0; idx < maxAttempts; idx += 1) {
@@ -1694,6 +1698,10 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
         throw params.signal.reason || new Error('Aborted');
       }
       const node = candidates[idx];
+      if (!node.isLocal && spec.mode === 'auto') {
+        if (!remoteDeadline) remoteDeadline = Date.now() + 60_000;
+        if (Date.now() >= remoteDeadline) break;
+      }
       const h = getHealth(node.id);
       const useNativeTools = needTools && node.nativeTools && !h.toolsRejected;
       const useVision = needVision && node.supportsVision && !h.visionRejected;
@@ -1712,10 +1720,14 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
           stream: streamFlag,
           compactContext,
         });
-        const timeoutMs = node.isLocal ? 120_000 : 28_000;
+        const remainingMs = remoteDeadline && !node.isLocal ? remoteDeadline - Date.now() : Infinity;
+        if (remainingMs <= 0) throw new Error('Timeout waiting for an available model');
+        const firstByteTimeoutMs = node.isLocal ? 120_000
+          : spec.mode === 'auto' ? Math.max(1, Math.min(15_000, remainingMs)) : 28_000;
         for await (const ev of callNodeStream(node, built.payload, {
           signal: params.signal,
-          firstByteTimeoutMs: timeoutMs,
+          firstByteTimeoutMs,
+          idleTimeoutMs: node.isLocal ? 120_000 : 60_000,
           promptBridgeActive: built.promptBridgeActive,
           allowedToolNames,
           omittedImages: built.omittedImages,

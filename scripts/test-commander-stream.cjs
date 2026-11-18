@@ -16,7 +16,7 @@ Module._load = function (name, ...args) {
   if (name === 'electron') return { app: { isPackaged: false, getPath: () => root, getVersion: () => '', on: () => {} }, shell: {}, BrowserWindow: {} };
   return originalLoad.call(this, name, ...args);
 };
-const { callZiCommanderNodeStreamForTest } = require('../src/main/model/autonomous-commander.ts');
+const { callZiCommanderNodeStreamForTest, createZiCommanderProvider } = require('../src/main/model/autonomous-commander.ts');
 Module._load = originalLoad;
 
 const nodeFor = url => ({ id: 'test', model: 'test', chatUrl: url });
@@ -83,6 +83,61 @@ test('real output extends the idle deadline and completes normally', async () =>
     assert.equal(events.filter(e => e.type === 'text_delta').map(e => e.text).join(''), 'onetwothree');
     assert.equal(events.at(-1).type, 'message_end');
   } finally { await close(server); }
+});
+
+test('stream output uses the longer idle timeout once response starts', async () => {
+  const { server, url } = await serverFor((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'hello' } }] })}\n\n`);
+    const timer = setTimeout(() => res.end('data: [DONE]\n\n'), 260);
+    res.on('close', () => clearTimeout(timer));
+  });
+  try {
+    const events = await collect(url, { firstByteTimeoutMs: 180, idleTimeoutMs: 500 });
+    assert.equal(events.at(-1).type, 'message_end');
+  } finally { await close(server); }
+});
+
+test('Auto bounds remote retries and gives an honest failure when none work', async () => {
+  const oldFetch = global.fetch, oldNow = Date.now;
+  let clock = 10_000_000, remoteAttempts = 0;
+  Date.now = () => clock;
+  global.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes('/models') || value.includes('supercapybara.com')) throw new Error('unavailable');
+    remoteAttempts++;
+    clock += 20_000;
+    throw new Error('unavailable');
+  };
+  try {
+    const provider = createZiCommanderProvider({ modelId: 'zi-commander-auto' });
+    const events = [];
+    for await (const event of provider.stream({ messages: [], tools: [] })) events.push(event);
+    assert.equal(remoteAttempts, 3);
+    assert.equal(events.at(-1).type, 'message_end');
+    assert.match(events.find(e => e.type === 'text_delta').text, /ZI-Commander/);
+  } finally { global.fetch = oldFetch; Date.now = oldNow; }
+});
+
+test('Auto can still fall back to a later responsive model within its budget', async () => {
+  const oldFetch = global.fetch, oldNow = Date.now;
+  let clock = 20_000_000, remoteAttempts = 0;
+  Date.now = () => clock;
+  global.fetch = async url => {
+    const value = String(url);
+    if (value.includes('/models') || value.includes('supercapybara.com')) throw new Error('unavailable');
+    remoteAttempts++;
+    clock += 10_000;
+    if (remoteAttempts < 3) throw new Error('unavailable');
+    return Response.json({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] });
+  };
+  try {
+    const provider = createZiCommanderProvider({ modelId: 'zi-commander-auto' });
+    const events = [];
+    for await (const event of provider.stream({ messages: [], tools: [] })) events.push(event);
+    assert.equal(remoteAttempts, 3);
+    assert.equal(events.find(e => e.type === 'text_delta').text, 'ok');
+  } finally { global.fetch = oldFetch; Date.now = oldNow; }
 });
 
 test('caller cancellation interrupts a stalled body', async () => {
