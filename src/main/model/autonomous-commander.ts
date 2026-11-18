@@ -1142,16 +1142,22 @@ async function* callNodeStream(
     if (opts.signal.aborted) throw opts.signal.reason || new Error('Aborted');
     opts.signal.addEventListener('abort', onAbort, { once: true });
   }
-  let headerTimer: ReturnType<typeof setTimeout> | null = setTimeout(
-    () => ctrl.abort(new Error(`Timeout waiting for ${node.id}`)),
-    opts.firstByteTimeoutMs,
-  );
-  const clearHeaderTimer = () => {
-    if (headerTimer) {
-      clearTimeout(headerTimer);
-      headerTimer = null;
-    }
+  // Fetch resolves as soon as headers arrive, not when the model starts replying.
+  // Keep the watchdog armed through the response body and re-arm it only for
+  // meaningful model output. SSE keep-alives alone must not mask a stalled turn.
+  let progressTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearProgressTimer = () => {
+    if (progressTimer) clearTimeout(progressTimer);
+    progressTimer = null;
   };
+  const armProgressTimer = () => {
+    clearProgressTimer();
+    progressTimer = setTimeout(
+      () => ctrl.abort(new Error(`Timeout waiting for ${node.id}`)),
+      opts.firstByteTimeoutMs,
+    );
+  };
+  armProgressTimer();
 
   try {
     // Strictly NO Authorization header for keyless/local autonomous calls.
@@ -1164,7 +1170,6 @@ async function* callNodeStream(
       body: JSON.stringify(payload),
       signal: ctrl.signal,
     });
-    clearHeaderTimer();
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
@@ -1336,7 +1341,13 @@ async function* callNodeStream(
         const line = buffer.slice(0, nl).replace(/\r$/, '');
         buffer = buffer.slice(nl + 1);
         if (line.startsWith('data:')) {
+          const previousTextLength = fullText.length;
           const evs = processSseData(line.slice(5));
+          if (fullText.length > previousTextLength || evs.some(ev =>
+            ev.type === 'thinking_delta' || ev.type === 'text_delta'
+            || ev.type === 'tool_use_start' || ev.type === 'tool_use_delta')) {
+            armProgressTimer();
+          }
           for (const ev of evs) yield ev;
         }
       }
@@ -1438,10 +1449,14 @@ async function* callNodeStream(
       ...(fullThinking ? { reasoningBoundary: { structured: true, literalLeadingText: false } } : {}),
     };
   } finally {
-    clearHeaderTimer();
+    clearProgressTimer();
     if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
+    if (!ctrl.signal.aborted) ctrl.abort();
   }
 }
+
+// Exposed for transport-level regression tests without making live model requests.
+export { callNodeStream as callZiCommanderNodeStreamForTest };
 
 function parseNonStreamingResponse(
   rawText: string,
