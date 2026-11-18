@@ -151,17 +151,26 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     description_it: "Trova e gestisci repository, segnalazioni, richieste di pull, file e codice.",
     description_ja: "リポジトリ、Issue、PR、ファイル、コードを検索・管理します。",
     description_pt: "Encontre e gerencie repositórios, issues, PRs, arquivos e código.",
-    auth_mode: 'server_bridge',
-    oauth: { provider_id: 'github' },
-    // Remote MCP via GitHub's hosted Streamable HTTP endpoint. We pass the user-to-server OAuth
-    // token (ghu_*) as `Authorization: Bearer <token>` — `apply-template.ts::applyTemplate`
-    // builds that header from `grant.token_type + grant.access_token`. Zero local install /
-    // no MCP-server subprocess.
-    transport_template: {
-      kind: 'streamable-http',
-      url: 'https://api.githubcopilot.com/mcp/',
-      oauth_header_key: 'Authorization',
+    auth_mode: 'local_api', local_api: { provider: 'github' },
+    setup_guide_id: 'github',
+    connection_setup: {
+      instructions_zh: '使用 GitHub Personal Access Token。令牌仅加密保存在此设备上。',
+      instructions_en: 'Create a GitHub personal access token with only the repository permissions you need. It is encrypted on this device. Actions dispatch requires Actions write permission and a workflow with workflow_dispatch.',
+      instructions_ru: 'Создайте персональный токен GitHub с необходимым доступом к репозиториям. Токен хранится зашифрованным на этом устройстве. Для запуска Actions нужны права Actions: write и workflow с workflow_dispatch.',
+      guide_url: 'https://github.com/settings/tokens',
+      guide_label_zh: '创建 GitHub 令牌', guide_label_en: 'Create a GitHub token', guide_label_ru: 'Создать токен GitHub',
+      fields: [{ key: 'access_token', input: 'secret', storage: 'credential', required: true, format: 'secret',
+        label_zh: 'GitHub Personal Access Token', label_en: 'GitHub Personal Access Token', label_ru: 'Персональный токен GitHub' }],
     },
+    allowed_tools: ['list_capabilities', 'describe_action', 'execute_read', 'execute_write', 'execute_high_impact'],
+    tool_policies: {
+      list_capabilities: { risk: 'R', confirmation: 'none', max_batch_size: 100 },
+      describe_action: { risk: 'R', confirmation: 'none', max_batch_size: 1 },
+      execute_read: { risk: 'R', confirmation: 'none', max_batch_size: 100 },
+      execute_write: { risk: 'W', confirmation: 'preview', max_batch_size: 25 },
+      execute_high_impact: { risk: 'H', confirmation: 'fresh', max_batch_size: 10, sensitive_operation: 'external_or_financial_change' },
+    },
+    transport_template: { kind: 'stdio', command: '${ORKAS_NODE}', args: ['${ORKAS_PC_DIR}/bin/direct-commerce-mcp-server.cjs'] },
   },
   {
     id: 'notion',

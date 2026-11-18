@@ -28,6 +28,7 @@
   "connectors.custom.argument_count": "{n} arguments",
   "connectors.install_confirm.http_summary": "HTTP MCP server: {target}",
   "connectors.install_confirm.stdio_summary": "Local command: {target}",
+  "connectors.github.authorization_failed": "Could not connect to GitHub. Check the personal access token, its expiration and access, and your network connection, then try again.",
   "connectors.seller.authorization_failed": "Could not authorize the shop. Check that the app is approved, its credentials match the environment, the required API permissions are enabled, and the callback matches the setup instructions. Then connect again.",
   "connectors.seller.shop_mismatch": "The authorized shop does not match your configuration. Check the shop ID or code and market, then authorize the intended shop. For Shopee, use the shop account rather than main-account bulk authorization.",
   "connectors.seller.request_failed": "The platform request did not complete. Check your network and the platform service status, then connect again.",
