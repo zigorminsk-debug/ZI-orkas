@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "b2309a4c084f08841ad8720c3edc1862b1d484100782d83f7abbba116312b022",
+  "content_tree_sha256": "1a77d6feda039c8b67c0f42f49f831f058897818cd94627f1d2e12d136b728e9",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -826,6 +826,36 @@
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-taste/SKILL.md",
       "bytes": 6373,
       "sha256": "a7ffd132f77f813d6dca22a9a6e7d910aaf4fca5350c4472f0923f20610da975"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a001/agent.json",
+      "bytes": 2013,
+      "sha256": "02c9cebc15824234a9fbea12e7f0de4e8436361009c2f5e16ad14d3a592e282a"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a002/agent.json",
+      "bytes": 2221,
+      "sha256": "55dc62eab7686d61629615a88e2d630e16a13d65967a08aaa26ab75b8c3a3bce"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a003/agent.json",
+      "bytes": 1993,
+      "sha256": "38d38b442ed6844a631cd547d4e18db33cf7a9b0175184bd387bbd802f709b25"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a004/agent.json",
+      "bytes": 2191,
+      "sha256": "dd149b81327a09ce844aedee9261a9150dd5760325d08a4583fdb0fdb8b4d241"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a005/agent.json",
+      "bytes": 2317,
+      "sha256": "ecc08e80b22bed4c5064777f5575862bdddd0c27606fe0058bb1712bd9fc5f4c"
+    },
+    {
+      "path": "marketplace/agents/d5ad71d7a006/agent.json",
+      "bytes": 2709,
+      "sha256": "69639cdb900e2b025fe052010d624b6d8b858038809c58d8dff9836aae030de2"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/agent.json",
@@ -2473,6 +2503,66 @@
           "ui-reference-packs",
           "ui-taste"
         ]
+      },
+      {
+        "id": "d5ad71d7a001",
+        "name": "AndroidDeveloper",
+        "version": "1.0.0",
+        "icon": "code",
+        "color": "sage",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "d5ad71d7a002",
+        "name": "BuildAgent",
+        "version": "1.0.0",
+        "icon": "git-pull-request",
+        "color": "periwinkle",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "d5ad71d7a003",
+        "name": "DiagnosticsAgent",
+        "version": "1.0.0",
+        "icon": "activity",
+        "color": "rose",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "d5ad71d7a004",
+        "name": "WindowsDeveloper",
+        "version": "1.0.0",
+        "icon": "code",
+        "color": "sage",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "d5ad71d7a005",
+        "name": "ArenaHandoff",
+        "version": "1.0.0",
+        "icon": "clipboard",
+        "color": "sunshine",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
+      },
+      {
+        "id": "d5ad71d7a006",
+        "name": "BrowserAssistant",
+        "version": "1.0.0",
+        "icon": "search",
+        "color": "sky",
+        "updated_at": "2026-11-18T00:00:00.000Z",
+        "skill_list": [],
+        "embedded_skills": []
       },
       {
         "id": "e064dca9e1bd",

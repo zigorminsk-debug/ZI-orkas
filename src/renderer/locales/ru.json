@@ -186,6 +186,7 @@
   "web_assist.back": "Назад",
   "web_assist.forward": "Вперёд",
   "web_assist.reload": "Перезагрузить",
+  "web_assist.open_arena": "Открыть Arena во встроенном браузере",
   "web_assist.open_external": "Открыть в браузере по умолчанию",
   "web_assist.close": "Закрыть Web Assist",
   "web_assist.loading": "Загрузка…",

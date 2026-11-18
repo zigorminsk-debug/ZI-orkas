@@ -16,7 +16,7 @@ Module._load = function (name, ...args) {
   if (name === 'electron') return { app: { isPackaged: false, getPath: () => root, getVersion: () => '', on: () => {} }, shell: {}, BrowserWindow: {} };
   return originalLoad.call(this, name, ...args);
 };
-const { callZiCommanderNodeStreamForTest, createZiCommanderProvider } = require('../src/main/model/autonomous-commander.ts');
+const { callZiCommanderNodeStreamForTest, createZiCommanderProvider, interleaveZiCommanderCandidatesForTest, getZiCommanderHealthForTest } = require('../src/main/model/autonomous-commander.ts');
 Module._load = originalLoad;
 
 const nodeFor = url => ({ id: 'test', model: 'test', chatUrl: url });
@@ -137,6 +137,35 @@ test('Auto can still fall back to a later responsive model within its budget', a
     for await (const event of provider.stream({ messages: [], tools: [] })) events.push(event);
     assert.equal(remoteAttempts, 3);
     assert.equal(events.find(e => e.type === 'text_delta').text, 'ok');
+  } finally { global.fetch = oldFetch; Date.now = oldNow; }
+});
+
+test('network interleaving does not skip healthy or capable nodes for cooled alternatives', () => {
+  const entry = (id, network, score, inCooldown = false, isLocal = false) => ({ node: { id, network, isLocal }, score, inCooldown });
+  const items = [entry('first', 'one', 1), entry('healthy', 'one', 2), entry('cooldown', 'two', 3, true)];
+  assert.deepEqual(interleaveZiCommanderCandidatesForTest(items).map(e => e.node.id), ['first', 'healthy', 'cooldown']);
+  assert.deepEqual(interleaveZiCommanderCandidatesForTest([entry('first','one',1), entry('capable','one',2), entry('no-tools','two',90)]).map(e => e.node.id), ['first','capable','no-tools']);
+  assert.deepEqual(interleaveZiCommanderCandidatesForTest([entry('first','one',1), entry('same','one',2), entry('different','two',3)]).map(e => e.node.id), ['first','different','same']);
+  assert.deepEqual(interleaveZiCommanderCandidatesForTest([entry('first','one',1), entry('local','local',2,false,true), entry('different','two',3)]).map(e => e.node.id), ['first','local','different']);
+});
+
+test('node health uses time to first output rather than full streamed answer time', async () => {
+  const oldFetch = global.fetch, oldNow = Date.now;
+  let clock = 30_000_000;
+  Date.now = () => clock;
+  global.fetch = async url => {
+    if (String(url).includes('/models') || String(url).includes('supercapybara.com')) throw new Error('unavailable');
+    clock += 200;
+    return new Response('data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  };
+  try {
+    const provider = createZiCommanderProvider({ modelId: 'zi-commander-auto' });
+    for await (const ev of provider.stream({ messages: [], tools: [] })) {
+      if (ev.type === 'text_delta') clock += 45_000;
+    }
+    const recorded = getZiCommanderHealthForTest().find(h => h.lastOkAt === clock);
+    assert.ok(recorded);
+    assert.equal(recorded.lastLatencyMs, 200);
   } finally { global.fetch = oldFetch; Date.now = oldNow; }
 });
 

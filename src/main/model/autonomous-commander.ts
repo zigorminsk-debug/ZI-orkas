@@ -167,6 +167,11 @@ interface NodeHealth {
 
 const _nodeHealth = new Map<string, NodeHealth>();
 
+/** Snapshot for deterministic transport tests; not exposed to the renderer. */
+export function getZiCommanderHealthForTest(): Array<{ id: string; lastOkAt: number; lastLatencyMs: number }> {
+  return [..._nodeHealth.entries()].map(([id, h]) => ({ id, lastOkAt: h.lastOkAt, lastLatencyMs: h.lastLatencyMs }));
+}
+
 function getHealth(nodeId: string): NodeHealth {
   let h = _nodeHealth.get(nodeId);
   if (!h) {
@@ -758,32 +763,39 @@ function rankCandidates(
       score -= 18;
       score += Math.min(10, h.lastLatencyMs / 800);
     }
-    return { node, score };
+    return { node, score, inCooldown };
   });
 
   scored.sort((a, b) => a.score - b.score);
 
-  // Interleave networks slightly after the top verified winner so retries hit
-  // genuinely independent infrastructure instead of hammering one host.
-  const ordered: AutonomousNode[] = [];
-  const remaining = scored.map((s) => s.node);
+  return interleaveRankedCandidates(scored).map((entry) => entry.node);
+}
+
+/** Do not let network diversity defeat health, capabilities or local preference. */
+function interleaveRankedCandidates<T extends { node: { network: string; isLocal: boolean }; score: number; inCooldown: boolean }>(scored: T[]): T[] {
+  const ordered: T[] = [];
+  const remaining = [...scored];
   let lastNetwork = '';
   while (remaining.length > 0) {
     let pickIdx = 0;
-    if (ordered.length >= 1 && lastNetwork && !remaining[0].isLocal) {
-      const altIdx = remaining.findIndex((n, idx) => idx < 4 && n.network !== lastNetwork);
-      if (altIdx > 0) {
-        const h0 = getHealth(remaining[0].id);
-        const topIsFreshWinner = h0.lastOkAt > 0 && h0.cooldownUntil <= now && ordered.length === 0;
-        if (!topIsFreshWinner) pickIdx = altIdx;
-      }
+    const top = remaining[0];
+    if (ordered.length && lastNetwork && !top.node.isLocal && !top.inCooldown) {
+      const altIdx = remaining.findIndex((candidate, idx) => idx > 0 && idx < 4
+        && !candidate.inCooldown && !candidate.node.isLocal
+        && candidate.node.network !== lastNetwork
+        // Never skip a substantially better tool/vision candidate for diversity.
+        && candidate.score <= top.score + 12);
+      if (altIdx > 0) pickIdx = altIdx;
     }
     const [picked] = remaining.splice(pickIdx, 1);
     ordered.push(picked);
-    lastNetwork = picked.network;
+    lastNetwork = picked.node.network;
   }
   return ordered;
 }
+
+// Exposed for deterministic routing regression tests.
+export { interleaveRankedCandidates as interleaveZiCommanderCandidatesForTest };
 
 // ── Prompt-Based Tool-Call Bridge (for nodes without native `tools`) ──────
 
@@ -1708,6 +1720,9 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
       const useStream = node.supportsStreaming && !h.streamingRejected;
       const startedAt = Date.now();
       let committedOutput = false;
+      let firstOutputMs: number | undefined;
+      // Do not log endpoint URLs, local model paths, prompt text or responses.
+      const nodeRef = crypto.createHash('sha256').update(node.id).digest('hex').slice(0, 12);
 
       const tryOnce = async function* (
         overrideTools: boolean,
@@ -1738,10 +1753,17 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
             || ev.type === 'thinking_delta'
           ) {
             committedOutput = true;
+            if (firstOutputMs === undefined) firstOutputMs = Date.now() - startedAt;
           }
           if (ev.type === 'message_end') {
             committedOutput = true;
-            recordNodeSuccess(node.id, Date.now() - startedAt);
+            const durationMs = Date.now() - startedAt;
+            // Rank by responsiveness, not the total duration of a long answer.
+            recordNodeSuccess(node.id, firstOutputMs ?? durationMs);
+            log.info('autonomous commander node completed', {
+              nodeRef, local: node.isLocal, attempt: idx + 1,
+              firstOutputMs: firstOutputMs ?? durationMs, durationMs,
+            });
             lastServedBudget = {
               key: `${ZI_COMMANDER_PROVIDER}:${node.id}`,
               model: spec.id,
@@ -1763,7 +1785,13 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
       } catch (err) {
         if (params.signal?.aborted) throw err;
         // If we already emitted partial tokens to the user, don't corrupt the stream by mixing two models
-        if (committedOutput) throw err;
+        if (committedOutput) {
+          log.warn('autonomous commander stream interrupted after output', {
+            nodeRef, local: node.isLocal, attempt: idx + 1,
+            firstOutputMs, elapsedMs: Date.now() - startedAt,
+          });
+          throw err;
+        }
 
         const httpErr = err instanceof NodeHttpError ? err : null;
         const bodyLower = String(httpErr?.body || (err as Error)?.message || '').toLowerCase();
@@ -1791,7 +1819,8 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
         recordNodeFailure(node.id, httpErr?.status, httpErr?.body || (err as Error)?.message);
         lastError = err instanceof Error ? err : new Error(String(err));
         log.info('autonomous commander rotating node', {
-          failedNode: node.id,
+          nodeRef, local: node.isLocal,
+          elapsedMs: Date.now() - startedAt,
           status: httpErr?.status,
           attempt: idx + 1,
           maxAttempts,
@@ -1808,7 +1837,7 @@ export function createZiCommanderProvider(config: { modelId?: string } = {}): LL
     }
 
     // Never block the user with an API-key prompt; return actionable status
-    log.warn('all autonomous commander nodes exhausted', { error: lastError?.message });
+    log.warn('all autonomous commander nodes exhausted', { hadError: Boolean(lastError) });
     const fallbackText = buildOfflineGuidanceMessage(spec.mode === 'local');
     yield { type: 'message_start', usage: { inputTokens: 0, outputTokens: 32, totalTokens: 32 } };
     yield { type: 'text_delta', text: fallbackText };

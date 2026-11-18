@@ -186,6 +186,7 @@
   "web_assist.back": "Back",
   "web_assist.forward": "Forward",
   "web_assist.reload": "Reload",
+  "web_assist.open_arena": "Open Arena in the built-in browser",
   "web_assist.open_external": "Open in default browser",
   "web_assist.close": "Close Web Assist",
   "web_assist.loading": "Loading…",
