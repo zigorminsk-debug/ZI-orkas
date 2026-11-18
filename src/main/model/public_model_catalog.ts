@@ -131,6 +131,30 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },
     { id: 'doubao-seed-2-0-lite-260428', name: 'Doubao Seed 2.0 Lite' },
   ],
+  // Free-tier inference providers (OpenAI-compatible). Users supply their own
+  // free API key in Settings; ZI-Commander mesh remains the zero-key default.
+  groq: [
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'qwen/qwen3-32b', name: 'Qwen3 32B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'openai/gpt-oss-120b', name: 'GPT-OSS 120B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'openai/gpt-oss-20b', name: 'GPT-OSS 20B', contextWindow: 131072, maxTokens: 8192 },
+  ],
+  cerebras: [
+    { id: 'llama-3.3-70b', name: 'Llama 3.3 70B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'qwen-3-32b', name: 'Qwen3 32B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'gpt-oss-120b', name: 'GPT-OSS 120B', contextWindow: 131072, maxTokens: 8192 },
+  ],
+  huggingface: [
+    { id: 'meta-llama/Llama-3.3-70B-Instruct', name: 'Llama 3.3 70B Instruct', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'Qwen/Qwen3-32B', name: 'Qwen3 32B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'deepseek-ai/DeepSeek-R1', name: 'DeepSeek R1', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'openai/gpt-oss-120b', name: 'GPT-OSS 120B', contextWindow: 131072, maxTokens: 8192 },
+  ],
+  nvidia: [
+    { id: 'meta/llama-3.3-70b-instruct', name: 'Llama 3.3 70B Instruct', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'qwen/qwen3-235b-a22b', name: 'Qwen3 235B A22B', contextWindow: 131072, maxTokens: 8192 },
+    { id: 'deepseek-ai/deepseek-r1', name: 'DeepSeek R1', contextWindow: 131072, maxTokens: 8192 },
+  ],
   openrouter: [
     // OpenRouter exposes hundreds of models. Prefer recent generations but
     // retain capability-driven exceptions such as Gemini 3.1 Pro. Settings

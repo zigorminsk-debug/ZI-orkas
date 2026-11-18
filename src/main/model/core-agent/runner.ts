@@ -117,11 +117,16 @@ import {
   ZI_COMMANDER_PROVIDER,
   buildDeepSeekModel,
   buildDoubaoModel,
+  buildFreeProviderModel,
   buildConfiguredOpenAICompatibleModel,
   createConfiguredOpenAICompatibleProvider,
   createMoonshotProvider,
   createDeepSeekProvider,
   createDoubaoProvider,
+  createGroqProvider,
+  createCerebrasProvider,
+  createHuggingFaceProvider,
+  createNvidiaProvider,
   buildCustomOpenAICompatibleModel,
   buildCustomAnthropicModel,
   buildCustomResponsesModel,
@@ -187,6 +192,11 @@ function buildExternalProviderModel(
       return buildDeepSeekModel(modelId);
     case 'doubao':
       return buildDoubaoModel(modelId);
+    case 'groq':
+    case 'cerebras':
+    case 'huggingface':
+    case 'nvidia':
+      return buildFreeProviderModel(providerId, modelId);
     case 'custom':
       return customConfig
         ? (customConfig.protocol === 'anthropic'
@@ -1803,6 +1813,14 @@ async function buildExternalProvider(
       return await createDeepSeekProvider({ apiKey, modelId, userCacheKey });
     case 'doubao':
       return await createDoubaoProvider({ apiKey, modelId, userCacheKey });
+    case 'groq':
+      return await createGroqProvider({ apiKey, modelId, userCacheKey });
+    case 'cerebras':
+      return await createCerebrasProvider({ apiKey, modelId, userCacheKey });
+    case 'huggingface':
+      return await createHuggingFaceProvider({ apiKey, modelId, userCacheKey });
+    case 'nvidia':
+      return await createNvidiaProvider({ apiKey, modelId, userCacheKey });
     case 'custom':
       if (!choice.customConfig) throw new Error('custom model configuration is incomplete');
       return await createCustomOpenAICompatibleProvider({
