@@ -1893,6 +1893,9 @@ export async function getChatPreloadApi(): Promise<string | null> {
     if (entry.provider === 'moonshot') return models.buildMoonshotModel(entry.model).api;
     if (entry.provider === 'deepseek') return models.buildDeepSeekModel(entry.model).api;
     if (entry.provider === 'doubao') return models.buildDoubaoModel(entry.model).api;
+    if (entry.provider === 'groq' || entry.provider === 'cerebras' || entry.provider === 'huggingface' || entry.provider === 'nvidia') {
+      return models.buildFreeProviderModel(entry.provider, entry.model).api;
+    }
     const configured = models.buildConfiguredOpenAICompatibleModel(entry.provider, entry.model);
     if (configured) return configured.api;
     const config = customRuntimeConfigFromProfile(store.profiles[entry.profileId]);
@@ -2904,6 +2907,14 @@ export async function testConnection(
         provider = await ext.createDeepSeekProvider({ apiKey, modelId: probeModel });
       } else if (pid === 'doubao') {
         provider = await ext.createDoubaoProvider({ apiKey, modelId: probeModel });
+      } else if (pid === 'groq') {
+        provider = await ext.createGroqProvider({ apiKey, modelId: probeModel });
+      } else if (pid === 'cerebras') {
+        provider = await ext.createCerebrasProvider({ apiKey, modelId: probeModel });
+      } else if (pid === 'huggingface') {
+        provider = await ext.createHuggingFaceProvider({ apiKey, modelId: probeModel });
+      } else if (pid === 'nvidia') {
+        provider = await ext.createNvidiaProvider({ apiKey, modelId: probeModel });
       } else if (pid === CUSTOM_MODEL_PROVIDER && customConfig) {
         provider = await ext.createCustomOpenAICompatibleProvider({
           apiKey,

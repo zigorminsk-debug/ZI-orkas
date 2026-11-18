@@ -35,6 +35,9 @@ jobs:
       - name: Typecheck (main + core-agent)
         run: npm run typecheck
 
+      - name: Test GitHub connector
+        run: node --test scripts/test-github-connector.cjs
+
       - name: Check Web App SDK documentation contract
         run: npm run web-app-sdk:check
 

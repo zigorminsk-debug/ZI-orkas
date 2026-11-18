@@ -498,6 +498,83 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
   });
 }
 
+// ── Free-tier OpenAI-compatible providers ──────────────────────────────
+// Groq, Cerebras, Hugging Face Router, NVIDIA NIM. All expose
+// OpenAI-compatible /v1/chat/completions; users supply their own free key
+// in Settings. ZI-Commander mesh remains the zero-key default.
+
+interface FreeProviderSpec {
+  id: string;
+  baseUrl: string;
+}
+
+const FREE_PROVIDER_SPECS: Record<string, FreeProviderSpec> = {
+  groq: { id: 'groq', baseUrl: 'https://api.groq.com/openai/v1' },
+  cerebras: { id: 'cerebras', baseUrl: 'https://api.cerebras.ai/v1' },
+  huggingface: { id: 'huggingface', baseUrl: 'https://router.huggingface.co/v1' },
+  nvidia: { id: 'nvidia', baseUrl: 'https://integrate.api.nvidia.com/v1' },
+};
+
+export function buildFreeProviderModel(
+  providerId: string,
+  modelId: string,
+): Model<'openai-completions'> {
+  const spec = FREE_PROVIDER_SPECS[providerId];
+  if (!spec) throw new Error(`unknown free provider: ${providerId}`);
+  const curated = curatedModelsFor(providerId).find((m) => m.id === modelId);
+  return {
+    id: modelId,
+    name: curated?.name || modelId,
+    api: 'openai-completions',
+    provider: providerId as any,
+    baseUrl: spec.baseUrl,
+    reasoning: /reason|r1|thinking|gpt-oss|qwen3/i.test(modelId),
+    input: modelInputFromConfiguredCapabilities(['text', 'image'], curated),
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, 131072),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, 8192),
+  };
+}
+
+export interface CreateFreeProviderConfig {
+  apiKey: string;
+  modelId: string;
+  userCacheKey?: string;
+}
+
+async function createFreeProvider(
+  providerId: string,
+  config: CreateFreeProviderConfig,
+): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error(`${providerId}: apiKey required`);
+  if (!config.modelId) throw new Error(`${providerId}: modelId required`);
+  const mod = await ca();
+  const model = buildFreeProviderModel(providerId, config.modelId);
+  return mod.createPiProvider({
+    provider: providerId,
+    apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
+    customModel: model,
+    onPayload: repairOpenAICompatiblePayload,
+  });
+}
+
+export async function createGroqProvider(config: CreateFreeProviderConfig): Promise<LLMProvider> {
+  return createFreeProvider('groq', config);
+}
+
+export async function createCerebrasProvider(config: CreateFreeProviderConfig): Promise<LLMProvider> {
+  return createFreeProvider('cerebras', config);
+}
+
+export async function createHuggingFaceProvider(config: CreateFreeProviderConfig): Promise<LLMProvider> {
+  return createFreeProvider('huggingface', config);
+}
+
+export async function createNvidiaProvider(config: CreateFreeProviderConfig): Promise<LLMProvider> {
+  return createFreeProvider('nvidia', config);
+}
+
 // ── User-configured endpoint ──────────────────────────
 
 export interface CreateCustomOpenAICompatibleProviderConfig

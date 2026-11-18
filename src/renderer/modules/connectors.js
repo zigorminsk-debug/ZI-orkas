@@ -2120,6 +2120,7 @@ function _formatConnectError(errLike, fallbackKey = 'connectors.errors.connect_f
   if (/does not advertise registration_endpoint|does not support client metadata or DCR registration|DCR unsupported|protected resource metadata missing|compatible token_endpoint_auth_method/i.test(marker)) return t('connectors.errors.service_configuration');
   if (/DCR registration failed|token endpoint HTTP 4\d{2}|HTTP 40[13]/i.test(marker)) return t('connectors.errors.authorization_failed');
   if (/state_expired|invalid_state|bad_state|oauth_code_invalid|exchange_http_4xx|missing_exchange_code/i.test(marker)) return t('connectors.errors.authorization_expired');
+  if (/github_authorization_failed/i.test(marker)) return t('connectors.github.authorization_failed');
   if (/local_api_authorization_failed|seller_authorization_failed/i.test(marker)) return t('connectors.seller.authorization_failed');
   if (/local_cli_authorization_failed|provider_error|access_denied|authorization_failed|exchange_failed|dcr_registration_failed/i.test(marker)) return t('connectors.errors.authorization_failed');
   if (/invalid (connector|Shopify|Lightspeed|Commerce Layer|WooCommerce|NetSuite|Shopee|TikTok|URL)|connector parameter required|unexpected connector|unknown connector parameter|connection parameters|invalid_configuration/i.test(marker)) return t('connectors.errors.invalid_configuration');

@@ -443,7 +443,7 @@ function missingScopes(grantedText, required) {
 }
 
 const BROWSER_OAUTH_PROVIDERS = new Set(['yahoo_shopping', 'base_shop', 'ebay', 'etsy', 'mercado_libre', 'taobao_top', 'alibaba_1688', 'jd_jos', 'pinduoduo', 'kuaishou_shop', 'lazada', 'shein', 'alibaba_icbu', 'aliexpress']);
-const SELF_AUTH_PROVIDERS = new Set(['rakuten_rms', 'futureshop', 'qoo10_japan', 'douyin_shop', 'youzan', 'weimob_wos', 'xiaohongshu_ark', 'bigcommerce', 'shopline', 'shoplazza', 'magento', 'temu']);
+const SELF_AUTH_PROVIDERS = new Set(['github', 'rakuten_rms', 'futureshop', 'qoo10_japan', 'douyin_shop', 'youzan', 'weimob_wos', 'xiaohongshu_ark', 'bigcommerce', 'shopline', 'shoplazza', 'magento', 'temu']);
 
 // One URL builder serves the desktop relay and the legacy CLI fallback.
 function authorizationRequest(env, state, verifier) {

@@ -126,6 +126,12 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'doubao',             label: 'Doubao',  docsUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', region: 'cn',
     subscriptionNote: '' },
 
+  // Free-tier inference (user supplies own free key; ZI-Commander stays default)
+  { id: 'groq',               label: 'Groq',               docsUrl: 'https://console.groq.com/keys' },
+  { id: 'cerebras',           label: 'Cerebras',           docsUrl: 'https://cloud.cerebras.ai' },
+  { id: 'huggingface',        label: 'Hugging Face',       docsUrl: 'https://huggingface.co/settings/tokens' },
+  { id: 'nvidia',             label: 'NVIDIA NIM',         docsUrl: 'https://build.nvidia.com' },
+
   { id: 'openrouter',         label: 'OpenRouter',    docsUrl: 'https://openrouter.ai/keys' },
   {
     id: 'custom',
@@ -785,7 +791,7 @@ export interface CustomOpenAICompatibleRuntimeConfig {
  * provider registry. `listProviders()` treats these as API-key-capable
  * even though `listPiProviders()` doesn't list them.
  */
-export const EXTERNAL_API_PROVIDERS: readonly string[] = [ZI_COMMANDER_PROVIDER, 'moonshot', 'deepseek', 'doubao', 'custom'];
+export const EXTERNAL_API_PROVIDERS: readonly string[] = [ZI_COMMANDER_PROVIDER, 'moonshot', 'deepseek', 'doubao', 'groq', 'cerebras', 'huggingface', 'nvidia', 'custom'];
 
 // ── Image-generation capability map ─────────────────────────────────────
 //

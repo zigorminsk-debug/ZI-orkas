@@ -412,6 +412,7 @@ export interface LocalCliConfig {
 
 export interface LocalApiConfig {
   provider:
+    | 'github'
     | 'rakuten_rms'
     | 'base_shop'
     | 'futureshop'

@@ -497,6 +497,9 @@ export async function authorizeLocalApi(
       const code = (error as { code?: string })?.code;
       if (code === 'user_cancelled' || code === 'flow_timeout') throw error;
       log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
+      if (config.provider === 'github') {
+        throw Object.assign(new Error('github_authorization_failed'), { code: 'github_authorization_failed' });
+      }
       if (code?.startsWith('storefront_')) {
         const key = code === 'storefront_permission_denied' ? 'permission_denied'
           : code === 'storefront_binding_mismatch' ? 'binding_mismatch' : 'request_failed';

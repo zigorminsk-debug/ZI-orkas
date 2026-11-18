@@ -200,6 +200,7 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
   'marketplace-seller-api.cjs',
   'storefront-admin-api.cjs',
   'merchant-platform-api.cjs',
+  'github-api.cjs',
   'rakuten-rms-api.cjs',
   'base-shop-api.cjs',
   'qoo10-japan-api.cjs',
